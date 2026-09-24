@@ -18,6 +18,6 @@
 	],
 	"settings": {
 		"sdcc.shellPath": "cmd.exe",
-		"sdcc.comPort": "COM8"
+		"sdcc.comPort": "COM7"
 	}
 }

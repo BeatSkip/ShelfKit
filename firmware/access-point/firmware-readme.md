@@ -1,217 +1,180 @@
-# ShelfKit - Access Point
+# ShelfKit — Access Point
 
-Firmware and tooling for the **SES-imagotag Vusion 2.6" BWR shelf label** (UU340 variant).
-The tag is built around an **Axsem AX8052F143** — a 2.4 GHz radio transceiver with an 8051
-core — running from a 26 MHz crystal. It drives a Good Display **GDEW026Z39** e-paper panel
-(296×152, black/white/red, IL0373 controller), an NFC chip and a serial flash.
+An **AX8052F143 board used as a UART-to-radio adapter** for ShelfKit tags. It does two things,
+in one loop:
 
-The original firmware was built with IAR EW8051. This repository builds it with **SDCC**
-instead, using the **SDCC-MDF** extension for VS Code.
+- **Reports.** It listens on the AX5043 for tag announcements and prints every one of them over
+  its serial port:
 
-## Current status
+  ```
+  *** ShelfKit access point ***
+  radio ready (silicon rev 51)
+  listening: 868.300 MHz, FSK
+  TAG 1408F525 rssi=-42
+  TAG 1408F525 rssi=-41
+  ```
 
-- The project **builds cleanly with SDCC**; roughly 18 KB of the ~58 KB usable flash is used.
-- `main.c` is a **flash dump tool**: it boots, powers the transistor lines, brings up UART0
-  (38400 8N1 — the AXSEM bootloader rate) and the SPI unit, then streams the whole SPI flash
-  over UART as a hexdump (JEDEC ID first), then blinks the blue LED. Reset the tag to dump
-  again; `tools/flashdump.py` automates the reset (boot pin via DTR, reset via RTS) and
-  saves the dump to a file.
-- **SPI and e-paper drivers are implemented but not yet verified on hardware.** The e-paper
-  init sequence was transcribed from three independent drivers for this exact panel, but
-  `main.c` no longer calls it; the BUSY polarity question is still open (see below).
-- **Flashing is not configured.** The `upload` section of `sdcc-project.json` is a
-  placeholder. The AX8052F143 is programmed over its debug link, which no tool in this repo
-  drives yet.
-- The NFC chip has chip-select support in the SPI driver, but no device driver. The
-  transistor-driven lines on PA2/PA5 are driven by `pwr.c` (config in `pwr.h`), their loads
-  still unidentified.
+  Anything that reads a serial port at 38400 8N1 can consume that: a terminal, `pyserial`, a
+  script, a home-automation bridge. The blue LED blinks once per accepted packet.
 
-## Repository layout
+- **Bridges.** A host sends the framed image-transfer commands of
+  [`shelfkit_proto.h`](../shared/include/shelfkit_proto.h) and the access point turns each one
+  into the matching radio packet, retries it until the tag acknowledges it, and answers with the
+  offset the tag confirmed (`SK_U_ACK`) or a status (`SK_U_STATUS`). One host frame in, one
+  answer out — the host is never more than one block ahead of the tag's flash. The end-to-end
+  design is in [`documentation/shelfkit-image-transfer.md`](../../documentation/shelfkit-image-transfer.md).
 
-| Path | Contents |
-|---|---|
-| `src/` | Application code: `main.c` (flash dumper), `board.c/h`, `hal.h`, drivers `spi.c/h`, `epd.c/h`, `flash.c/h`, `pwr.c/h`, and the generated boot image `epd_image.c/h` |
-| `tools/` | Helper scripts: `png2epd.py` converts a PNG into e-paper plane data |
-| `include/` | Project-local headers (currently empty) |
-| `lib/` | Prebuilt Axsem LibMF SDK libraries as SDCC archives: `libmf`, `libaxdvk2`, `libaxdsp`, `libmfcrypto` |
-| `libraries/` | Full Axsem SDK source tree (IAR/Keil/SDCC/ARM build makefiles and headers) |
-| `documentation/` | AX8052F100/F131/F143 datasheets |
-| `.sdcc/boards/` | Board definition for the SDCC-MDF extension (project-scoped, travels with the repo) |
-| `.vscode/` | Build tasks, IntelliSense config, workspace settings |
-| `sdcc-project.json` | SDCC-MDF project configuration |
-| `GDEW026Z39-init-reference.md` | Notes on the e-paper init sequence and the sources of each byte |
+## The host protocol
 
-## Pin map
+```
+[0xAA][0x55][TYPE][LEN][LEN payload][CRC hi][CRC lo]
+```
 
-Full authoritative mapping: `documentation/signal-list.md`.
+with the CRC **CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, MSB first)** over `TYPE`, `LEN` and
+the payload. Note that libmf carries two CRC-16s whose names are one letter apart and which are
+*not* the same check: `crc_ccitt_msb()` is the one this protocol uses; `crc_crc16_msb()` is poly
+0x8005. `tools/tests/serial_frame_test.c` pins the check value (0x29B1 for `"123456789"`).
 
-| Function | Pin | Notes |
-|---|---|---|
-| LED white / blue / green | `PB0` / `PB7` / `PB6` | active low |
-| LED red | `PC4` | active low |
-| UART0 TX / RX | `PB4` / `PB5` | 38400 8N1, timer 0 baud (off while the e-paper is driven) |
-| SPI SCK / MOSI / MISO | `PC1` / `PC2` / `PC3` | hardware SPI unit |
-| CS flash / NFC / EPD | `PC0` / `PB1` / `PA1` | active low |
-| EPD D/C, RST, BUSY | `PA0`, `PB5`, `PB2` | D/C: 0 = command, 1 = data |
-| NFC field detect / boot | `PB3` | |
-| Transistor U4 / U5 | `PA5` / `PA2` | function not identified yet |
+Host → access point: `SK_U_IMG_BEGIN` (`0x01`), `SK_U_IMG_DATA` (`0x02`), `SK_U_IMG_END` (`0x03`).
+Access point → host: `SK_U_ACK` (`0x81`, the offset the tag confirmed) or `SK_U_STATUS` (`0x82`,
+`[status][detail]`, where `detail` is the access point's own reason — see `LINK_D_*` in
+`main.c`). A frame with a bad CRC, an over-long `LEN` or an unknown type is not answered: the
+parser resynchronises on the next `0xAA 0x55`, which is what the header specifies.
 
-One conflict worth knowing about: **EPD reset shares PB5 with the UART RX function.**
-Enabling UART0 hands the pin to the UART, so the boot demo leaves UART0 off — if a future
-firmware needs UART, it must release PB5 (or reset the panel) before driving the display.
+## The radio link
 
-## Building
+Every register value is taken from the vendor's own working sample project, kept in
+[`documentation/reference/VusionLink/`](../../documentation/reference/VusionLink/) — an AXSEM
+AX-RadioLAB generated configuration plus the `easyax5043` SDK driver. Its header states the
+link in one line: **868.300 MHz, deviation 1600 Hz, 4800 bit/s, RX bandwidth 7.2 kHz,
+15 dBm, 26 MHz TCXO.** The physical layer, the frame format and the reasoning are in
+[`documentation/shelfkit-radio-link.md`](../../documentation/shelfkit-radio-link.md).
+
+**The tag and the access point must carry the same `radio.c`/`radio.h`.** The two copies in
+this repo are byte-identical, and the driver applies the generated register table verbatim
+rather than deriving values by hand — an earlier attempt at deriving them from the programming
+manual produced a link that compiled, ran, and never worked.
+
+## Building and flashing
 
 Required: [SDCC](https://sdcc.sourceforge.net/) (tested with 3.6.0) and the
 [SDCC-MDF extension](https://marketplace.visualstudio.com/items?itemName=dzantemir.sdcc-mdf)
-(tested with 0.29.11) in VS Code.
+in VS Code.
 
-1. Open the repository in VS Code.
-2. If the extension does not detect SDCC, set the path via *SDCC-MDF: Select Toolchain*.
-3. **Ctrl+Shift+B** (or the *SDCC: Build* task). Output lands in `build/`:
-   - `firmware.ihx` — linker output
-   - `firmware.hex` — Intel HEX, ready for flashing once flashing is wired up
-   - `firmware.map` / `firmware.mem` — placement and usage report
+1. Open `ShelfKit.code-workspace`.
+2. Select `firmware/access-point`, then **Ctrl+Shift+B** (*SDCC: Build*) and *SDCC: Flash*.
+   The port comes from the workspace setting `"sdcc.comPort"`. **Build before flashing** — the
+   extension deletes stale `firmware.hex`/`.bin` on every build, so flashing an unbuilt tree
+   only gets you "Hex file not found".
 
-The same build by hand, from the repository root (PowerShell needs `&` before a quoted
-executable path):
+The build uses ~11 KB of the ~58 KB usable flash, ~740 bytes of the 8 KB of XRAM, and leaves
+179 bytes of the internal RAM as stack.
+
+The same build by hand, from `firmware/access-point`:
 
 ```powershell
+$sdcc  = 'C:\Program Files\SDCC\bin\sdcc.exe'
 $flags = @('-mmcs51','--model-small','--iram-size','256','--xram-size','8192','--code-size','59389')
+$inc   = @('-I../shared/include','-I../shared/libraries/libmf/include','-I../shared/libraries/libaxdvk2/include')
+$srcs  = @('main','board','spi','radio','flash','pwr','uart')   # see the exclude rule below
 
-& 'C:\Program Files\SDCC\bin\sdcc.exe' -c @flags '-Iinclude' '-Ilibraries/libmf/include' 'src/main.c'  -o 'build/obj/src/main.rel'
-& 'C:\Program Files\SDCC\bin\sdcc.exe' -c @flags '-Iinclude' '-Ilibraries/libmf/include' 'src/board.c' -o 'build/obj/src/board.rel'
-& 'C:\Program Files\SDCC\bin\sdcc.exe' -c @flags '-Iinclude' '-Ilibraries/libmf/include' 'src/spi.c'   -o 'build/obj/src/spi.rel'
-& 'C:\Program Files\SDCC\bin\sdcc.exe' -c @flags '-Iinclude' '-Ilibraries/libmf/include' 'src/epd.c'   -o 'build/obj/src/epd.rel'
+foreach ($s in $srcs) {
+    & $sdcc -c @flags @inc "src/$s.c" -o "build/obj/src/$s.rel"
+}
 
-& 'C:\Program Files\SDCC\bin\sdcc.exe' @flags '-Iinclude' '-Ilibraries/libmf/include' `
-    'build/obj/src/main.rel' 'build/obj/src/board.rel' 'build/obj/src/spi.rel' 'build/obj/src/epd.rel' `
-    'lib/libaxdsp.lib' 'lib/libaxdvk2.lib' 'lib/libmf.lib' 'lib/libmfcrypto.lib' `
+& $sdcc @flags @inc ($srcs | ForEach-Object { "build/obj/src/$_.rel" }) `
+    '../shared/lib/libaxdsp.lib' '../shared/lib/libaxdvk2.lib' `
+    '../shared/lib/libmf.lib'    '../shared/lib/libmfcrypto.lib' `
     -o 'build/firmware.ihx'
+
+& 'C:\Program Files\SDCC\bin\packihx.exe' 'build/firmware.ihx' |
+    Set-Content -Encoding ascii 'build/firmware.hex'
 ```
 
-Memory model is `--model-small`, with 256 B IRAM, 8 KB XRAM and ~58 KB code (the top of the
-64 KB flash is reserved, matching the boundary the original IAR linker file used).
+`build/firmware.mem` reports the three numbers that matter: the ROM and EXTERNAL RAM sizes and
+`Stack starts at: ... with N bytes available`.
 
-## Drivers
+## Host tests
 
-### Transistor lines — `src/pwr.h`
+`main.c`'s parser and bridge have no MCU dependency, so they are tested on the PC: the test
+compiles the real `main.c` against stub headers (`tools/tests/ap_stubs/`) and drives it with a
+scripted serial line and a scripted tag.
 
-Controls the unidentified transistor lines PA2 (U5) and PA5 (U4). Which pins are driven and
-their polarity are `#define`s at the top of `pwr.h`:
-
-```c
-#define PWR_USE_U4  1       /* PA5 */      #define PWR_USE_U5  1       /* PA2 */
-#define PWR_U4_ACTIVE_HIGH  1              #define PWR_U5_ACTIVE_HIGH  1
-
-pwr_init();                /* selected pins become outputs, driven off */
-pwr_on();                  /* drive all selected pins to their on level */
-pwr_off();
-pwr_pulse(100, 100, 0);    /* 100 ms on, 100 ms off, forever */
+```powershell
+gcc -Wall -Wextra -Wno-unused-function -Wno-unused-parameter `
+    -I tools/tests/ap_stubs -I firmware/shared/include `
+    -o tools/tests/serial_frame_test.exe tools/tests/serial_frame_test.c
+./tools/tests/serial_frame_test.exe
 ```
 
-The boot demo calls `pwr_on()` before touching the panel, on the assumption one of the
-transistors gates the display supply. If that misbehaves, flip the polarity defines or
-disable one pin and rebuild.
+## Source layout
 
-### SPI — `src/spi.h`
+| File | Contents |
+|---|---|
+| `main.c` | boot, banner, the receive loop, `TAG <serial> rssi=<db>` reporting, the serial frame parser, the host↔radio bridge |
+| `radio.c/h` | the AX5043 driver — init, auto-ranging, transmit, receive |
+| `uart.c/h` | minimal UART0 bring-up at 38400 8N1 on PB4/PB5, TX and polled RX |
+| `board.c/h`, `hal.h`, `pwr.c/h` | board pins and the PA2/PA5 transistor lines |
+| `spi.c/h`, `flash.c/h` | SPI bus and serial flash (linked but unused so far) |
+| `epd.c/h`, `epd_image.c/h` | the tag's e-paper driver, **excluded from this build** |
 
-A thin wrapper over the AX8052's built-in SPI unit, mode 0, MSB first — the same
-configuration the vendor's own LCD code uses. Provides `spi_init()`, `spi_transfer()`,
-`spi_write()`/`spi_read()`, and chip-select helpers for the three slaves on the bus
-(EPD, NFC, flash). The SPI clock source is a `#define` at the top of the header; the default
-(0xD8) is the LibMF LCD driver's setting, and 0x06 (SYSCLK) also works.
+`sdcc-project.json` excludes `src/epd.c` and `src/epd_image.c`: SDCC links every object file it
+is handed, so a ~11 KB boot image would otherwise sit in the AP firmware. The e-paper sources
+stay in the tree because they are the tag's, and this project folder started as a copy of it.
 
-### Serial flash — `src/flash.h`
+## Pin map
 
-Thin 25-series SPI NOR driver: `extflash_release_powerdown()`, `extflash_read_jedec_id()`,
-`extflash_read()`. The dump size lives in `FLASH_SIZE` (default 128 KiB for the suspected
-1 Mbit chip; the JEDEC capacity byte tells the truth). The boot firmware prints the JEDEC ID
-and a full hexdump of the chip on UART0 at 38400 8N1 (TX = PB4); `tools/flashdump.py`
-resets the board (boot pin via DTR, reset via RTS, same wiring as `tools/axsem-flasher.py`)
-and saves the stream to a file. Use `--bootloader` to reset into the serial bootloader
-instead.
+| Function | Pin | Notes |
+|---|---|---|
+| UART0 TX / RX | `PB4` / `PB5` | 38400 8N1; both directions used here (on a tag board PB5 is the panel reset, which is why the tag never listens) |
+| LED blue / white / green | `PB7` / `PB0` / `PB6` | active low; blue blinks per packet |
+| LED red | `PC4` | active low |
+| SPI SCK / MOSI / MISO | `PC1` / `PC2` / `PC3` | unused by the AP |
+| CS flash / NFC / EPD | `PC0` / `PB1` / `PA1` | unused by the AP |
+| NFC field detect / boot | `PB3` | the flasher uses it as the boot pin |
+| Transistor U4 / U5 | `PA5` / `PA2` | driven on at boot (`pwr.c`), function unidentified |
 
-### E-paper — `src/epd.h`
+## Notes
 
-Driver for the GDEW026Z39 (IL0373), driven **rotated — 152 wide × 296 tall** — the same
-orientation the stock tag firmware uses. It relies on the panel's built-in OTP LUT, so no
-waveform tables are needed.
-
-A full frame is two 5624-byte planes (black/white and red), which together exceed the 8 KB
-of XRAM. The API therefore streams the frame in two halves, reusing one buffer:
-
-```c
-#include "spi.h"
-#include "epd.h"
-
-uint8_t __xdata buf[EPD_PLANE_BYTES];   /* 5624 bytes; 0 = ink, 1 = white */
-
-spi_init();                             /* call after periph_init() */
-epd_init();                             /* resets the panel, clears it to white */
-
-epd_plane_ink(buf, 10, 10);             /* bit 0 = ink, MSB = leftmost pixel */
-epd_upload(0x10, buf, EPD_PLANE_BYTES); /* black/white plane */
-
-/* refill buf with the red plane (bit 0 = red ink) and send it */
-epd_upload(0x13, buf, EPD_PLANE_BYTES);
-
-epd_refresh();                          /* starts the update, waits for BUSY */
-epd_sleep();                            /* panel deep sleep */
-```
-
-`epd_clear(0xFF, 0xFF)` wipes the screen white without any buffer; static images can live in
-`const` (flash) and be passed straight to `epd_upload()`.
-
-### Boot image
-
-`main.c` shows `polyform-eink.png` on boot. The image was converted to the two 1-bit
-planes in `src/epd_image.c` by:
-
-```
-python tools/png2epd.py polyform-eink.png --dither
-```
-
-The converter composites transparency over white, quantizes to black/white/red
-(optionally with Floyd-Steinberg dithering) and rotates the image to the panel's mounted
-orientation. If the logo shows up sideways on the tag, regenerate with a different
-`--rotate` (0/90/180/270; 90 = image's left edge on top).
-
-Two hardware notes that will matter on first bring-up:
-
-- **UART0 is off in the demo.** Its RX pin (PB5) doubles as the panel reset line; with the
-  UART enabled, the pin belongs to the UART and the reset pulse never reaches the panel.
-- **BUSY polarity.** Every driver found for this panel on this tag polls BUSY *low* while
-  busy — the tag board inverts the line, although the bare Good Display module is
-  active-high. `epd.c` defaults to active-low. If `epd_init()` hangs or updates render
-  corrupt, flip `EPD_BUSY_ACTIVE_HIGH` and retry.
-- The init bytes and their provenance are written up in `GDEW026Z39-init-reference.md`.
-
-## Known issues and quirks
-
-- **SDCC-MDF vs PowerShell** (extension ≤ 0.29.11): the extension emits single-quoted tool
-  paths without the `&` call operator, so with a PowerShell terminal every build fails with
-  `Unexpected token '-mmcs' …`. This repo works around it with `"sdcc.shellPath": "cmd.exe"`
-  in `.vscode/settings.json` (workspace-scoped). After changing it, reload the VS Code
-  window — the extension reuses its existing build terminal.
-- **Board definitions are cached** by the extension; after editing `axsem-8051.json`,
-  reload the window for the change to take effect.
-- The `lib/*.lib` files are SDCC archives built from `libraries/` with the vendor's
-  `buildsdcc` makefiles. Only `libmf` is currently linked; the other three are present for
-  future drivers.
+- **RAM is the scarce resource on this part**: 128 bytes of directly addressable internal RAM
+  for statics *and* function parameter blocks. Two consequences are baked into this project:
+  buffers live in XRAM, and the new API functions are declared `__reentrant` so SDCC passes
+  their parameters on the stack instead of allocating a permanent parameter block.
+- **The UART receiver is polled, not interrupt-driven.** This firmware never sets IE/EA, so
+  there is no vector to be woken by; `uart_rx_ready()`/`uart_getc()` in `uart.c` make the same
+  two register accesses libmf's own UART0 handler does. The one hazard of polling is that the
+  receiver has a single byte of buffering while we are busy transmitting, so `uart_putc()`
+  spends its waits draining the receiver into a 64-byte XRAM ring; without it, printing a `TAG`
+  line in the middle of a host frame would cost the host that frame.
+- **Timing.** `delay(1000)` from libmf is ~1 ms of the 20 MHz core, which is what the retry
+  budgets in `main.c` are written in. A radio round trip plus a flash page write is a few
+  hundred milliseconds; `IMG_END` is the exception, because the tag answers it only after its
+  e-paper refresh, which is why that one is sent once and waited for over 60 s.
+- The parser gives up on a half-received frame after ~0.1 s of silence (`SER_IDLE_LIMIT`). That
+  is what stops a frame the host abandoned mid-way from being completed with the *next* frame's
+  bytes; the constant is only good to a factor of a few, and deliberately sits far from both the
+  260 µs between two bytes of a real frame and any host's retry delay.
+- **`hal.h` deliberately does not include `libmfuart*.h`.** Those headers declare
+  `uart0_irq()`/`uart1_irq()` as `__interrupt` handlers, and SDCC emits the interrupt vector
+  for a declaration — which drags libmf's buffered UART and its UART1 ring buffers into the
+  link. `uart.c` configures the UART registers directly instead (see its header).
+- `radio_init()` returns a code on failure and `main()` stops with the LED dark. It also prints
+  a register-level diagnostic from `radio_diag()` — the raw `XTALSTATUS`, `POWSTAT` and
+  `PLLRANGINGA` of the failing step — because that is what distinguishes a reference-clock
+  problem from a PLL or VCO one when debugging on hardware.
+- The receiver stays in FULLRX continuously (7-11 mA on the radio). Wake-on-radio is a later
+  feature.
 
 ## Not done yet
 
-- Flash/debug recipe for the AX8052 debug link, so `SDCC: Flash` actually flashes.
-- Hardware verification of the e-paper driver (init + first frame), settling the BUSY
-  polarity question.
-- Identification of the PA2/PA5 transistor lines.
-- NFC (FM11NT081DS) and serial flash device drivers — chip selects are in place.
-- Repo weight: `libraries/` is ~120 MB, of which only `libraries/libmf/include` is needed
-  to build.
-
-## License
-
-The code in `src/` has no license declared yet. The Axsem SDK under `libraries/` and `lib/`
-retains its original terms (compiler headers are GPL with a linking exception; the rest is
-vendor-licensed) — see the individual files.
+- No addressing, acknowledgements or channel access for *announcements*: a tag announces, the
+  access point listens. An image transfer is addressed by serial in the tag's own filter, but
+  the air packets carry no address the radio can use.
+- The access point does not queue transfers and cannot serve two hosts at once; a second
+  `IMG_BEGIN` supersedes the first.
+- No hardware verification of the bridge yet: the end-to-end test needs the tag firmware's
+  image-receive path (see the last section of
+  [`documentation/shelfkit-image-transfer.md`](../../documentation/shelfkit-image-transfer.md)).
+  What *is* verified without hardware is the parser, the CRC and every retry/timeout decision —
+  see "Host tests" above.
+- Hardware verification of the radio link (see the bring-up checklist in the link doc).

@@ -1,0 +1,3 @@
+# Compiled host-test binaries
+*.exe
+*.out

@@ -38,6 +38,13 @@
 /* EEPROM addresses of the interesting fields */
 #define NFC_SERIAL_ADDR   0x000U    /* SN0..SN2, BCC0, SN3..SN6, BCC1 (9 bytes) */
 #define NFC_CC_ADDR       0x00CU    /* capability container (4 bytes) */
+#define NFC_TLV_ADDR      0x010U    /* start of the NDEF/TLV area (page 4) */
+#define NFC_TLV_WINDOW    128U      /* bytes of it we read and parse */
+
+/* Longest ASCII serial (the NDEF URI's last path segment) we will produce */
+#ifndef NFC_SERIAL_STR_MAX
+#define NFC_SERIAL_STR_MAX 24
+#endif
 
 /**
  * Take the SPI bus away from the hardware SPI unit and set up the bit-bang
@@ -62,7 +69,7 @@ void nfc_release(void);
  * bits are part of the command byte, so one command can only seek within
  * the block its address belongs to.
  */
-void nfc_read(uint16_t addr, uint8_t *buf, uint8_t len);
+void nfc_read(uint16_t addr, uint8_t *buf, uint8_t len) __reentrant;
 
 /**
  * Read the 7-byte serial number (UID) and verify it against the two
@@ -74,6 +81,34 @@ void nfc_read(uint16_t addr, uint8_t *buf, uint8_t len);
  * @return 1 when both check bytes match - i.e. the SPI transaction really
  *         produced the chip's UID - 0 when the read looks like noise.
  */
-uint8_t nfc_read_serial(uint8_t serial[NFC_SERIAL_LEN]);
+uint8_t nfc_read_serial(uint8_t serial[NFC_SERIAL_LEN]) __reentrant;
+
+/**
+ * Read the tag's serial number the way the stock system does: the NFC
+ * EEPROM holds an NDEF URI record ("https://nfc.ses-imagotag.com/1408F525")
+ * and the serial number is the last path segment of that URI.
+ *
+ * The TLV area is read from address 0x010 and parsed by nfc_ndef.c (which
+ * is plain C and unit-tested on the host against a real capture).
+ *
+ * @return length of the serial (excluding the NUL), or 0 when the chip has
+ *         no usable URI record.
+ */
+uint8_t nfc_read_tag_serial(char *serial, uint8_t maxlen) __reentrant;
+
+/**
+ * The same as nfc_read_tag_serial(), but the whole reconstructed URI - handy
+ * for logging when a tag's serial cannot be parsed.
+ */
+uint8_t nfc_read_ndef_uri(char *uri, uint8_t maxlen) __reentrant;
+
+/**
+ * Fallback identifier for a chip with no (or unreadable) NDEF data: the
+ * 7-byte UID as 14 uppercase hex characters.
+ *
+ * @return length of the string (excluding the NUL), or 0 if @p maxlen is
+ *         too small.
+ */
+uint8_t nfc_uid_string(char *out, uint8_t maxlen) __reentrant;
 
 #endif /* NFC_DRIVER_H */

@@ -4,8 +4,13 @@
 #include <ax8052f143.h>
 #include <libmftypes.h>
 #include <libmfwtimer.h>
-#include <libmfuart.h>
-#include <libmfuart1.h>
+
+/* Deliberately NOT <libmfuart.h>/<libmfuart0.h>/<libmfuart1.h>: they declare
+ * uart0_irq()/uart1_irq() as __interrupt handlers, and SDCC emits the
+ * interrupt vector for a declaration - which drags libmf's buffered UART
+ * (and its three 64-byte ring buffers, most of this part's 128 bytes of
+ * directly addressable RAM) into every link. This firmware talks to the
+ * UART registers directly instead; see src/uart.c. */
 
 //Choose LOWFREQ_QUARZ or LOWFREQ_RC as source for RTC clock
 //#define LOWFREQ_QUARZ

@@ -124,13 +124,29 @@ void epd_sleep(void)
     epd_data(0xA5);
 }
 
-void epd_upload(uint8_t cmd, const uint8_t *plane, uint16_t len)
+/* A plane can be pushed in as many chunks as the caller likes: the command
+ * selects the plane once, and every later chunk continues where the last
+ * one stopped, because the controller's write pointer is driven by the
+ * bytes it receives and not by the chip select edges. That is what lets the
+ * caller read the next chunk out of the SPI flash (the same bus) in
+ * between - see epd_stream_data() in epd.h. */
+void epd_stream_begin(uint8_t cmd) __reentrant
 {
     epd_cmd(cmd);
+}
+
+void epd_stream_data(const uint8_t *buf, uint16_t len) __reentrant
+{
     spi_select(SPI_DEV_EPD);
     while (len--)
-        spi_transfer(*plane++);
+        spi_transfer(*buf++);
     spi_deselect(SPI_DEV_EPD);
+}
+
+void epd_upload(uint8_t cmd, const uint8_t *plane, uint16_t len)
+{
+    epd_stream_begin(cmd);
+    epd_stream_data(plane, len);
 }
 
 void epd_refresh(void)

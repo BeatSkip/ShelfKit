@@ -29,14 +29,13 @@
 #include <ax8052f143.h>
 #include <libmf.h>
 #include <libmftypes.h>
-#include <libmfuart.h>
-#include <libmfuart0.h>
 #include "hal.h"
 #include "board.h"
 #include "pwr.h"
 #include "spi.h"
 #include "flash.h"
 #include "nfc.h"
+#include "uart.h"
 
 /* Dump the AX8052's own 64 KiB code space as well. Off by default: it holds
  * the firmware you just flashed (plus the AXSEM bootloader at the top), it
@@ -115,9 +114,13 @@ static void dump_hexline(uint32_t addr, const uint8_t *buf, uint8_t n)
  * of internal RAM and all of it should stay available for the stack. */
 static uint8_t __xdata dump_buf[16];
 
+/* The tag's serial number as the stock system defines it: the last path
+ * segment of the NDEF URI record ("1408F525"). */
+static char __xdata dump_serial[NFC_SERIAL_STR_MAX];
+
 static void dump_nfc(void)
 {
-    uint8_t serial[NFC_SERIAL_LEN];
+    uint8_t uid[NFC_SERIAL_LEN];
     uint8_t ok, i, n;
     uint16_t addr;
 
@@ -125,14 +128,29 @@ static void dump_nfc(void)
 
     nfc_init();                     /* SPI unit off, pads bit-banged */
 
-    ok = nfc_read_serial(serial);
-    uart_puts("NFC serial: ");
+    ok = nfc_read_serial(uid);
+    uart_puts("NFC UID: ");
     for (i = 0; i < NFC_SERIAL_LEN; i++) {
-        uart_puthex8(serial[i]);
+        uart_puthex8(uid[i]);
         uart_putc(' ');
     }
     uart_puts(ok ? "[check bytes ok]\r\n"
                  : "[check bytes BAD - read is not trustworthy]\r\n");
+
+    /* The serial number the stock system uses, out of the NDEF URI record */
+    n = nfc_read_tag_serial(dump_serial, sizeof dump_serial);
+    if (n) {
+        uart_puts("NFC serial: ");
+        for (i = 0; i < n; i++)
+            uart_putc((uint8_t)dump_serial[i]);
+        uart_puts("  [from the NDEF URI]\r\n");
+    } else {
+        n = nfc_uid_string(dump_serial, sizeof dump_serial);
+        uart_puts("NFC serial: ");
+        for (i = 0; i < n; i++)
+            uart_putc((uint8_t)dump_serial[i]);
+        uart_puts("  [NO NDEF RECORD - using the UID]\r\n");
+    }
 
     /* Capability container: E1 10 <user bytes/8> <access> for a Type 2 tag */
     nfc_read(NFC_CC_ADDR, dump_buf, 4);
@@ -262,9 +280,10 @@ void main()
         OSCCALIB = 0x00;
     }
 
-    uart_timer0_baud(CLKSRC_FRCOSC, 38400, 20000000);
-    uart0_init(0, 8, 1);        /* enables the UART hardware; TX is driven
-                                 * directly via uart_putc() (EA stays off) */
+    /* UART0 at 38400 8N1 on PB4. uart_begin() is libmf's uart_timer0_baud()
+     * + uart0_init() inlined: linking libmf's versions drags in its buffered
+     * UART and the UART1 ring buffers (see uart.c). */
+    uart_begin();
 
     uart_puts("\r\n*** imagotag memory dump ***\r\n");
 

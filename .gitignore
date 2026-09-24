@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 
+
+# Plane dumps written by tools/send_image.py --dry-run
+images/*.bw.bin
+images/*.red.bin

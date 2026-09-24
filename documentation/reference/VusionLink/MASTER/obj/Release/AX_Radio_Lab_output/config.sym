@@ -1,0 +1,1520 @@
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 1.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    .__.$$$.                                                    =  002710 L
+    .__.ABS.                                                    =  000000 G
+    .__.CPU.                                                    =  000000 L
+    .__.H$L.                                                    =  000001 L
+    A                                                           =  0000E0 L
+    A.0                                                         =  0000E0 L
+    A.1                                                         =  0000E1 L
+    A.2                                                         =  0000E2 L
+    A.3                                                         =  0000E3 L
+    A.4                                                         =  0000E4 L
+    A.5                                                         =  0000E5 L
+    A.6                                                         =  0000E6 L
+    A.7                                                         =  0000E7 L
+    AC                                                          =  0000D6 L
+    ACC                                                         =  0000E0 L
+    ACC.0                                                       =  0000E0 L
+    ACC.1                                                       =  0000E1 L
+    ACC.2                                                       =  0000E2 L
+    ACC.3                                                       =  0000E3 L
+    ACC.4                                                       =  0000E4 L
+    ACC.5                                                       =  0000E5 L
+    ACC.6                                                       =  0000E6 L
+    ACC.7                                                       =  0000E7 L
+    B                                                           =  0000F0 L
+    B.0                                                         =  0000F0 L
+    B.1                                                         =  0000F1 L
+    B.2                                                         =  0000F2 L
+    B.3                                                         =  0000F3 L
+    B.4                                                         =  0000F4 L
+    B.5                                                         =  0000F5 L
+    B.6                                                         =  0000F6 L
+    B.7                                                         =  0000F7 L
+    CPRL2                                                       =  0000C8 L
+    CT2                                                         =  0000C9 L
+    CY                                                          =  0000D7 L
+    DPH                                                         =  000083 L
+    DPL                                                         =  000082 L
+    EA                                                          =  0000AF L
+    ES                                                          =  0000AC L
+    ET0                                                         =  0000A9 L
+    ET1                                                         =  0000AB L
+    ET2                                                         =  0000AD L
+    EX0                                                         =  0000A8 L
+    EX1                                                         =  0000AA L
+    EXEN2                                                       =  0000CB L
+    EXF2                                                        =  0000CE L
+    F0                                                          =  0000D5 L
+    IE                                                          =  0000A8 L
+    IE.0                                                        =  0000A8 L
+    IE.1                                                        =  0000A9 L
+    IE.2                                                        =  0000AA L
+    IE.3                                                        =  0000AB L
+    IE.4                                                        =  0000AC L
+    IE.5                                                        =  0000AD L
+    IE.7                                                        =  0000AF L
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 2.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    IE0                                                         =  000089 L
+    IE1                                                         =  00008B L
+    INT0                                                        =  0000B2 L
+    INT1                                                        =  0000B3 L
+    IP                                                          =  0000B8 L
+    IP.0                                                        =  0000B8 L
+    IP.1                                                        =  0000B9 L
+    IP.2                                                        =  0000BA L
+    IP.3                                                        =  0000BB L
+    IP.4                                                        =  0000BC L
+    IP.5                                                        =  0000BD L
+    IT0                                                         =  000088 L
+    IT1                                                         =  00008A L
+    OV                                                          =  0000D2 L
+    P                                                           =  0000D0 L
+    P0                                                          =  000080 L
+    P0.0                                                        =  000080 L
+    P0.1                                                        =  000081 L
+    P0.2                                                        =  000082 L
+    P0.3                                                        =  000083 L
+    P0.4                                                        =  000084 L
+    P0.5                                                        =  000085 L
+    P0.6                                                        =  000086 L
+    P0.7                                                        =  000087 L
+    P1                                                          =  000090 L
+    P1.0                                                        =  000090 L
+    P1.1                                                        =  000091 L
+    P1.2                                                        =  000092 L
+    P1.3                                                        =  000093 L
+    P1.4                                                        =  000094 L
+    P1.5                                                        =  000095 L
+    P1.6                                                        =  000096 L
+    P1.7                                                        =  000097 L
+    P2                                                          =  0000A0 L
+    P2.0                                                        =  0000A0 L
+    P2.1                                                        =  0000A1 L
+    P2.2                                                        =  0000A2 L
+    P2.3                                                        =  0000A3 L
+    P2.4                                                        =  0000A4 L
+    P2.5                                                        =  0000A5 L
+    P2.6                                                        =  0000A6 L
+    P2.7                                                        =  0000A7 L
+    P3                                                          =  0000B0 L
+    P3.0                                                        =  0000B0 L
+    P3.1                                                        =  0000B1 L
+    P3.2                                                        =  0000B2 L
+    P3.3                                                        =  0000B3 L
+    P3.4                                                        =  0000B4 L
+    P3.5                                                        =  0000B5 L
+    P3.6                                                        =  0000B6 L
+    P3.7                                                        =  0000B7 L
+    PCON                                                        =  000087 L
+    PS                                                          =  0000BC L
+    PSW                                                         =  0000D0 L
+    PSW.0                                                       =  0000D0 L
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 3.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    PSW.1                                                       =  0000D1 L
+    PSW.2                                                       =  0000D2 L
+    PSW.3                                                       =  0000D3 L
+    PSW.4                                                       =  0000D4 L
+    PSW.5                                                       =  0000D5 L
+    PSW.6                                                       =  0000D6 L
+    PSW.7                                                       =  0000D7 L
+    PT0                                                         =  0000B9 L
+    PT1                                                         =  0000BB L
+    PT2                                                         =  0000BD L
+    PX0                                                         =  0000B8 L
+    PX1                                                         =  0000BA L
+    RB8                                                         =  00009A L
+    RCAP2H                                                      =  0000CB L
+    RCAP2L                                                      =  0000CA L
+    RCLK                                                        =  0000CD L
+    REN                                                         =  00009C L
+    RI                                                          =  000098 L
+    RS0                                                         =  0000D3 L
+    RS1                                                         =  0000D4 L
+    RXD                                                         =  0000B0 L
+    SBUF                                                        =  000099 L
+    SCON                                                        =  000098 L
+    SCON.0                                                      =  000098 L
+    SCON.1                                                      =  000099 L
+    SCON.2                                                      =  00009A L
+    SCON.3                                                      =  00009B L
+    SCON.4                                                      =  00009C L
+    SCON.5                                                      =  00009D L
+    SCON.6                                                      =  00009E L
+    SCON.7                                                      =  00009F L
+    SM0                                                         =  00009F L
+    SM1                                                         =  00009E L
+    SM2                                                         =  00009D L
+    SP                                                          =  000081 L
+    T2CON                                                       =  0000C8 L
+    T2CON.0                                                     =  0000C8 L
+    T2CON.1                                                     =  0000C9 L
+    T2CON.2                                                     =  0000CA L
+    T2CON.3                                                     =  0000CB L
+    T2CON.4                                                     =  0000CC L
+    T2CON.5                                                     =  0000CD L
+    T2CON.6                                                     =  0000CE L
+    T2CON.7                                                     =  0000CF L
+    TB8                                                         =  00009B L
+    TCLK                                                        =  0000CC L
+    TCON                                                        =  000088 L
+    TCON.0                                                      =  000088 L
+    TCON.1                                                      =  000089 L
+    TCON.2                                                      =  00008A L
+    TCON.3                                                      =  00008B L
+    TCON.4                                                      =  00008C L
+    TCON.5                                                      =  00008D L
+    TCON.6                                                      =  00008E L
+    TCON.7                                                      =  00008F L
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 4.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    TF0                                                         =  00008D L
+    TF1                                                         =  00008F L
+    TF2                                                         =  0000CF L
+    TH0                                                         =  00008C L
+    TH1                                                         =  00008D L
+    TH2                                                         =  0000CD L
+    TI                                                          =  000099 L
+    TL0                                                         =  00008A L
+    TL1                                                         =  00008B L
+    TL2                                                         =  0000CC L
+    TMOD                                                        =  000089 L
+    TR0                                                         =  00008C L
+    TR1                                                         =  00008E L
+    TR2                                                         =  0000CA L
+    TXD                                                         =  0000B1 L
+    _AC                                                         =  0000D6 G
+    _ACC                                                        =  0000E0 G
+    _ACC_0                                                      =  0000E0 G
+    _ACC_1                                                      =  0000E1 G
+    _ACC_2                                                      =  0000E2 G
+    _ACC_3                                                      =  0000E3 G
+    _ACC_4                                                      =  0000E4 G
+    _ACC_5                                                      =  0000E5 G
+    _ACC_6                                                      =  0000E6 G
+    _ACC_7                                                      =  0000E7 G
+    _ADCCH0CONFIG                                               =  0000CA G
+    _ADCCH0VAL                                                  =  007020 G
+    _ADCCH0VAL0                                                 =  007020 G
+    _ADCCH0VAL1                                                 =  007021 G
+    _ADCCH1CONFIG                                               =  0000CB G
+    _ADCCH1VAL                                                  =  007022 G
+    _ADCCH1VAL0                                                 =  007022 G
+    _ADCCH1VAL1                                                 =  007023 G
+    _ADCCH2CONFIG                                               =  0000D2 G
+    _ADCCH2VAL                                                  =  007024 G
+    _ADCCH2VAL0                                                 =  007024 G
+    _ADCCH2VAL1                                                 =  007025 G
+    _ADCCH3CONFIG                                               =  0000D3 G
+    _ADCCH3VAL                                                  =  007026 G
+    _ADCCH3VAL0                                                 =  007026 G
+    _ADCCH3VAL1                                                 =  007027 G
+    _ADCCLKSRC                                                  =  0000D1 G
+    _ADCCONV                                                    =  0000C9 G
+    _ADCTUNE0                                                   =  007028 G
+    _ADCTUNE1                                                   =  007029 G
+    _ADCTUNE2                                                   =  00702A G
+    _ANALOGA                                                    =  007007 G
+    _ANALOGCOMP                                                 =  0000E1 G
+    _AX5043_0xF00                                               =  004F00 G
+    _AX5043_0xF00NB                                             =  005F00 G
+    _AX5043_0xF0C                                               =  004F0C G
+    _AX5043_0xF0CNB                                             =  005F0C G
+    _AX5043_0xF18                                               =  004F18 G
+    _AX5043_0xF18NB                                             =  005F18 G
+    _AX5043_0xF1C                                               =  004F1C G
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 5.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    _AX5043_0xF1CNB                                             =  005F1C G
+    _AX5043_0xF21                                               =  004F21 G
+    _AX5043_0xF21NB                                             =  005F21 G
+    _AX5043_0xF22                                               =  004F22 G
+    _AX5043_0xF22NB                                             =  005F22 G
+    _AX5043_0xF23                                               =  004F23 G
+    _AX5043_0xF23NB                                             =  005F23 G
+    _AX5043_0xF26                                               =  004F26 G
+    _AX5043_0xF26NB                                             =  005F26 G
+    _AX5043_0xF30                                               =  004F30 G
+    _AX5043_0xF30NB                                             =  005F30 G
+    _AX5043_0xF31                                               =  004F31 G
+    _AX5043_0xF31NB                                             =  005F31 G
+    _AX5043_0xF32                                               =  004F32 G
+    _AX5043_0xF32NB                                             =  005F32 G
+    _AX5043_0xF33                                               =  004F33 G
+    _AX5043_0xF33NB                                             =  005F33 G
+    _AX5043_0xF34                                               =  004F34 G
+    _AX5043_0xF34NB                                             =  005F34 G
+    _AX5043_0xF35                                               =  004F35 G
+    _AX5043_0xF35NB                                             =  005F35 G
+    _AX5043_0xF44                                               =  004F44 G
+    _AX5043_0xF44NB                                             =  005F44 G
+    _AX5043_AFSKCTRL                                            =  004114 G
+    _AX5043_AFSKCTRLNB                                          =  005114 G
+    _AX5043_AFSKMARK0                                           =  004113 G
+    _AX5043_AFSKMARK0NB                                         =  005113 G
+    _AX5043_AFSKMARK1                                           =  004112 G
+    _AX5043_AFSKMARK1NB                                         =  005112 G
+    _AX5043_AFSKSPACE0                                          =  004111 G
+    _AX5043_AFSKSPACE0NB                                        =  005111 G
+    _AX5043_AFSKSPACE1                                          =  004110 G
+    _AX5043_AFSKSPACE1NB                                        =  005110 G
+    _AX5043_AGCAHYST0                                           =  004122 G
+    _AX5043_AGCAHYST0NB                                         =  005122 G
+    _AX5043_AGCAHYST1                                           =  004132 G
+    _AX5043_AGCAHYST1NB                                         =  005132 G
+    _AX5043_AGCAHYST2                                           =  004142 G
+    _AX5043_AGCAHYST2NB                                         =  005142 G
+    _AX5043_AGCAHYST3                                           =  004152 G
+    _AX5043_AGCAHYST3NB                                         =  005152 G
+    _AX5043_AGCCOUNTER                                          =  004043 G
+    _AX5043_AGCCOUNTERNB                                        =  005043 G
+    _AX5043_AGCGAIN0                                            =  004120 G
+    _AX5043_AGCGAIN0NB                                          =  005120 G
+    _AX5043_AGCGAIN1                                            =  004130 G
+    _AX5043_AGCGAIN1NB                                          =  005130 G
+    _AX5043_AGCGAIN2                                            =  004140 G
+    _AX5043_AGCGAIN2NB                                          =  005140 G
+    _AX5043_AGCGAIN3                                            =  004150 G
+    _AX5043_AGCGAIN3NB                                          =  005150 G
+    _AX5043_AGCMINMAX0                                          =  004123 G
+    _AX5043_AGCMINMAX0NB                                        =  005123 G
+    _AX5043_AGCMINMAX1                                          =  004133 G
+    _AX5043_AGCMINMAX1NB                                        =  005133 G
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 6.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    _AX5043_AGCMINMAX2                                          =  004143 G
+    _AX5043_AGCMINMAX2NB                                        =  005143 G
+    _AX5043_AGCMINMAX3                                          =  004153 G
+    _AX5043_AGCMINMAX3NB                                        =  005153 G
+    _AX5043_AGCTARGET0                                          =  004121 G
+    _AX5043_AGCTARGET0NB                                        =  005121 G
+    _AX5043_AGCTARGET1                                          =  004131 G
+    _AX5043_AGCTARGET1NB                                        =  005131 G
+    _AX5043_AGCTARGET2                                          =  004141 G
+    _AX5043_AGCTARGET2NB                                        =  005141 G
+    _AX5043_AGCTARGET3                                          =  004151 G
+    _AX5043_AGCTARGET3NB                                        =  005151 G
+    _AX5043_AMPLFILTER                                          =  004115 G
+    _AX5043_AMPLFILTERNB                                        =  005115 G
+    _AX5043_AMPLITUDEGAIN0                                      =  00412B G
+    _AX5043_AMPLITUDEGAIN0NB                                    =  00512B G
+    _AX5043_AMPLITUDEGAIN1                                      =  00413B G
+    _AX5043_AMPLITUDEGAIN1NB                                    =  00513B G
+    _AX5043_AMPLITUDEGAIN2                                      =  00414B G
+    _AX5043_AMPLITUDEGAIN2NB                                    =  00514B G
+    _AX5043_AMPLITUDEGAIN3                                      =  00415B G
+    _AX5043_AMPLITUDEGAIN3NB                                    =  00515B G
+    _AX5043_BBOFFSCAP                                           =  004189 G
+    _AX5043_BBOFFSCAPNB                                         =  005189 G
+    _AX5043_BBOFFSRES0                                          =  00412F G
+    _AX5043_BBOFFSRES0NB                                        =  00512F G
+    _AX5043_BBOFFSRES1                                          =  00413F G
+    _AX5043_BBOFFSRES1NB                                        =  00513F G
+    _AX5043_BBOFFSRES2                                          =  00414F G
+    _AX5043_BBOFFSRES2NB                                        =  00514F G
+    _AX5043_BBOFFSRES3                                          =  00415F G
+    _AX5043_BBOFFSRES3NB                                        =  00515F G
+    _AX5043_BBTUNE                                              =  004188 G
+    _AX5043_BBTUNENB                                            =  005188 G
+    _AX5043_BGNDRSSI                                            =  004041 G
+    _AX5043_BGNDRSSIGAIN                                        =  00422E G
+    _AX5043_BGNDRSSIGAINNB                                      =  00522E G
+    _AX5043_BGNDRSSINB                                          =  005041 G
+    _AX5043_BGNDRSSITHR                                         =  00422F G
+    _AX5043_BGNDRSSITHRNB                                       =  00522F G
+    _AX5043_CRCINIT0                                            =  004017 G
+    _AX5043_CRCINIT0NB                                          =  005017 G
+    _AX5043_CRCINIT1                                            =  004016 G
+    _AX5043_CRCINIT1NB                                          =  005016 G
+    _AX5043_CRCINIT2                                            =  004015 G
+    _AX5043_CRCINIT2NB                                          =  005015 G
+    _AX5043_CRCINIT3                                            =  004014 G
+    _AX5043_CRCINIT3NB                                          =  005014 G
+    _AX5043_DACCONFIG                                           =  004332 G
+    _AX5043_DACCONFIGNB                                         =  005332 G
+    _AX5043_DACVALUE0                                           =  004331 G
+    _AX5043_DACVALUE0NB                                         =  005331 G
+    _AX5043_DACVALUE1                                           =  004330 G
+    _AX5043_DACVALUE1NB                                         =  005330 G
+    _AX5043_DECIMATION                                          =  004102 G
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 7.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    _AX5043_DECIMATIONNB                                        =  005102 G
+    _AX5043_DIVERSITY                                           =  004042 G
+    _AX5043_DIVERSITYNB                                         =  005042 G
+    _AX5043_DRGAIN0                                             =  004125 G
+    _AX5043_DRGAIN0NB                                           =  005125 G
+    _AX5043_DRGAIN1                                             =  004135 G
+    _AX5043_DRGAIN1NB                                           =  005135 G
+    _AX5043_DRGAIN2                                             =  004145 G
+    _AX5043_DRGAIN2NB                                           =  005145 G
+    _AX5043_DRGAIN3                                             =  004155 G
+    _AX5043_DRGAIN3NB                                           =  005155 G
+    _AX5043_ENCODING                                            =  004011 G
+    _AX5043_ENCODINGNB                                          =  005011 G
+    _AX5043_FEC                                                 =  004018 G
+    _AX5043_FECNB                                               =  005018 G
+    _AX5043_FECSTATUS                                           =  00401A G
+    _AX5043_FECSTATUSNB                                         =  00501A G
+    _AX5043_FECSYNC                                             =  004019 G
+    _AX5043_FECSYNCNB                                           =  005019 G
+    _AX5043_FIFOCOUNT0                                          =  00402B G
+    _AX5043_FIFOCOUNT0NB                                        =  00502B G
+    _AX5043_FIFOCOUNT1                                          =  00402A G
+    _AX5043_FIFOCOUNT1NB                                        =  00502A G
+    _AX5043_FIFODATA                                            =  004029 G
+    _AX5043_FIFODATANB                                          =  005029 G
+    _AX5043_FIFOFREE0                                           =  00402D G
+    _AX5043_FIFOFREE0NB                                         =  00502D G
+    _AX5043_FIFOFREE1                                           =  00402C G
+    _AX5043_FIFOFREE1NB                                         =  00502C G
+    _AX5043_FIFOSTAT                                            =  004028 G
+    _AX5043_FIFOSTATNB                                          =  005028 G
+    _AX5043_FIFOTHRESH0                                         =  00402F G
+    _AX5043_FIFOTHRESH0NB                                       =  00502F G
+    _AX5043_FIFOTHRESH1                                         =  00402E G
+    _AX5043_FIFOTHRESH1NB                                       =  00502E G
+    _AX5043_FOURFSK0                                            =  00412E G
+    _AX5043_FOURFSK0NB                                          =  00512E G
+    _AX5043_FOURFSK1                                            =  00413E G
+    _AX5043_FOURFSK1NB                                          =  00513E G
+    _AX5043_FOURFSK2                                            =  00414E G
+    _AX5043_FOURFSK2NB                                          =  00514E G
+    _AX5043_FOURFSK3                                            =  00415E G
+    _AX5043_FOURFSK3NB                                          =  00515E G
+    _AX5043_FRAMING                                             =  004012 G
+    _AX5043_FRAMINGNB                                           =  005012 G
+    _AX5043_FREQA0                                              =  004037 G
+    _AX5043_FREQA0NB                                            =  005037 G
+    _AX5043_FREQA1                                              =  004036 G
+    _AX5043_FREQA1NB                                            =  005036 G
+    _AX5043_FREQA2                                              =  004035 G
+    _AX5043_FREQA2NB                                            =  005035 G
+    _AX5043_FREQA3                                              =  004034 G
+    _AX5043_FREQA3NB                                            =  005034 G
+    _AX5043_FREQB0                                              =  00403F G
+    _AX5043_FREQB0NB                                            =  00503F G
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 8.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    _AX5043_FREQB1                                              =  00403E G
+    _AX5043_FREQB1NB                                            =  00503E G
+    _AX5043_FREQB2                                              =  00403D G
+    _AX5043_FREQB2NB                                            =  00503D G
+    _AX5043_FREQB3                                              =  00403C G
+    _AX5043_FREQB3NB                                            =  00503C G
+    _AX5043_FREQDEV00                                           =  00412D G
+    _AX5043_FREQDEV00NB                                         =  00512D G
+    _AX5043_FREQDEV01                                           =  00413D G
+    _AX5043_FREQDEV01NB                                         =  00513D G
+    _AX5043_FREQDEV02                                           =  00414D G
+    _AX5043_FREQDEV02NB                                         =  00514D G
+    _AX5043_FREQDEV03                                           =  00415D G
+    _AX5043_FREQDEV03NB                                         =  00515D G
+    _AX5043_FREQDEV10                                           =  00412C G
+    _AX5043_FREQDEV10NB                                         =  00512C G
+    _AX5043_FREQDEV11                                           =  00413C G
+    _AX5043_FREQDEV11NB                                         =  00513C G
+    _AX5043_FREQDEV12                                           =  00414C G
+    _AX5043_FREQDEV12NB                                         =  00514C G
+    _AX5043_FREQDEV13                                           =  00415C G
+    _AX5043_FREQDEV13NB                                         =  00515C G
+    _AX5043_FREQUENCYGAINA0                                     =  004127 G
+    _AX5043_FREQUENCYGAINA0NB                                   =  005127 G
+    _AX5043_FREQUENCYGAINA1                                     =  004137 G
+    _AX5043_FREQUENCYGAINA1NB                                   =  005137 G
+    _AX5043_FREQUENCYGAINA2                                     =  004147 G
+    _AX5043_FREQUENCYGAINA2NB                                   =  005147 G
+    _AX5043_FREQUENCYGAINA3                                     =  004157 G
+    _AX5043_FREQUENCYGAINA3NB                                   =  005157 G
+    _AX5043_FREQUENCYGAINB0                                     =  004128 G
+    _AX5043_FREQUENCYGAINB0NB                                   =  005128 G
+    _AX5043_FREQUENCYGAINB1                                     =  004138 G
+    _AX5043_FREQUENCYGAINB1NB                                   =  005138 G
+    _AX5043_FREQUENCYGAINB2                                     =  004148 G
+    _AX5043_FREQUENCYGAINB2NB                                   =  005148 G
+    _AX5043_FREQUENCYGAINB3                                     =  004158 G
+    _AX5043_FREQUENCYGAINB3NB                                   =  005158 G
+    _AX5043_FREQUENCYGAINC0                                     =  004129 G
+    _AX5043_FREQUENCYGAINC0NB                                   =  005129 G
+    _AX5043_FREQUENCYGAINC1                                     =  004139 G
+    _AX5043_FREQUENCYGAINC1NB                                   =  005139 G
+    _AX5043_FREQUENCYGAINC2                                     =  004149 G
+    _AX5043_FREQUENCYGAINC2NB                                   =  005149 G
+    _AX5043_FREQUENCYGAINC3                                     =  004159 G
+    _AX5043_FREQUENCYGAINC3NB                                   =  005159 G
+    _AX5043_FREQUENCYGAIND0                                     =  00412A G
+    _AX5043_FREQUENCYGAIND0NB                                   =  00512A G
+    _AX5043_FREQUENCYGAIND1                                     =  00413A G
+    _AX5043_FREQUENCYGAIND1NB                                   =  00513A G
+    _AX5043_FREQUENCYGAIND2                                     =  00414A G
+    _AX5043_FREQUENCYGAIND2NB                                   =  00514A G
+    _AX5043_FREQUENCYGAIND3                                     =  00415A G
+    _AX5043_FREQUENCYGAIND3NB                                   =  00515A G
+    _AX5043_FREQUENCYLEAK                                       =  004116 G
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 9.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    _AX5043_FREQUENCYLEAKNB                                     =  005116 G
+    _AX5043_FSKDEV0                                             =  004163 G
+    _AX5043_FSKDEV0NB                                           =  005163 G
+    _AX5043_FSKDEV1                                             =  004162 G
+    _AX5043_FSKDEV1NB                                           =  005162 G
+    _AX5043_FSKDEV2                                             =  004161 G
+    _AX5043_FSKDEV2NB                                           =  005161 G
+    _AX5043_FSKDMAX0                                            =  00410D G
+    _AX5043_FSKDMAX0NB                                          =  00510D G
+    _AX5043_FSKDMAX1                                            =  00410C G
+    _AX5043_FSKDMAX1NB                                          =  00510C G
+    _AX5043_FSKDMIN0                                            =  00410F G
+    _AX5043_FSKDMIN0NB                                          =  00510F G
+    _AX5043_FSKDMIN1                                            =  00410E G
+    _AX5043_FSKDMIN1NB                                          =  00510E G
+    _AX5043_GPADC13VALUE0                                       =  004309 G
+    _AX5043_GPADC13VALUE0NB                                     =  005309 G
+    _AX5043_GPADC13VALUE1                                       =  004308 G
+    _AX5043_GPADC13VALUE1NB                                     =  005308 G
+    _AX5043_GPADCCTRL                                           =  004300 G
+    _AX5043_GPADCCTRLNB                                         =  005300 G
+    _AX5043_GPADCPERIOD                                         =  004301 G
+    _AX5043_GPADCPERIODNB                                       =  005301 G
+    _AX5043_IFFREQ0                                             =  004101 G
+    _AX5043_IFFREQ0NB                                           =  005101 G
+    _AX5043_IFFREQ1                                             =  004100 G
+    _AX5043_IFFREQ1NB                                           =  005100 G
+    _AX5043_IRQINVERSION0                                       =  00400B G
+    _AX5043_IRQINVERSION0NB                                     =  00500B G
+    _AX5043_IRQINVERSION1                                       =  00400A G
+    _AX5043_IRQINVERSION1NB                                     =  00500A G
+    _AX5043_IRQMASK0                                            =  004007 G
+    _AX5043_IRQMASK0NB                                          =  005007 G
+    _AX5043_IRQMASK1                                            =  004006 G
+    _AX5043_IRQMASK1NB                                          =  005006 G
+    _AX5043_IRQREQUEST0                                         =  00400D G
+    _AX5043_IRQREQUEST0NB                                       =  00500D G
+    _AX5043_IRQREQUEST1                                         =  00400C G
+    _AX5043_IRQREQUEST1NB                                       =  00500C G
+    _AX5043_LPOSCCONFIG                                         =  004310 G
+    _AX5043_LPOSCCONFIGNB                                       =  005310 G
+    _AX5043_LPOSCFREQ0                                          =  004317 G
+    _AX5043_LPOSCFREQ0NB                                        =  005317 G
+    _AX5043_LPOSCFREQ1                                          =  004316 G
+    _AX5043_LPOSCFREQ1NB                                        =  005316 G
+    _AX5043_LPOSCKFILT0                                         =  004313 G
+    _AX5043_LPOSCKFILT0NB                                       =  005313 G
+    _AX5043_LPOSCKFILT1                                         =  004312 G
+    _AX5043_LPOSCKFILT1NB                                       =  005312 G
+    _AX5043_LPOSCPER0                                           =  004319 G
+    _AX5043_LPOSCPER0NB                                         =  005319 G
+    _AX5043_LPOSCPER1                                           =  004318 G
+    _AX5043_LPOSCPER1NB                                         =  005318 G
+    _AX5043_LPOSCREF0                                           =  004315 G
+    _AX5043_LPOSCREF0NB                                         =  005315 G
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 10.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    _AX5043_LPOSCREF1                                           =  004314 G
+    _AX5043_LPOSCREF1NB                                         =  005314 G
+    _AX5043_LPOSCSTATUS                                         =  004311 G
+    _AX5043_LPOSCSTATUSNB                                       =  005311 G
+    _AX5043_MATCH0LEN                                           =  004214 G
+    _AX5043_MATCH0LENNB                                         =  005214 G
+    _AX5043_MATCH0MAX                                           =  004216 G
+    _AX5043_MATCH0MAXNB                                         =  005216 G
+    _AX5043_MATCH0MIN                                           =  004215 G
+    _AX5043_MATCH0MINNB                                         =  005215 G
+    _AX5043_MATCH0PAT0                                          =  004213 G
+    _AX5043_MATCH0PAT0NB                                        =  005213 G
+    _AX5043_MATCH0PAT1                                          =  004212 G
+    _AX5043_MATCH0PAT1NB                                        =  005212 G
+    _AX5043_MATCH0PAT2                                          =  004211 G
+    _AX5043_MATCH0PAT2NB                                        =  005211 G
+    _AX5043_MATCH0PAT3                                          =  004210 G
+    _AX5043_MATCH0PAT3NB                                        =  005210 G
+    _AX5043_MATCH1LEN                                           =  00421C G
+    _AX5043_MATCH1LENNB                                         =  00521C G
+    _AX5043_MATCH1MAX                                           =  00421E G
+    _AX5043_MATCH1MAXNB                                         =  00521E G
+    _AX5043_MATCH1MIN                                           =  00421D G
+    _AX5043_MATCH1MINNB                                         =  00521D G
+    _AX5043_MATCH1PAT0                                          =  004219 G
+    _AX5043_MATCH1PAT0NB                                        =  005219 G
+    _AX5043_MATCH1PAT1                                          =  004218 G
+    _AX5043_MATCH1PAT1NB                                        =  005218 G
+    _AX5043_MAXDROFFSET0                                        =  004108 G
+    _AX5043_MAXDROFFSET0NB                                      =  005108 G
+    _AX5043_MAXDROFFSET1                                        =  004107 G
+    _AX5043_MAXDROFFSET1NB                                      =  005107 G
+    _AX5043_MAXDROFFSET2                                        =  004106 G
+    _AX5043_MAXDROFFSET2NB                                      =  005106 G
+    _AX5043_MAXRFOFFSET0                                        =  00410B G
+    _AX5043_MAXRFOFFSET0NB                                      =  00510B G
+    _AX5043_MAXRFOFFSET1                                        =  00410A G
+    _AX5043_MAXRFOFFSET1NB                                      =  00510A G
+    _AX5043_MAXRFOFFSET2                                        =  004109 G
+    _AX5043_MAXRFOFFSET2NB                                      =  005109 G
+    _AX5043_MODCFGA                                             =  004164 G
+    _AX5043_MODCFGANB                                           =  005164 G
+    _AX5043_MODCFGF                                             =  004160 G
+    _AX5043_MODCFGFNB                                           =  005160 G
+    _AX5043_MODCFGP                                             =  004F5F G
+    _AX5043_MODCFGPNB                                           =  005F5F G
+    _AX5043_MODULATION                                          =  004010 G
+    _AX5043_MODULATIONNB                                        =  005010 G
+    _AX5043_PHASEGAIN0                                          =  004126 G
+    _AX5043_PHASEGAIN0NB                                        =  005126 G
+    _AX5043_PHASEGAIN1                                          =  004136 G
+    _AX5043_PHASEGAIN1NB                                        =  005136 G
+    _AX5043_PHASEGAIN2                                          =  004146 G
+    _AX5043_PHASEGAIN2NB                                        =  005146 G
+    _AX5043_PHASEGAIN3                                          =  004156 G
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 11.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    _AX5043_PHASEGAIN3NB                                        =  005156 G
+    _AX5043_PINFUNCANTSEL                                       =  004025 G
+    _AX5043_PINFUNCANTSELNB                                     =  005025 G
+    _AX5043_PINFUNCDATA                                         =  004023 G
+    _AX5043_PINFUNCDATANB                                       =  005023 G
+    _AX5043_PINFUNCDCLK                                         =  004022 G
+    _AX5043_PINFUNCDCLKNB                                       =  005022 G
+    _AX5043_PINFUNCIRQ                                          =  004024 G
+    _AX5043_PINFUNCIRQNB                                        =  005024 G
+    _AX5043_PINFUNCPWRAMP                                       =  004026 G
+    _AX5043_PINFUNCPWRAMPNB                                     =  005026 G
+    _AX5043_PINFUNCSYSCLK                                       =  004021 G
+    _AX5043_PINFUNCSYSCLKNB                                     =  005021 G
+    _AX5043_PINSTATE                                            =  004020 G
+    _AX5043_PINSTATENB                                          =  005020 G
+    _AX5043_PKTACCEPTFLAGS                                      =  004233 G
+    _AX5043_PKTACCEPTFLAGSNB                                    =  005233 G
+    _AX5043_PKTADDR0                                            =  004207 G
+    _AX5043_PKTADDR0NB                                          =  005207 G
+    _AX5043_PKTADDR1                                            =  004206 G
+    _AX5043_PKTADDR1NB                                          =  005206 G
+    _AX5043_PKTADDR2                                            =  004205 G
+    _AX5043_PKTADDR2NB                                          =  005205 G
+    _AX5043_PKTADDR3                                            =  004204 G
+    _AX5043_PKTADDR3NB                                          =  005204 G
+    _AX5043_PKTADDRCFG                                          =  004200 G
+    _AX5043_PKTADDRCFGNB                                        =  005200 G
+    _AX5043_PKTADDRMASK0                                        =  00420B G
+    _AX5043_PKTADDRMASK0NB                                      =  00520B G
+    _AX5043_PKTADDRMASK1                                        =  00420A G
+    _AX5043_PKTADDRMASK1NB                                      =  00520A G
+    _AX5043_PKTADDRMASK2                                        =  004209 G
+    _AX5043_PKTADDRMASK2NB                                      =  005209 G
+    _AX5043_PKTADDRMASK3                                        =  004208 G
+    _AX5043_PKTADDRMASK3NB                                      =  005208 G
+    _AX5043_PKTCHUNKSIZE                                        =  004230 G
+    _AX5043_PKTCHUNKSIZENB                                      =  005230 G
+    _AX5043_PKTLENCFG                                           =  004201 G
+    _AX5043_PKTLENCFGNB                                         =  005201 G
+    _AX5043_PKTLENOFFSET                                        =  004202 G
+    _AX5043_PKTLENOFFSETNB                                      =  005202 G
+    _AX5043_PKTMAXLEN                                           =  004203 G
+    _AX5043_PKTMAXLENNB                                         =  005203 G
+    _AX5043_PKTMISCFLAGS                                        =  004231 G
+    _AX5043_PKTMISCFLAGSNB                                      =  005231 G
+    _AX5043_PKTSTOREFLAGS                                       =  004232 G
+    _AX5043_PKTSTOREFLAGSNB                                     =  005232 G
+    _AX5043_PLLCPI                                              =  004031 G
+    _AX5043_PLLCPIBOOST                                         =  004039 G
+    _AX5043_PLLCPIBOOSTNB                                       =  005039 G
+    _AX5043_PLLCPINB                                            =  005031 G
+    _AX5043_PLLLOCKDET                                          =  004182 G
+    _AX5043_PLLLOCKDETNB                                        =  005182 G
+    _AX5043_PLLLOOP                                             =  004030 G
+    _AX5043_PLLLOOPBOOST                                        =  004038 G
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 12.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    _AX5043_PLLLOOPBOOSTNB                                      =  005038 G
+    _AX5043_PLLLOOPNB                                           =  005030 G
+    _AX5043_PLLRANGINGA                                         =  004033 G
+    _AX5043_PLLRANGINGANB                                       =  005033 G
+    _AX5043_PLLRANGINGB                                         =  00403B G
+    _AX5043_PLLRANGINGBNB                                       =  00503B G
+    _AX5043_PLLRNGCLK                                           =  004183 G
+    _AX5043_PLLRNGCLKNB                                         =  005183 G
+    _AX5043_PLLVCODIV                                           =  004032 G
+    _AX5043_PLLVCODIVNB                                         =  005032 G
+    _AX5043_PLLVCOI                                             =  004180 G
+    _AX5043_PLLVCOINB                                           =  005180 G
+    _AX5043_PLLVCOIR                                            =  004181 G
+    _AX5043_PLLVCOIRNB                                          =  005181 G
+    _AX5043_POWCTRL1                                            =  004F08 G
+    _AX5043_POWCTRL1NB                                          =  005F08 G
+    _AX5043_POWIRQMASK                                          =  004005 G
+    _AX5043_POWIRQMASKNB                                        =  005005 G
+    _AX5043_POWSTAT                                             =  004003 G
+    _AX5043_POWSTATNB                                           =  005003 G
+    _AX5043_POWSTICKYSTAT                                       =  004004 G
+    _AX5043_POWSTICKYSTATNB                                     =  005004 G
+    _AX5043_PWRAMP                                              =  004027 G
+    _AX5043_PWRAMPNB                                            =  005027 G
+    _AX5043_PWRMODE                                             =  004002 G
+    _AX5043_PWRMODENB                                           =  005002 G
+    _AX5043_RADIOEVENTMASK0                                     =  004009 G
+    _AX5043_RADIOEVENTMASK0NB                                   =  005009 G
+    _AX5043_RADIOEVENTMASK1                                     =  004008 G
+    _AX5043_RADIOEVENTMASK1NB                                   =  005008 G
+    _AX5043_RADIOEVENTREQ0                                      =  00400F G
+    _AX5043_RADIOEVENTREQ0NB                                    =  00500F G
+    _AX5043_RADIOEVENTREQ1                                      =  00400E G
+    _AX5043_RADIOEVENTREQ1NB                                    =  00500E G
+    _AX5043_RADIOSTATE                                          =  00401C G
+    _AX5043_RADIOSTATENB                                        =  00501C G
+    _AX5043_REF                                                 =  004F0D G
+    _AX5043_REFNB                                               =  005F0D G
+    _AX5043_RSSI                                                =  004040 G
+    _AX5043_RSSIABSTHR                                          =  00422D G
+    _AX5043_RSSIABSTHRNB                                        =  00522D G
+    _AX5043_RSSINB                                              =  005040 G
+    _AX5043_RSSIREFERENCE                                       =  00422C G
+    _AX5043_RSSIREFERENCENB                                     =  00522C G
+    _AX5043_RXDATARATE0                                         =  004105 G
+    _AX5043_RXDATARATE0NB                                       =  005105 G
+    _AX5043_RXDATARATE1                                         =  004104 G
+    _AX5043_RXDATARATE1NB                                       =  005104 G
+    _AX5043_RXDATARATE2                                         =  004103 G
+    _AX5043_RXDATARATE2NB                                       =  005103 G
+    _AX5043_RXPARAMCURSET                                       =  004118 G
+    _AX5043_RXPARAMCURSETNB                                     =  005118 G
+    _AX5043_RXPARAMSETS                                         =  004117 G
+    _AX5043_RXPARAMSETSNB                                       =  005117 G
+    _AX5043_SCRATCH                                             =  004001 G
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 13.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    _AX5043_SCRATCHNB                                           =  005001 G
+    _AX5043_SILICONREVISION                                     =  004000 G
+    _AX5043_SILICONREVISIONNB                                   =  005000 G
+    _AX5043_TIMEGAIN0                                           =  004124 G
+    _AX5043_TIMEGAIN0NB                                         =  005124 G
+    _AX5043_TIMEGAIN1                                           =  004134 G
+    _AX5043_TIMEGAIN1NB                                         =  005134 G
+    _AX5043_TIMEGAIN2                                           =  004144 G
+    _AX5043_TIMEGAIN2NB                                         =  005144 G
+    _AX5043_TIMEGAIN3                                           =  004154 G
+    _AX5043_TIMEGAIN3NB                                         =  005154 G
+    _AX5043_TIMER0                                              =  00405B G
+    _AX5043_TIMER0NB                                            =  00505B G
+    _AX5043_TIMER1                                              =  00405A G
+    _AX5043_TIMER1NB                                            =  00505A G
+    _AX5043_TIMER2                                              =  004059 G
+    _AX5043_TIMER2NB                                            =  005059 G
+    _AX5043_TMGRXAGC                                            =  004227 G
+    _AX5043_TMGRXAGCNB                                          =  005227 G
+    _AX5043_TMGRXBOOST                                          =  004223 G
+    _AX5043_TMGRXBOOSTNB                                        =  005223 G
+    _AX5043_TMGRXCOARSEAGC                                      =  004226 G
+    _AX5043_TMGRXCOARSEAGCNB                                    =  005226 G
+    _AX5043_TMGRXOFFSACQ                                        =  004225 G
+    _AX5043_TMGRXOFFSACQNB                                      =  005225 G
+    _AX5043_TMGRXPREAMBLE1                                      =  004229 G
+    _AX5043_TMGRXPREAMBLE1NB                                    =  005229 G
+    _AX5043_TMGRXPREAMBLE2                                      =  00422A G
+    _AX5043_TMGRXPREAMBLE2NB                                    =  00522A G
+    _AX5043_TMGRXPREAMBLE3                                      =  00422B G
+    _AX5043_TMGRXPREAMBLE3NB                                    =  00522B G
+    _AX5043_TMGRXRSSI                                           =  004228 G
+    _AX5043_TMGRXRSSINB                                         =  005228 G
+    _AX5043_TMGRXSETTLE                                         =  004224 G
+    _AX5043_TMGRXSETTLENB                                       =  005224 G
+    _AX5043_TMGTXBOOST                                          =  004220 G
+    _AX5043_TMGTXBOOSTNB                                        =  005220 G
+    _AX5043_TMGTXSETTLE                                         =  004221 G
+    _AX5043_TMGTXSETTLENB                                       =  005221 G
+    _AX5043_TRKAFSKDEMOD0                                       =  004055 G
+    _AX5043_TRKAFSKDEMOD0NB                                     =  005055 G
+    _AX5043_TRKAFSKDEMOD1                                       =  004054 G
+    _AX5043_TRKAFSKDEMOD1NB                                     =  005054 G
+    _AX5043_TRKAMPLITUDE0                                       =  004049 G
+    _AX5043_TRKAMPLITUDE0NB                                     =  005049 G
+    _AX5043_TRKAMPLITUDE1                                       =  004048 G
+    _AX5043_TRKAMPLITUDE1NB                                     =  005048 G
+    _AX5043_TRKDATARATE0                                        =  004047 G
+    _AX5043_TRKDATARATE0NB                                      =  005047 G
+    _AX5043_TRKDATARATE1                                        =  004046 G
+    _AX5043_TRKDATARATE1NB                                      =  005046 G
+    _AX5043_TRKDATARATE2                                        =  004045 G
+    _AX5043_TRKDATARATE2NB                                      =  005045 G
+    _AX5043_TRKFREQ0                                            =  004051 G
+    _AX5043_TRKFREQ0NB                                          =  005051 G
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 14.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    _AX5043_TRKFREQ1                                            =  004050 G
+    _AX5043_TRKFREQ1NB                                          =  005050 G
+    _AX5043_TRKFSKDEMOD0                                        =  004053 G
+    _AX5043_TRKFSKDEMOD0NB                                      =  005053 G
+    _AX5043_TRKFSKDEMOD1                                        =  004052 G
+    _AX5043_TRKFSKDEMOD1NB                                      =  005052 G
+    _AX5043_TRKPHASE0                                           =  00404B G
+    _AX5043_TRKPHASE0NB                                         =  00504B G
+    _AX5043_TRKPHASE1                                           =  00404A G
+    _AX5043_TRKPHASE1NB                                         =  00504A G
+    _AX5043_TRKRFFREQ0                                          =  00404F G
+    _AX5043_TRKRFFREQ0NB                                        =  00504F G
+    _AX5043_TRKRFFREQ1                                          =  00404E G
+    _AX5043_TRKRFFREQ1NB                                        =  00504E G
+    _AX5043_TRKRFFREQ2                                          =  00404D G
+    _AX5043_TRKRFFREQ2NB                                        =  00504D G
+    _AX5043_TXPWRCOEFFA0                                        =  004169 G
+    _AX5043_TXPWRCOEFFA0NB                                      =  005169 G
+    _AX5043_TXPWRCOEFFA1                                        =  004168 G
+    _AX5043_TXPWRCOEFFA1NB                                      =  005168 G
+    _AX5043_TXPWRCOEFFB0                                        =  00416B G
+    _AX5043_TXPWRCOEFFB0NB                                      =  00516B G
+    _AX5043_TXPWRCOEFFB1                                        =  00416A G
+    _AX5043_TXPWRCOEFFB1NB                                      =  00516A G
+    _AX5043_TXPWRCOEFFC0                                        =  00416D G
+    _AX5043_TXPWRCOEFFC0NB                                      =  00516D G
+    _AX5043_TXPWRCOEFFC1                                        =  00416C G
+    _AX5043_TXPWRCOEFFC1NB                                      =  00516C G
+    _AX5043_TXPWRCOEFFD0                                        =  00416F G
+    _AX5043_TXPWRCOEFFD0NB                                      =  00516F G
+    _AX5043_TXPWRCOEFFD1                                        =  00416E G
+    _AX5043_TXPWRCOEFFD1NB                                      =  00516E G
+    _AX5043_TXPWRCOEFFE0                                        =  004171 G
+    _AX5043_TXPWRCOEFFE0NB                                      =  005171 G
+    _AX5043_TXPWRCOEFFE1                                        =  004170 G
+    _AX5043_TXPWRCOEFFE1NB                                      =  005170 G
+    _AX5043_TXRATE0                                             =  004167 G
+    _AX5043_TXRATE0NB                                           =  005167 G
+    _AX5043_TXRATE1                                             =  004166 G
+    _AX5043_TXRATE1NB                                           =  005166 G
+    _AX5043_TXRATE2                                             =  004165 G
+    _AX5043_TXRATE2NB                                           =  005165 G
+    _AX5043_WAKEUP0                                             =  00406B G
+    _AX5043_WAKEUP0NB                                           =  00506B G
+    _AX5043_WAKEUP1                                             =  00406A G
+    _AX5043_WAKEUP1NB                                           =  00506A G
+    _AX5043_WAKEUPFREQ0                                         =  00406D G
+    _AX5043_WAKEUPFREQ0NB                                       =  00506D G
+    _AX5043_WAKEUPFREQ1                                         =  00406C G
+    _AX5043_WAKEUPFREQ1NB                                       =  00506C G
+    _AX5043_WAKEUPTIMER0                                        =  004069 G
+    _AX5043_WAKEUPTIMER0NB                                      =  005069 G
+    _AX5043_WAKEUPTIMER1                                        =  004068 G
+    _AX5043_WAKEUPTIMER1NB                                      =  005068 G
+    _AX5043_WAKEUPXOEARLY                                       =  00406E G
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 15.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    _AX5043_WAKEUPXOEARLYNB                                     =  00506E G
+    _AX5043_XTALAMPL                                            =  004F11 G
+    _AX5043_XTALAMPLNB                                          =  005F11 G
+    _AX5043_XTALCAP                                             =  004184 G
+    _AX5043_XTALCAPNB                                           =  005184 G
+    _AX5043_XTALOSC                                             =  004F10 G
+    _AX5043_XTALOSCNB                                           =  005F10 G
+    _AX5043_XTALSTATUS                                          =  00401D G
+    _AX5043_XTALSTATUSNB                                        =  00501D G
+    _B                                                          =  0000F0 G
+    _B_0                                                        =  0000F0 G
+    _B_1                                                        =  0000F1 G
+    _B_2                                                        =  0000F2 G
+    _B_3                                                        =  0000F3 G
+    _B_4                                                        =  0000F4 G
+    _B_5                                                        =  0000F5 G
+    _B_6                                                        =  0000F6 G
+    _B_7                                                        =  0000F7 G
+    _CLKCON                                                     =  0000C6 G
+    _CLKSTAT                                                    =  0000C7 G
+    _CODECONFIG                                                 =  000097 G
+    _CY                                                         =  0000D7 G
+    _DBGLNKBUF                                                  =  0000E3 G
+    _DBGLNKSTAT                                                 =  0000E2 G
+    _DIRA                                                       =  000089 G
+    _DIRB                                                       =  00008A G
+    _DIRC                                                       =  00008B G
+    _DIRR                                                       =  00008E G
+    _DMA0ADDR                                                   =  007010 G
+    _DMA0ADDR0                                                  =  007010 G
+    _DMA0ADDR1                                                  =  007011 G
+    _DMA0CONFIG                                                 =  007014 G
+    _DMA1ADDR                                                   =  007012 G
+    _DMA1ADDR0                                                  =  007012 G
+    _DMA1ADDR1                                                  =  007013 G
+    _DMA1CONFIG                                                 =  007015 G
+    _DPH                                                        =  000083 G
+    _DPH1                                                       =  000085 G
+    _DPL                                                        =  000082 G
+    _DPL1                                                       =  000084 G
+    _DPS                                                        =  000086 G
+    _DPTR0                                                      =  008382 G
+    _DPTR1                                                      =  008584 G
+    _E2IE                                                       =  0000A0 G
+    _E2IE_0                                                     =  0000A0 G
+    _E2IE_1                                                     =  0000A1 G
+    _E2IE_2                                                     =  0000A2 G
+    _E2IE_3                                                     =  0000A3 G
+    _E2IE_4                                                     =  0000A4 G
+    _E2IE_5                                                     =  0000A5 G
+    _E2IE_6                                                     =  0000A6 G
+    _E2IE_7                                                     =  0000A7 G
+    _E2IP                                                       =  0000C0 G
+    _E2IP_0                                                     =  0000C0 G
+    _E2IP_1                                                     =  0000C1 G
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 16.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    _E2IP_2                                                     =  0000C2 G
+    _E2IP_3                                                     =  0000C3 G
+    _E2IP_4                                                     =  0000C4 G
+    _E2IP_5                                                     =  0000C5 G
+    _E2IP_6                                                     =  0000C6 G
+    _E2IP_7                                                     =  0000C7 G
+    _EA                                                         =  0000AF G
+    _EIE                                                        =  000098 G
+    _EIE_0                                                      =  000098 G
+    _EIE_1                                                      =  000099 G
+    _EIE_2                                                      =  00009A G
+    _EIE_3                                                      =  00009B G
+    _EIE_4                                                      =  00009C G
+    _EIE_5                                                      =  00009D G
+    _EIE_6                                                      =  00009E G
+    _EIE_7                                                      =  00009F G
+    _EIP                                                        =  0000B0 G
+    _EIP_0                                                      =  0000B0 G
+    _EIP_1                                                      =  0000B1 G
+    _EIP_2                                                      =  0000B2 G
+    _EIP_3                                                      =  0000B3 G
+    _EIP_4                                                      =  0000B4 G
+    _EIP_5                                                      =  0000B5 G
+    _EIP_6                                                      =  0000B6 G
+    _EIP_7                                                      =  0000B7 G
+    _EXTIRQ                                                     =  007003 G
+    _F0                                                         =  0000D5 G
+    _F1                                                         =  0000D1 G
+    _FRCOSCCONFIG                                               =  007070 G
+    _FRCOSCCTRL                                                 =  007071 G
+    _FRCOSCFREQ                                                 =  007076 G
+    _FRCOSCFREQ0                                                =  007076 G
+    _FRCOSCFREQ1                                                =  007077 G
+    _FRCOSCKFILT                                                =  007072 G
+    _FRCOSCKFILT0                                               =  007072 G
+    _FRCOSCKFILT1                                               =  007073 G
+    _FRCOSCPER                                                  =  007078 G
+    _FRCOSCPER0                                                 =  007078 G
+    _FRCOSCPER1                                                 =  007079 G
+    _FRCOSCREF                                                  =  007074 G
+    _FRCOSCREF0                                                 =  007074 G
+    _FRCOSCREF1                                                 =  007075 G
+    _GPIOENABLE                                                 =  00700C G
+    _IC0CAPT                                                    =  00CFCE G
+    _IC0CAPT0                                                   =  0000CE G
+    _IC0CAPT1                                                   =  0000CF G
+    _IC0MODE                                                    =  0000CC G
+    _IC0STATUS                                                  =  0000CD G
+    _IC1CAPT                                                    =  00D7D6 G
+    _IC1CAPT0                                                   =  0000D6 G
+    _IC1CAPT1                                                   =  0000D7 G
+    _IC1MODE                                                    =  0000D4 G
+    _IC1STATUS                                                  =  0000D5 G
+    _IE                                                         =  0000A8 G
+    _IE_0                                                       =  0000A8 G
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 17.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    _IE_1                                                       =  0000A9 G
+    _IE_2                                                       =  0000AA G
+    _IE_3                                                       =  0000AB G
+    _IE_4                                                       =  0000AC G
+    _IE_5                                                       =  0000AD G
+    _IE_6                                                       =  0000AE G
+    _IE_7                                                       =  0000AF G
+    _INTCHGA                                                    =  007000 G
+    _INTCHGB                                                    =  007001 G
+    _INTCHGC                                                    =  007002 G
+    _IP                                                         =  0000B8 G
+    _IP_0                                                       =  0000B8 G
+    _IP_1                                                       =  0000B9 G
+    _IP_2                                                       =  0000BA G
+    _IP_3                                                       =  0000BB G
+    _IP_4                                                       =  0000BC G
+    _IP_5                                                       =  0000BD G
+    _IP_6                                                       =  0000BE G
+    _IP_7                                                       =  0000BF G
+    _LPOSCCONFIG                                                =  007060 G
+    _LPOSCFREQ                                                  =  007066 G
+    _LPOSCFREQ0                                                 =  007066 G
+    _LPOSCFREQ1                                                 =  007067 G
+    _LPOSCKFILT                                                 =  007062 G
+    _LPOSCKFILT0                                                =  007062 G
+    _LPOSCKFILT1                                                =  007063 G
+    _LPOSCPER                                                   =  007068 G
+    _LPOSCPER0                                                  =  007068 G
+    _LPOSCPER1                                                  =  007069 G
+    _LPOSCREF                                                   =  007064 G
+    _LPOSCREF0                                                  =  007064 G
+    _LPOSCREF1                                                  =  007065 G
+    _LPXOSCGM                                                   =  007054 G
+    _MISCCTRL                                                   =  007F01 G
+    _NVADDR                                                     =  009392 G
+    _NVADDR0                                                    =  000092 G
+    _NVADDR1                                                    =  000093 G
+    _NVDATA                                                     =  009594 G
+    _NVDATA0                                                    =  000094 G
+    _NVDATA1                                                    =  000095 G
+    _NVKEY                                                      =  000096 G
+    _NVSTATUS                                                   =  000091 G
+    _OC0COMP                                                    =  00BDBC G
+    _OC0COMP0                                                   =  0000BC G
+    _OC0COMP1                                                   =  0000BD G
+    _OC0MODE                                                    =  0000B9 G
+    _OC0PIN                                                     =  0000BA G
+    _OC0STATUS                                                  =  0000BB G
+    _OC1COMP                                                    =  00C5C4 G
+    _OC1COMP0                                                   =  0000C4 G
+    _OC1COMP1                                                   =  0000C5 G
+    _OC1MODE                                                    =  0000C1 G
+    _OC1PIN                                                     =  0000C2 G
+    _OC1STATUS                                                  =  0000C3 G
+    _OSCCALIB                                                   =  007053 G
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 18.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    _OSCFORCERUN                                                =  007050 G
+    _OSCREADY                                                   =  007052 G
+    _OSCRUN                                                     =  007051 G
+    _OV                                                         =  0000D2 G
+    _P                                                          =  0000D0 G
+    _PALTA                                                      =  007008 G
+    _PALTB                                                      =  007009 G
+    _PALTC                                                      =  00700A G
+    _PALTRADIO                                                  =  007046 G
+    _PCON                                                       =  000087 G
+    _PINA                                                       =  0000C8 G
+    _PINA_0                                                     =  0000C8 G
+    _PINA_1                                                     =  0000C9 G
+    _PINA_2                                                     =  0000CA G
+    _PINA_3                                                     =  0000CB G
+    _PINA_4                                                     =  0000CC G
+    _PINA_5                                                     =  0000CD G
+    _PINA_6                                                     =  0000CE G
+    _PINA_7                                                     =  0000CF G
+    _PINB                                                       =  0000E8 G
+    _PINB_0                                                     =  0000E8 G
+    _PINB_1                                                     =  0000E9 G
+    _PINB_2                                                     =  0000EA G
+    _PINB_3                                                     =  0000EB G
+    _PINB_4                                                     =  0000EC G
+    _PINB_5                                                     =  0000ED G
+    _PINB_6                                                     =  0000EE G
+    _PINB_7                                                     =  0000EF G
+    _PINC                                                       =  0000F8 G
+    _PINCHGA                                                    =  007004 G
+    _PINCHGB                                                    =  007005 G
+    _PINCHGC                                                    =  007006 G
+    _PINC_0                                                     =  0000F8 G
+    _PINC_1                                                     =  0000F9 G
+    _PINC_2                                                     =  0000FA G
+    _PINC_3                                                     =  0000FB G
+    _PINC_4                                                     =  0000FC G
+    _PINC_5                                                     =  0000FD G
+    _PINC_6                                                     =  0000FE G
+    _PINC_7                                                     =  0000FF G
+    _PINR                                                       =  00008D G
+    _PINSEL                                                     =  00700B G
+    _PORTA                                                      =  000080 G
+    _PORTA_0                                                    =  000080 G
+    _PORTA_1                                                    =  000081 G
+    _PORTA_2                                                    =  000082 G
+    _PORTA_3                                                    =  000083 G
+    _PORTA_4                                                    =  000084 G
+    _PORTA_5                                                    =  000085 G
+    _PORTA_6                                                    =  000086 G
+    _PORTA_7                                                    =  000087 G
+    _PORTB                                                      =  000088 G
+    _PORTB_0                                                    =  000088 G
+    _PORTB_1                                                    =  000089 G
+    _PORTB_2                                                    =  00008A G
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 19.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    _PORTB_3                                                    =  00008B G
+    _PORTB_4                                                    =  00008C G
+    _PORTB_5                                                    =  00008D G
+    _PORTB_6                                                    =  00008E G
+    _PORTB_7                                                    =  00008F G
+    _PORTC                                                      =  000090 G
+    _PORTC_0                                                    =  000090 G
+    _PORTC_1                                                    =  000091 G
+    _PORTC_2                                                    =  000092 G
+    _PORTC_3                                                    =  000093 G
+    _PORTC_4                                                    =  000094 G
+    _PORTC_5                                                    =  000095 G
+    _PORTC_6                                                    =  000096 G
+    _PORTC_7                                                    =  000097 G
+    _PORTR                                                      =  00008C G
+    _PSW                                                        =  0000D0 G
+    _RADIOACC                                                   =  0000B1 G
+    _RADIOADDR                                                  =  00B2B3 G
+    _RADIOADDR0                                                 =  0000B3 G
+    _RADIOADDR1                                                 =  0000B2 G
+    _RADIODATA                                                  =  B4B5B6B7 G
+    _RADIODATA0                                                 =  0000B7 G
+    _RADIODATA1                                                 =  0000B6 G
+    _RADIODATA2                                                 =  0000B5 G
+    _RADIODATA3                                                 =  0000B4 G
+    _RADIOFDATAADDR                                             =  007040 G
+    _RADIOFDATAADDR0                                            =  007040 G
+    _RADIOFDATAADDR1                                            =  007041 G
+    _RADIOFSTATADDR                                             =  007042 G
+    _RADIOFSTATADDR0                                            =  007042 G
+    _RADIOFSTATADDR1                                            =  007043 G
+    _RADIOMUX                                                   =  007044 G
+    _RADIOSTAT                                                  =  00BFBE G
+    _RADIOSTAT0                                                 =  0000BE G
+    _RADIOSTAT1                                                 =  0000BF G
+    _RS0                                                        =  0000D3 G
+    _RS1                                                        =  0000D4 G
+    _SCRATCH0                                                   =  007084 G
+    _SCRATCH1                                                   =  007085 G
+    _SCRATCH2                                                   =  007086 G
+    _SCRATCH3                                                   =  007087 G
+    _SILICONREV                                                 =  007F00 G
+    _SP                                                         =  000081 G
+    _SPCLKSRC                                                   =  0000DF G
+    _SPMODE                                                     =  0000DC G
+    _SPSHREG                                                    =  0000DE G
+    _SPSTATUS                                                   =  0000DD G
+    _T0CLKSRC                                                   =  00009A G
+    _T0CNT                                                      =  009D9C G
+    _T0CNT0                                                     =  00009C G
+    _T0CNT1                                                     =  00009D G
+    _T0MODE                                                     =  000099 G
+    _T0PERIOD                                                   =  009F9E G
+    _T0PERIOD0                                                  =  00009E G
+    _T0PERIOD1                                                  =  00009F G
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 20.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    _T0STATUS                                                   =  00009B G
+    _T1CLKSRC                                                   =  0000A2 G
+    _T1CNT                                                      =  00A5A4 G
+    _T1CNT0                                                     =  0000A4 G
+    _T1CNT1                                                     =  0000A5 G
+    _T1MODE                                                     =  0000A1 G
+    _T1PERIOD                                                   =  00A7A6 G
+    _T1PERIOD0                                                  =  0000A6 G
+    _T1PERIOD1                                                  =  0000A7 G
+    _T1STATUS                                                   =  0000A3 G
+    _T2CLKSRC                                                   =  0000AA G
+    _T2CNT                                                      =  00ADAC G
+    _T2CNT0                                                     =  0000AC G
+    _T2CNT1                                                     =  0000AD G
+    _T2MODE                                                     =  0000A9 G
+    _T2PERIOD                                                   =  00AFAE G
+    _T2PERIOD0                                                  =  0000AE G
+    _T2PERIOD1                                                  =  0000AF G
+    _T2STATUS                                                   =  0000AB G
+    _U0CTRL                                                     =  0000E4 G
+    _U0MODE                                                     =  0000E7 G
+    _U0SHREG                                                    =  0000E6 G
+    _U0STATUS                                                   =  0000E5 G
+    _U1CTRL                                                     =  0000EC G
+    _U1MODE                                                     =  0000EF G
+    _U1SHREG                                                    =  0000EE G
+    _U1STATUS                                                   =  0000ED G
+    _WDTCFG                                                     =  0000DA G
+    _WDTRESET                                                   =  0000DB G
+    _WTCFGA                                                     =  0000F1 G
+    _WTCFGB                                                     =  0000F9 G
+    _WTCNTA                                                     =  00F3F2 G
+    _WTCNTA0                                                    =  0000F2 G
+    _WTCNTA1                                                    =  0000F3 G
+    _WTCNTB                                                     =  00FBFA G
+    _WTCNTB0                                                    =  0000FA G
+    _WTCNTB1                                                    =  0000FB G
+    _WTCNTR1                                                    =  0000EB G
+    _WTEVTA                                                     =  00F5F4 G
+    _WTEVTA0                                                    =  0000F4 G
+    _WTEVTA1                                                    =  0000F5 G
+    _WTEVTB                                                     =  00F7F6 G
+    _WTEVTB0                                                    =  0000F6 G
+    _WTEVTB1                                                    =  0000F7 G
+    _WTEVTC                                                     =  00FDFC G
+    _WTEVTC0                                                    =  0000FC G
+    _WTEVTC1                                                    =  0000FD G
+    _WTEVTD                                                     =  00FFFE G
+    _WTEVTD0                                                    =  0000FE G
+    _WTEVTD1                                                    =  0000FF G
+    _WTIRQEN                                                    =  0000E9 G
+    _WTSTAT                                                     =  0000EA G
+    _XPAGE                                                      =  0000D9 G
+    _XTALAMPL                                                   =  007F19 G
+    _XTALOSC                                                    =  007F18 G
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 21.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    _XTALREADY                                                  =  007F1A G
+    __XPAGE                                                     =  0000D9 G
+ 16 _ax5043_set_registers                                          000000 GR
+ 16 _ax5043_set_registers_rx                                       0002E1 GR
+ 16 _ax5043_set_registers_rxcont                                   000317 GR
+ 16 _ax5043_set_registers_rxcont_singleparamset                    000325 GR
+ 16 _ax5043_set_registers_rxwor                                    000304 GR
+ 16 _ax5043_set_registers_tx                                       0002BD GR
+ 16 _axradio_byteconv                                              0005F1 GR
+ 16 _axradio_byteconv_buffer                                       0005F4 GR
+ 16 _axradio_conv_freq_fromhz                                      000345 GR
+ 16 _axradio_conv_freq_fromreg                                     0004D9 GR
+ 16 _axradio_conv_freq_tohz                                        0003F8 GR
+ 16 _axradio_conv_timeinterval_totimer0                            00052B GR
+ 17 _axradio_framing_ack_delay                                     000059 GR
+ 17 _axradio_framing_ack_retransmissions                           00005D GR
+ 17 _axradio_framing_ack_seqnrpos                                  00005E GR
+ 17 _axradio_framing_ack_timeout                                   000055 GR
+ 17 _axradio_framing_addrlen                                       000047 GR
+ 16 _axradio_framing_append_crc                                    000682 GR
+ 16 _axradio_framing_check_crc                                     00063C GR
+ 17 _axradio_framing_destaddrpos                                   000048 GR
+ 17 _axradio_framing_enable_sfdcallback                            000054 GR
+ 17 _axradio_framing_lenmask                                       00004C GR
+ 17 _axradio_framing_lenoffs                                       00004B GR
+ 17 _axradio_framing_lenpos                                        00004A GR
+ 17 _axradio_framing_maclen                                        000046 GR
+ 17 _axradio_framing_minpayloadlen                                 00005F GR
+ 17 _axradio_framing_sourceaddrpos                                 000049 GR
+ 17 _axradio_framing_swcrclen                                      00004D GR
+ 17 _axradio_framing_syncflags                                     000053 GR
+ 17 _axradio_framing_synclen                                       00004E GR
+ 17 _axradio_framing_syncword                                      00004F GR
+ 17 _axradio_fxtal                                                 000098 GR
+ 17 _axradio_lposckfiltmax                                         000096 GR
+ 17 _axradio_phy_chanfreq                                          000003 GR
+ 17 _axradio_phy_channelbusy                                       000034 GR
+  A _axradio_phy_chanpllrng                                        000000 GR
+ 17 _axradio_phy_chanpllrnginit                                    00001B GR
+  A _axradio_phy_chanvcoi                                          00000C GR
+ 17 _axradio_phy_chanvcoiinit                                      000027 GR
+ 17 _axradio_phy_cs_enabled                                        000037 GR
+ 17 _axradio_phy_cs_period                                         000035 GR
+ 17 _axradio_phy_innerfreqloop                                     000000 GR
+ 17 _axradio_phy_lbt_forcetx                                       000039 GR
+ 17 _axradio_phy_lbt_retries                                       000038 GR
+ 17 _axradio_phy_maxfreqoffset                                     00002E GR
+ 17 _axradio_phy_nrchannels                                        000002 GR
+ 17 _axradio_phy_pn9                                               000001 GR
+ 17 _axradio_phy_preamble_appendbits                               000044 GR
+ 17 _axradio_phy_preamble_appendpattern                            000045 GR
+ 17 _axradio_phy_preamble_byte                                     000042 GR
+ 17 _axradio_phy_preamble_flags                                    000043 GR
+ 17 _axradio_phy_preamble_len                                      000040 GR
+ 17 _axradio_phy_preamble_longlen                                  00003E GR
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 22.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+ 17 _axradio_phy_preamble_wor_len                                  00003C GR
+ 17 _axradio_phy_preamble_wor_longlen                              00003A GR
+ 17 _axradio_phy_rssioffset                                        000032 GR
+ 17 _axradio_phy_rssireference                                     000033 GR
+ 17 _axradio_phy_vcocalib                                          00002D GR
+ 16 _axradio_setup_pincfg1                                         00033B GR
+ 16 _axradio_setup_pincfg2                                         000341 GR
+ 17 _axradio_sync_period                                           000062 GR
+ 17 _axradio_sync_slave_initialsyncwindow                          00006E GR
+ 17 _axradio_sync_slave_maxperiod                                  000076 GR
+ 17 _axradio_sync_slave_nrrx                                       000079 GR
+ 17 _axradio_sync_slave_resyncloss                                 000078 GR
+ 17 _axradio_sync_slave_rxadvance                                  00007A GR
+ 17 _axradio_sync_slave_rxtimeout                                  000092 GR
+ 17 _axradio_sync_slave_rxwindow                                   000086 GR
+ 17 _axradio_sync_slave_syncpause                                  000072 GR
+ 17 _axradio_sync_slave_syncwindow                                 00006A GR
+ 17 _axradio_sync_xoscstartup                                      000066 GR
+ 17 _axradio_wor_period                                            000060 GR
+    _bp                                                            ****** GX
+    _crc_crc16_msb                                                 ****** GX
+    _rev8                                                          ****** GX
+    a                                                           =  0000E0 L
+    a.0                                                         =  0000E0 L
+    a.1                                                         =  0000E1 L
+    a.2                                                         =  0000E2 L
+    a.3                                                         =  0000E3 L
+    a.4                                                         =  0000E4 L
+    a.5                                                         =  0000E5 L
+    a.6                                                         =  0000E6 L
+    a.7                                                         =  0000E7 L
+    ac                                                          =  0000D6 L
+    acc                                                         =  0000E0 L
+    acc.0                                                       =  0000E0 L
+    acc.1                                                       =  0000E1 L
+    acc.2                                                       =  0000E2 L
+    acc.3                                                       =  0000E3 L
+    acc.4                                                       =  0000E4 L
+    acc.5                                                       =  0000E5 L
+    acc.6                                                       =  0000E6 L
+    acc.7                                                       =  0000E7 L
+    ar0                                                         =  000000 
+    ar1                                                         =  000001 
+    ar2                                                         =  000002 
+    ar3                                                         =  000003 
+    ar4                                                         =  000004 
+    ar5                                                         =  000005 
+    ar6                                                         =  000006 
+    ar7                                                         =  000007 
+    b                                                           =  0000F0 L
+    b.0                                                         =  0000F0 L
+    b.1                                                         =  0000F1 L
+    b.2                                                         =  0000F2 L
+    b.3                                                         =  0000F3 L
+    b.4                                                         =  0000F4 L
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 23.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    b.5                                                         =  0000F5 L
+    b.6                                                         =  0000F6 L
+    b.7                                                         =  0000F7 L
+    cprl2                                                       =  0000C8 L
+    ct2                                                         =  0000C9 L
+    cy                                                          =  0000D7 L
+    dph                                                         =  000083 L
+    dpl                                                         =  000082 L
+    ea                                                          =  0000AF L
+    es                                                          =  0000AC L
+    et0                                                         =  0000A9 L
+    et1                                                         =  0000AB L
+    et2                                                         =  0000AD L
+    ex0                                                         =  0000A8 L
+    ex1                                                         =  0000AA L
+    exen2                                                       =  0000CB L
+    exf2                                                        =  0000CE L
+    f0                                                          =  0000D5 L
+    ie                                                          =  0000A8 L
+    ie.0                                                        =  0000A8 L
+    ie.1                                                        =  0000A9 L
+    ie.2                                                        =  0000AA L
+    ie.3                                                        =  0000AB L
+    ie.4                                                        =  0000AC L
+    ie.5                                                        =  0000AD L
+    ie.7                                                        =  0000AF L
+    ie0                                                         =  000089 L
+    ie1                                                         =  00008B L
+    int0                                                        =  0000B2 L
+    int1                                                        =  0000B3 L
+    ip                                                          =  0000B8 L
+    ip.0                                                        =  0000B8 L
+    ip.1                                                        =  0000B9 L
+    ip.2                                                        =  0000BA L
+    ip.3                                                        =  0000BB L
+    ip.4                                                        =  0000BC L
+    ip.5                                                        =  0000BD L
+    it0                                                         =  000088 L
+    it1                                                         =  00008A L
+    ov                                                          =  0000D2 L
+    p                                                           =  0000D0 L
+    p0                                                          =  000080 L
+    p0.0                                                        =  000080 L
+    p0.1                                                        =  000081 L
+    p0.2                                                        =  000082 L
+    p0.3                                                        =  000083 L
+    p0.4                                                        =  000084 L
+    p0.5                                                        =  000085 L
+    p0.6                                                        =  000086 L
+    p0.7                                                        =  000087 L
+    p1                                                          =  000090 L
+    p1.0                                                        =  000090 L
+    p1.1                                                        =  000091 L
+    p1.2                                                        =  000092 L
+    p1.3                                                        =  000093 L
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 24.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    p1.4                                                        =  000094 L
+    p1.5                                                        =  000095 L
+    p1.6                                                        =  000096 L
+    p1.7                                                        =  000097 L
+    p2                                                          =  0000A0 L
+    p2.0                                                        =  0000A0 L
+    p2.1                                                        =  0000A1 L
+    p2.2                                                        =  0000A2 L
+    p2.3                                                        =  0000A3 L
+    p2.4                                                        =  0000A4 L
+    p2.5                                                        =  0000A5 L
+    p2.6                                                        =  0000A6 L
+    p2.7                                                        =  0000A7 L
+    p3                                                          =  0000B0 L
+    p3.0                                                        =  0000B0 L
+    p3.1                                                        =  0000B1 L
+    p3.2                                                        =  0000B2 L
+    p3.3                                                        =  0000B3 L
+    p3.4                                                        =  0000B4 L
+    p3.5                                                        =  0000B5 L
+    p3.6                                                        =  0000B6 L
+    p3.7                                                        =  0000B7 L
+    pcon                                                        =  000087 L
+    ps                                                          =  0000BC L
+    psw                                                         =  0000D0 L
+    psw.0                                                       =  0000D0 L
+    psw.1                                                       =  0000D1 L
+    psw.2                                                       =  0000D2 L
+    psw.3                                                       =  0000D3 L
+    psw.4                                                       =  0000D4 L
+    psw.5                                                       =  0000D5 L
+    psw.6                                                       =  0000D6 L
+    psw.7                                                       =  0000D7 L
+    pt0                                                         =  0000B9 L
+    pt1                                                         =  0000BB L
+    pt2                                                         =  0000BD L
+    px0                                                         =  0000B8 L
+    px1                                                         =  0000BA L
+    rb8                                                         =  00009A L
+    rcap2h                                                      =  0000CB L
+    rcap2l                                                      =  0000CA L
+    rclk                                                        =  0000CD L
+    ren                                                         =  00009C L
+    ri                                                          =  000098 L
+    rs0                                                         =  0000D3 L
+    rs1                                                         =  0000D4 L
+    rxd                                                         =  0000B0 L
+    sbuf                                                        =  000099 L
+    scon                                                        =  000098 L
+    scon.0                                                      =  000098 L
+    scon.1                                                      =  000099 L
+    scon.2                                                      =  00009A L
+    scon.3                                                      =  00009B L
+    scon.4                                                      =  00009C L
+    scon.5                                                      =  00009D L
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 25.
+Hexadecimal [24-Bits]
+
+Symbol Table
+
+    scon.6                                                      =  00009E L
+    scon.7                                                      =  00009F L
+    sm0                                                         =  00009F L
+    sm1                                                         =  00009E L
+    sm2                                                         =  00009D L
+    sp                                                          =  000081 L
+    t2con                                                       =  0000C8 L
+    t2con.0                                                     =  0000C8 L
+    t2con.1                                                     =  0000C9 L
+    t2con.2                                                     =  0000CA L
+    t2con.3                                                     =  0000CB L
+    t2con.4                                                     =  0000CC L
+    t2con.5                                                     =  0000CD L
+    t2con.6                                                     =  0000CE L
+    t2con.7                                                     =  0000CF L
+    tb8                                                         =  00009B L
+    tclk                                                        =  0000CC L
+    tcon                                                        =  000088 L
+    tcon.0                                                      =  000088 L
+    tcon.1                                                      =  000089 L
+    tcon.2                                                      =  00008A L
+    tcon.3                                                      =  00008B L
+    tcon.4                                                      =  00008C L
+    tcon.5                                                      =  00008D L
+    tcon.6                                                      =  00008E L
+    tcon.7                                                      =  00008F L
+    tf0                                                         =  00008D L
+    tf1                                                         =  00008F L
+    tf2                                                         =  0000CF L
+    th0                                                         =  00008C L
+    th1                                                         =  00008D L
+    th2                                                         =  0000CD L
+    ti                                                          =  000099 L
+    tl0                                                         =  00008A L
+    tl1                                                         =  00008B L
+    tl2                                                         =  0000CC L
+    tmod                                                        =  000089 L
+    tr0                                                         =  00008C L
+    tr1                                                         =  00008E L
+    tr2                                                         =  0000CA L
+    txd                                                         =  0000B1 L
+
+
+ASxxxx Assembler V02.00 + NoICE + SDCC mods  (Intel 8051), page 26.
+Hexadecimal [24-Bits]
+
+Area Table
+
+   0 _CODE                                      size      0   flags    0
+   1 RSEG                                       size      0   flags    8
+   2 RSEG0                                      size      0   flags    8
+   3 RSEG1                                      size      0   flags    8
+   4 REG_BANK_0                                 size      8   flags    4
+   5 DSEG                                       size      0   flags    0
+   6 ISEG                                       size      0   flags    0
+   7 IABS                                       size      0   flags    8
+   8 BSEG                                       size      0   flags   80
+   9 PSEG                                       size      0   flags   50
+   A XSEG                                       size     12   flags   40
+   B XABS                                       size      0   flags   48
+   C XISEG                                      size      0   flags   40
+   D HOME                                       size      0   flags   20
+   E GSINIT0                                    size      0   flags   20
+   F GSINIT1                                    size      0   flags   20
+  10 GSINIT2                                    size      0   flags   20
+  11 GSINIT3                                    size      0   flags   20
+  12 GSINIT4                                    size      0   flags   20
+  13 GSINIT5                                    size      0   flags   20
+  14 GSINIT                                     size      0   flags   20
+  15 GSFINAL                                    size      0   flags   20
+  16 CSEG                                       size    6E4   flags   20
+  17 CONST                                      size     9C   flags   20
+  18 XINIT                                      size      0   flags   20
+  19 CABS                                       size      0   flags   28
+

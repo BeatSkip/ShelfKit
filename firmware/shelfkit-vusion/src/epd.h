@@ -64,6 +64,31 @@ void epd_clear(uint8_t bw_byte, uint8_t red_byte);
  */
 void epd_upload(uint8_t cmd, const uint8_t *plane, uint16_t len);
 
+/* ── Streaming one plane in chunks ──────────────────────────────────────
+ * epd_upload() needs the whole plane in RAM at once. When the plane does
+ * not live in RAM - the tag stages a received image in its SPI flash, and
+ * the flash holds 11248 bytes against 8 KiB of XRAM - start the plane and
+ * push it in as many chunks as it takes:
+ *
+ *   epd_stream_begin(0x10);                  // black/white plane
+ *   while (left) {
+ *       extflash_read(addr, buf, n);         // refill the chunk
+ *       epd_stream_data(buf, n);             // push it
+ *       addr += n; left -= n;
+ *   }
+ *   epd_stream_begin(0x13);                  // then the red plane
+ *   ...
+ *   epd_refresh();
+ *
+ * epd_stream_begin() sends the data command and switches to data mode;
+ * epd_stream_data() may then be called any number of times. CS is released
+ * between chunks (each call is its own SPI transaction) so another slave -
+ * the flash, which is where the chunks come from - can be read in between.
+ * The controller's internal write pointer is not affected by CS: CS edges
+ * frame SPI bytes, they do not restart the plane. */
+void epd_stream_begin(uint8_t cmd) __reentrant;
+void epd_stream_data(const uint8_t *buf, uint16_t len) __reentrant;
+
 /* Start a screen refresh (IL0373 0x12) and wait for BUSY to clear. */
 void epd_refresh(void);
 

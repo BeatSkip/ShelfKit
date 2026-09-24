@@ -33,6 +33,7 @@
  */
 
 #include "nfc.h"
+#include "nfc_ndef.h"
 #include "board.h"
 #include "spi.h"
 
@@ -135,7 +136,7 @@ static uint8_t nfc_bb_transfer(uint8_t out)
 
 /* ── EEPROM access ───────────────────────────────────────────────────── */
 
-void nfc_read(uint16_t addr, uint8_t *buf, uint8_t len)
+void nfc_read(uint16_t addr, uint8_t *buf, uint8_t len) __reentrant
 {
     uint8_t i;
 
@@ -152,9 +153,12 @@ void nfc_read(uint16_t addr, uint8_t *buf, uint8_t len)
     delay(NFC_RESET_US);            /* >= 50 ns high resets the SPI port */
 }
 
-uint8_t nfc_read_serial(uint8_t serial[NFC_SERIAL_LEN])
+uint8_t nfc_read_serial(uint8_t serial[NFC_SERIAL_LEN]) __reentrant
 {
-    uint8_t raw[9];                 /* SN0..2, BCC0, SN3..6, BCC1 */
+    /* In XRAM like every other buffer here: a 9-byte local array plus the
+     * parameter block would be a 20-plus byte chunk of the 128 bytes of
+     * directly addressable RAM this part has for everything. */
+    static uint8_t __xdata raw[9];  /* SN0..2, BCC0, SN3..6, BCC1 */
     uint8_t bcc0, bcc1;
 
     nfc_read(NFC_SERIAL_ADDR, raw, 9);
@@ -177,4 +181,72 @@ uint8_t nfc_read_serial(uint8_t serial[NFC_SERIAL_LEN])
     if (raw[3] != bcc0 || raw[8] != bcc1)
         return 0;
     return 1;
+}
+
+/* ── serial number from the NDEF record ──────────────────────────────── */
+
+/* The TLV area and the reconstructed URI live in XRAM - 152 bytes that the
+ * 256-byte internal RAM does not have to give up (see main.c). */
+static uint8_t __xdata nfc_tlv[NFC_TLV_WINDOW];
+static char    __xdata nfc_uri[NFC_NDEF_URI_MAX];
+
+/* Read the TLV window off the chip and rebuild the URI into nfc_uri.
+ * Returns the URI length, or 0 when there is no usable URI record. */
+static uint8_t nfc_load_uri(void)
+{
+    uint16_t i;
+    uint8_t  n;
+
+    /* 16 bytes per transaction, and the window never crosses a 256-byte
+     * block boundary, which is all one read command can reach. */
+    for (i = 0; i < NFC_TLV_WINDOW; i += 16) {
+        n = 16;
+        if (NFC_TLV_WINDOW - i < 16)
+            n = (uint8_t)(NFC_TLV_WINDOW - i);
+        nfc_read((uint16_t)(NFC_TLV_ADDR + i), &nfc_tlv[i], n);
+    }
+
+    return nfc_ndef_uri(nfc_tlv, NFC_TLV_WINDOW, nfc_uri, sizeof nfc_uri);
+}
+
+uint8_t nfc_read_tag_serial(char *serial, uint8_t maxlen) __reentrant
+{
+    if (!nfc_load_uri())
+        return 0;
+    return nfc_ndef_last_segment(nfc_uri, serial, maxlen);
+}
+
+uint8_t nfc_read_ndef_uri(char *uri, uint8_t maxlen) __reentrant
+{
+    uint8_t n, i;
+
+    n = nfc_load_uri();
+    if (!n || (uint8_t)(n + 1) > maxlen)
+        return 0;
+
+    for (i = 0; i < n; i++)
+        uri[i] = nfc_uri[i];
+    uri[n] = 0;
+    return n;
+}
+
+uint8_t nfc_uid_string(char *out, uint8_t maxlen) __reentrant
+{
+    static const char hex[] = "0123456789ABCDEF";
+    static uint8_t __xdata raw[NFC_SERIAL_LEN];
+    uint8_t i;
+
+    if (maxlen < (NFC_SERIAL_LEN * 2) + 1)
+        return 0;
+
+    /* Not nfc_read_serial(): for an identifier we would rather have the
+     * bytes than a check-byte verdict. */
+    (void)nfc_read_serial(raw);
+
+    for (i = 0; i < NFC_SERIAL_LEN; i++) {
+        out[(i * 2)]     = hex[raw[i] >> 4];
+        out[(i * 2) + 1] = hex[raw[i] & 0x0F];
+    }
+    out[NFC_SERIAL_LEN * 2] = 0;
+    return NFC_SERIAL_LEN * 2;
 }

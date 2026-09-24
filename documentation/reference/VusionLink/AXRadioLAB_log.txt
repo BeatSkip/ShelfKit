@@ -1,0 +1,84 @@
+Project Reopened Successfully
+
+d:\Axsem\Projects\VusionLink-Test-1
+
+Status for SDCC build AX::CB: 0
+
+Built program path C:\Program Files (x86)\ON Semiconductor\AxCodeBlocks\bin\axcodeblocks.exe --build "d:\Axsem\Projects\VusionLink\MASTER\MASTER.cbp"
+
+Status for SDCC download AX::CB:FAILURE, binary file doesnt exist 
+
+Status for SDCC build AX::CB: 0
+
+Built program path C:\Program Files (x86)\ON Semiconductor\AxCodeBlocks\bin\axcodeblocks.exe --build "d:\Axsem\Projects\VusionLink\SLAVE\SLAVE.cbp"
+
+Status for SDCC download program: 1
+
+download program path C:\Program Files (x86)\ON Semiconductor\AXSDB\bin\axsdb.exe --flashprog="d:\Axsem\Projects\VusionLink\SLAVE\bin\Debug\SLAVE.omf"
+
+Status failure: 
+
+Status of build 0
+
+path C:\Program Files (x86)\ON Semiconductor\AxCodeBlocks\bin\axcodeblocks.exe --build "d:\Axsem\Projects\VusionLink\TESTS\TESTS.cbp"
+
+Status of download test program 1
+
+Download failed
+
+Status of build 0
+
+path C:\Program Files (x86)\ON Semiconductor\AxCodeBlocks\bin\axcodeblocks.exe --build "d:\Axsem\Projects\VusionLink\TESTS\TESTS.cbp"
+
+Status of download test program 1
+
+Download failed
+
+Status of build 0
+
+path C:\Program Files (x86)\ON Semiconductor\AxCodeBlocks\bin\axcodeblocks.exe --build "d:\Axsem\Projects\VusionLink\TESTS\TESTS.cbp"
+
+Status of download test program 1
+
+Download failed
+
+Status of build 0
+
+path C:\Program Files (x86)\ON Semiconductor\AxCodeBlocks\bin\axcodeblocks.exe --build "d:\Axsem\Projects\VusionLink\TESTS\TESTS.cbp"
+
+Status of download test program 1
+
+Download failed
+
+SDCC is built
+
+Project built is C:\Program Files (x86)\ON Semiconductor\AxCodeBlocks\bin\axcodeblocks.exe "d:\Axsem\Projects\VusionLink\SLAVE\SLAVE.cbp"
+
+Status for opening AX:CodeBlocks: SUCCESS 0
+
+Opened AX:CodeBlocks successfully
+
+Status of build 0
+
+path C:\Program Files (x86)\ON Semiconductor\AxCodeBlocks\bin\axcodeblocks.exe --build "d:\Axsem\Projects\VusionLink\TESTS\TESTS.cbp"
+
+Status of download test program 1
+
+Download failed
+
+Status for SDCC build AX::CB: 0
+
+Built program path C:\Program Files (x86)\ON Semiconductor\AxCodeBlocks\bin\axcodeblocks.exe --build "d:\Axsem\Projects\VusionLink\MASTER\MASTER.cbp"
+
+Status for SDCC download AX::CB:FAILURE, binary file doesnt exist 
+
+Status for SDCC build AX::CB: 0
+
+Built program path C:\Program Files (x86)\ON Semiconductor\AxCodeBlocks\bin\axcodeblocks.exe --build "d:\Axsem\Projects\VusionLink\SLAVE\SLAVE.cbp"
+
+Status for SDCC download program: 1
+
+download program path C:\Program Files (x86)\ON Semiconductor\AXSDB\bin\axsdb.exe --flashprog="d:\Axsem\Projects\VusionLink\SLAVE\bin\Debug\SLAVE.omf"
+
+Status failure: 
+

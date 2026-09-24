@@ -26,6 +26,13 @@ except ImportError:
 
 PALETTE = {"white": (255, 255, 255), "black": (0, 0, 0), "red": (255, 0, 0)}
 
+# Defaults of the non-dithered classifier. tools/send_image.py drives the very
+# same function with its --threshold/--red-threshold/--red-dominance options,
+# so an image converted for the air looks exactly like a boot image.
+INK_THRESHOLD = 110
+RED_THRESHOLD = 110
+RED_DOMINANCE = 40
+
 
 def classify(r, g, b):
     """Nearest palette color in RGB space (works for the dithered case too)."""
@@ -34,7 +41,38 @@ def classify(r, g, b):
     return min(d, key=d.get)
 
 
-def to_planes(img, dither):
+def classify_ink(r, g, b, threshold=INK_THRESHOLD, red_threshold=RED_THRESHOLD,
+                 red_dominance=RED_DOMINANCE):
+    """One pixel -> 'black', 'red' or 'white' for the three-colour panel.
+
+    Red is tested first: an e-paper pixel is one of the three, and a saturated
+    red would otherwise read as dark and come out black.
+    """
+    if r > red_threshold and r > g + red_dominance and r > b + red_dominance:
+        return "red"
+    lum = (3 * r + 6 * g + b) // 10
+    return "black" if lum < threshold else "white"
+
+
+def rotate_image(im, degrees):
+    """Rotate `degrees` clockwise, expanding the result to fit.
+
+    90 degrees puts the source's LEFT edge at the top of the result, which is
+    how the panel is mounted (see the module docstring).
+    """
+    degrees %= 360
+    if degrees == 0:
+        return im
+    if degrees not in (90, 180, 270):
+        raise ValueError(f"rotation must be 0, 90, 180 or 270, not {degrees}")
+    # PIL rotates counterclockwise; ROTATE_270 = 90 degrees clockwise.
+    return im.transpose({90: Image.Transpose.ROTATE_270,
+                         180: Image.Transpose.ROTATE_180,
+                         270: Image.Transpose.ROTATE_90}[degrees])
+
+
+def to_planes(img, dither=False, threshold=INK_THRESHOLD,
+              red_threshold=RED_THRESHOLD, red_dominance=RED_DOMINANCE):
     """Return (bw, red) bytearrays, MSB-first rows, 0 = ink."""
     w, h = img.size
     px = img.load()
@@ -50,13 +88,8 @@ def to_planes(img, dither):
                     r = (r * a + 255 * (255 - a)) // 255
                     g = (g * a + 255 * (255 - a)) // 255
                     b = (b * a + 255 * (255 - a)) // 255
-                lum = (3 * r + 6 * g + b) // 10
-                if r > 110 and r > g + 40 and r > b + 40:
-                    kind = "red"
-                elif lum < 110:
-                    kind = "black"
-                else:
-                    kind = "white"
+                kind = classify_ink(r, g, b, threshold, red_threshold,
+                                    red_dominance)
                 if kind != "white":
                     idx = (y * w + x) >> 3
                     mask = 0x80 >> (x & 7)
@@ -124,10 +157,7 @@ def main():
     img = Image.open(args.png).convert("RGBA")
     print(f"source: {args.png} {img.size[0]}x{img.size[1]}")
     if args.rotate:
-        # PIL rotates counterclockwise; ROTATE_270 = 90 deg clockwise,
-        # which puts the source LEFT edge at the top of the result.
-        ccw = (360 - args.rotate) % 360
-        img = img.rotate(ccw, expand=True)
+        img = rotate_image(img, args.rotate)
         print(f"rotated {args.rotate} deg -> {img.size[0]}x{img.size[1]}")
     if img.size != (152, 296):
         print(f"warning: rotated size {img.size[0]}x{img.size[1]} != 152x296 "

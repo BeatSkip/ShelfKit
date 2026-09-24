@@ -49,7 +49,8 @@ SECTIONS = {
 
 # "000000: 04 5A 3C EA ...  |.Z<.|"  ->  address + the hex bytes
 LINE_RE = re.compile(r"^([0-9A-Fa-f]{4,8}):\s+((?:[0-9A-Fa-f]{2}\s+)*)")
-SERIAL_RE = re.compile(r"^NFC serial:\s+((?:[0-9A-Fa-f]{2}\s+)*)\s*\[(.*?)\]")
+UID_RE = re.compile(r"^NFC UID:\s+((?:[0-9A-Fa-f]{2}\s+)*)\s*\[(.*?)\]")
+SERIAL_RE = re.compile(r"^NFC serial:\s+(\S+)(.*)$")
 CC_RE = re.compile(r"^NFC CC:\s+(.+?)\s*$")
 JEDEC_RE = re.compile(r"^JEDEC ID:\s+(.+?)\s*$")
 
@@ -57,16 +58,19 @@ JEDEC_RE = re.compile(r"^JEDEC ID:\s+(.+?)\s*$")
 def parse_sections(text):
     """Split the capture into {section: {address: byte}} plus the metadata."""
     found = {}
-    meta = {"serial": None, "serial_ok": None, "cc": None, "jedec": None}
+    meta = {"uid": None, "uid_ok": None, "serial": None, "cc": None, "jedec": None}
     current = None
 
     for raw in text.splitlines():
         line = raw.rstrip("\r")
 
+        m = UID_RE.match(line)
+        if m:
+            meta["uid"] = m.group(1).split()
+            meta["uid_ok"] = m.group(2)
         m = SERIAL_RE.match(line)
         if m:
-            meta["serial"] = m.group(1).split()
-            meta["serial_ok"] = m.group(2)
+            meta["serial"] = m.group(1)
         m = CC_RE.match(line)
         if m:
             meta["cc"] = m.group(1)
@@ -160,10 +164,12 @@ def main():
     print(f"\nmemdump summary  ({nbytes} bytes in {elapsed:.1f}s -> {raw_path})")
 
     if meta["serial"]:
-        print(f"  NFC serial      {' '.join(meta['serial'])}  [{meta['serial_ok']}]")
+        print(f"  NFC serial      {meta['serial']}")
     else:
         print("  NFC serial      - (no NFC section in the capture)")
 
+    if meta["uid"]:
+        print(f"  NFC UID         {' '.join(meta['uid'])}  [{meta['uid_ok']}]")
     if meta["cc"]:
         print(f"  NFC CC          {meta['cc']}")
     if meta["jedec"]:

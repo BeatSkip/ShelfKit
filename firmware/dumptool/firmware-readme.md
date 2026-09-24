@@ -27,10 +27,11 @@ A capture looks like this (abridged):
 ```
 *** imagotag memory dump ***
 --- NFC (FM11NT081DS) ---
-NFC serial: 04 5A 3C 7D 21 E8 B6  [check bytes ok]
+NFC UID: 1D 34 9A 90 89 00 00 [check bytes ok]
+NFC serial: 1408F525  [from the NDEF URI]
 NFC CC: E1 10 6F 00
 NFC EEPROM: 924 bytes
-000000: 04 5A 3C EA 7D 21 E8 B6 02 00 00 00 E1 10 6F 00  |.Z<.!.........|
+000000: 1D 34 9A 3B 90 89 00 00 19 A2 FF FF E1 10 6F 0F  |.4.;..........o.|
 ...
 --- end of NFC ---
 --- SPI flash ---
@@ -59,7 +60,8 @@ really came off the chip. The format of the protocol is written up in
 
    ```
    memdump summary  (395123 bytes in 103.4s -> memdump_20260924_210500.txt)
-     NFC serial      04 5A 3C 7D 21 E8 B6  [check bytes ok]
+     NFC serial      1408F525
+     NFC UID         1D 34 9A 90 89 00 00  [check bytes ok]
      NFC CC          E1 10 6F 00
      SPI flash ID    1F 42 00
      nfc             memdump_20260924_210500_nfc.bin       924 bytes
@@ -100,6 +102,12 @@ lost while the board is still printing, so start the capture first and reset aft
 | `build/` | Build output (`firmware.ihx`, `.hex`, `.bin`, `.map`, `.mem`) |
 | `.sdcc/boards/` | Board definition for the SDCC-MDF extension (project-scoped) |
 | `sdcc-project.json` | SDCC-MDF project configuration |
+
+`src/flash.c` and `src/flash.h` are **copies of the tag firmware's** (`firmware/shelfkit-vusion/src/`)
+and are meant to stay identical, so copy them over after changing either. The shared driver
+carries the tag's whole write path (write enable, 4 KiB sector erase, page program, status
+polling, read-back) on top of the three read functions this project uses; the extra code is
+dead here and costs ~0.7 KB of ROM.
 
 ## Pin map
 
