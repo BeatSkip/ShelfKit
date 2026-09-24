@@ -1,11 +1,17 @@
 /**
  * @file main.c
- * @brief Show the polyform logo on the e-paper, log over UART TX
+ * @brief Read the NFC chip, then show the polyform logo on the e-paper
  *
- * Boots, brings up the e-paper display (GDEW026Z39, 2.6"), uploads the
- * polyform boot image (both black/white and red planes), refreshes the
- * panel, powers it down, and flashes the blue LED once when the refresh
- * has finished. The panel holds the image in deep sleep.
+ * Boots, brings up UART0 and the SPI bus, reads the NFC chip's serial
+ * number and the whole NFC EEPROM and prints both over UART, then brings
+ * up the e-paper display (GDEW026Z39, 2.6"), uploads the polyform boot
+ * image (both black/white and red planes), refreshes the panel, powers it
+ * down, and flashes the blue LED once when the refresh has finished. The
+ * panel holds the image in deep sleep.
+ *
+ * The NFC read happens first: it needs the SPI pads as GPIO (the chip is a
+ * mode-1 SPI slave, the panel a mode-0 one - see nfc.c) and hands the bus
+ * back to the hardware SPI unit when it is done.
  *
  * UART0 is TX-only debug logging at 38400 8N1 on PB4, using the same
  * register-level output path as the flash-dump firmware (avoids the
@@ -22,6 +28,7 @@
 #include "board.h"
 #include "pwr.h"
 #include "spi.h"
+#include "nfc.h"
 #include "epd.h"
 #include "epd_image.h"      /* epd_image_bw / epd_image_red */
 
@@ -39,6 +46,82 @@ static void uart_puts(const char *s)
 {
     while (*s)
         uart_putc((uint8_t)*s++);
+}
+
+static void uart_puthex8(uint8_t v)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    uart_putc(hex[v >> 4]);
+    uart_putc(hex[v & 0x0F]);
+}
+
+static void uart_puthex16(uint16_t v)
+{
+    uart_puthex8((uint8_t)(v >> 8));
+    uart_puthex8((uint8_t)v);
+}
+
+/* ── NFC chip: serial number + EEPROM dump ───────────────────────────── */
+
+/* Scratch lives in XRAM: this is an 8051, and keeping it out of IRAM
+ * leaves the whole internal RAM as stack headroom. */
+static uint8_t __xdata nfc_serial[NFC_SERIAL_LEN];
+static uint8_t __xdata nfc_buf[16];
+
+static void nfc_report(void)
+{
+    uint8_t ok, i;
+    uint16_t addr;
+
+    uart_puts("\r\n--- NFC chip (FM11NT081DS) ---\r\n");
+
+    nfc_init();                     /* bit-bang the bus, SPI unit off */
+
+    ok = nfc_read_serial(nfc_serial);
+    uart_puts("serial number (7-byte UID): ");
+    for (i = 0; i < NFC_SERIAL_LEN; i++) {
+        uart_puthex8(nfc_serial[i]);
+        if (i + 1 < NFC_SERIAL_LEN)
+            uart_putc(' ');
+    }
+    uart_puts(ok ? "  [check bytes ok]\r\n"
+                 : "  [check bytes BAD - read is not trustworthy]\r\n");
+
+    /* Capability container: E1 10 <user bytes/8> <access> for a Type 2 tag */
+    nfc_read(NFC_CC_ADDR, nfc_buf, 4);
+    uart_puts("capability container: ");
+    for (i = 0; i < 4; i++) {
+        uart_puthex8(nfc_buf[i]);
+        uart_putc(' ');
+    }
+    uart_puts((nfc_buf[0] == 0xE1) ? "(NFC Forum Type 2 tag)\r\n"
+                                   : "(unexpected - see nfc.c)\r\n");
+
+    uart_puts("EEPROM dump, 924 bytes:\r\n");
+    for (addr = 0; addr < NFC_EEPROM_SIZE; addr += 16) {
+        uint8_t n = 16;             /* the last line is short (924 = 57*16 + 12) */
+        if (NFC_EEPROM_SIZE - addr < 16)
+            n = (uint8_t)(NFC_EEPROM_SIZE - addr);
+
+        nfc_read(addr, nfc_buf, n);
+        uart_puthex16(addr);
+        uart_puts(": ");
+        for (i = 0; i < n; i++) {
+            uart_puthex8(nfc_buf[i]);
+            uart_putc(' ');
+        }
+        for (i = n; i < 16; i++)    /* keep the ASCII column lined up */
+            uart_puts("   ");
+        uart_puts(" |");
+        for (i = 0; i < n; i++) {
+            uint8_t c = nfc_buf[i];
+            uart_putc((c >= 32 && c <= 126) ? c : '.');
+        }
+        uart_puts("|\r\n");
+    }
+    uart_puts("--- end of NFC dump ---\r\n");
+
+    nfc_release();                  /* SPI unit back on for the panel */
 }
 
 /* ── small helpers ────────────────────────────────────────────────────── */
@@ -177,6 +260,10 @@ void main()
     uart0_init(0, 8, 1);
 
     uart_puts("\r\n*** polyform demo ***\r\n");
+
+    /* NFC chip first: it is a mode-1 SPI slave, so this bit-bangs the bus
+     * and hands it back to the hardware SPI unit (mode 0) afterwards. */
+    nfc_report();
 
     spi_init();
     epd_init_panel();

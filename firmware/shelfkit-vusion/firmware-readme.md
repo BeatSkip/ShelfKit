@@ -3,34 +3,34 @@
 Firmware and tooling for the **SES-imagotag Vusion 2.6" BWR shelf label** (UU340 variant).
 The tag is built around an **Axsem AX8052F143** — a 2.4 GHz radio transceiver with an 8051
 core — running from a 26 MHz crystal. It drives a Good Display **GDEW026Z39** e-paper panel
-(296×152, black/white/red, IL0373 controller), an NFC chip and a serial flash.
+(296×152, black/white/red, IL0373 controller), a Fudan **FM11NT081DS** NFC Forum Type 2 tag
+chip (whose factory UID is the tag's serial number) and a serial flash.
 
 The original firmware was built with IAR EW8051. This repository builds it with **SDCC**
 instead, using the **SDCC-MDF** extension for VS Code.
 
 ## Current status
 
-- The project **builds cleanly with SDCC**; roughly 18 KB of the ~58 KB usable flash is used.
-- `main.c` is a **flash dump tool**: it boots, powers the transistor lines, brings up UART0
-  (38400 8N1 — the AXSEM bootloader rate) and the SPI unit, then streams the whole SPI flash
-  over UART as a hexdump (JEDEC ID first), then blinks the blue LED. Reset the tag to dump
-  again; `tools/flashdump.py` automates the reset (boot pin via DTR, reset via RTS) and
-  saves the dump to a file.
-- **SPI and e-paper drivers are implemented but not yet verified on hardware.** The e-paper
-  init sequence was transcribed from three independent drivers for this exact panel, but
-  `main.c` no longer calls it; the BUSY polarity question is still open (see below).
+- The project **builds cleanly with SDCC**; roughly 19 KB of the ~58 KB usable flash is used.
+- `main.c` reads the **NFC chip** on every boot: it pulls the 7-byte serial number (UID) out of
+  the FM11NT081DS, checks it against the chip's own ISO 14443-3 check bytes, then dumps the whole
+  924-byte NFC EEPROM as a hexdump over UART — see *NFC* under Drivers. After that it shows the
+  polyform boot image on the e-paper and blinks the blue LED when the refresh has finished.
+- **SPI, e-paper and NFC drivers are implemented, but the NFC read has not been verified on
+  hardware yet** — the check bytes are printed exactly so the first boot says whether the
+  transaction worked. The e-paper init sequence was transcribed from three independent drivers
+  for this exact panel; the BUSY polarity question is still open (see below).
 - **Flashing is not configured.** The `upload` section of `sdcc-project.json` is a
   placeholder. The AX8052F143 is programmed over its debug link, which no tool in this repo
   drives yet.
-- The NFC chip has chip-select support in the SPI driver, but no device driver. The
-  transistor-driven lines on PA2/PA5 are driven by `pwr.c` (config in `pwr.h`), their loads
+- The transistor-driven lines on PA2/PA5 are driven by `pwr.c` (config in `pwr.h`), their loads
   still unidentified.
 
 ## Repository layout
 
 | Path | Contents |
 |---|---|
-| `src/` | Application code: `main.c` (flash dumper), `board.c/h`, `hal.h`, drivers `spi.c/h`, `epd.c/h`, `flash.c/h`, `pwr.c/h`, and the generated boot image `epd_image.c/h` |
+| `src/` | Application code: `main.c` (NFC read + boot image), `board.c/h`, `hal.h`, drivers `spi.c/h`, `nfc.c/h`, `epd.c/h`, `flash.c/h`, `pwr.c/h`, and the generated boot image `epd_image.c/h` |
 | `tools/` | Helper scripts: `png2epd.py` converts a PNG into e-paper plane data |
 | `include/` | Project-local headers (currently empty) |
 | `lib/` | Prebuilt Axsem LibMF SDK libraries as SDCC archives: `libmf`, `libaxdvk2`, `libaxdsp`, `libmfcrypto` |
@@ -73,22 +73,32 @@ Required: [SDCC](https://sdcc.sourceforge.net/) (tested with 3.6.0) and the
    - `firmware.hex` — Intel HEX, ready for flashing once flashing is wired up
    - `firmware.map` / `firmware.mem` — placement and usage report
 
-The same build by hand, from the repository root (PowerShell needs `&` before a quoted
+The same build by hand, from `firmware/shelfkit-vusion` (PowerShell needs `&` before a quoted
 executable path):
 
 ```powershell
+$sdcc  = 'C:\Program Files\SDCC\bin\sdcc.exe'
 $flags = @('-mmcs51','--model-small','--iram-size','256','--xram-size','8192','--code-size','59389')
+$inc   = @('-I../shared/include','-I../shared/libraries/libmf/include','-I../shared/libraries/libaxdvk2/include')
+$srcs  = @('main','board','spi','nfc','flash','pwr','epd','epd_image')
 
-& 'C:\Program Files\SDCC\bin\sdcc.exe' -c @flags '-Iinclude' '-Ilibraries/libmf/include' 'src/main.c'  -o 'build/obj/src/main.rel'
-& 'C:\Program Files\SDCC\bin\sdcc.exe' -c @flags '-Iinclude' '-Ilibraries/libmf/include' 'src/board.c' -o 'build/obj/src/board.rel'
-& 'C:\Program Files\SDCC\bin\sdcc.exe' -c @flags '-Iinclude' '-Ilibraries/libmf/include' 'src/spi.c'   -o 'build/obj/src/spi.rel'
-& 'C:\Program Files\SDCC\bin\sdcc.exe' -c @flags '-Iinclude' '-Ilibraries/libmf/include' 'src/epd.c'   -o 'build/obj/src/epd.rel'
+foreach ($s in $srcs) {
+    & $sdcc -c @flags @inc "src/$s.c" -o "build/obj/src/$s.rel"
+}
 
-& 'C:\Program Files\SDCC\bin\sdcc.exe' @flags '-Iinclude' '-Ilibraries/libmf/include' `
-    'build/obj/src/main.rel' 'build/obj/src/board.rel' 'build/obj/src/spi.rel' 'build/obj/src/epd.rel' `
-    'lib/libaxdsp.lib' 'lib/libaxdvk2.lib' 'lib/libmf.lib' 'lib/libmfcrypto.lib' `
+& $sdcc @flags @inc ($srcs | ForEach-Object { "build/obj/src/$_.rel" }) `
+    '../shared/lib/libaxdsp.lib' '../shared/lib/libaxdvk2.lib' `
+    '../shared/lib/libmf.lib'    '../shared/lib/libmfcrypto.lib' `
     -o 'build/firmware.ihx'
+
+# The hex the flasher eats has to be plain ASCII - PowerShell's '>' would
+# write UTF-16 with a BOM and the bootloader would choke on the first line.
+& 'C:\Program Files\SDCC\bin\packihx.exe' 'build/firmware.ihx' |
+    Set-Content -Encoding ascii 'build/firmware.hex'
 ```
+
+`build/firmware.bin` (32 KB flash image, gaps filled with `0xFF`) is what the SDCC-MDF
+extension produces alongside the hex; nothing in this repo consumes it.
 
 Memory model is `--model-small`, with 256 B IRAM, 8 KB XRAM and ~58 KB code (the top of the
 64 KB flash is reserved, matching the boundary the original IAR linker file used).
@@ -121,6 +131,69 @@ configuration the vendor's own LCD code uses. Provides `spi_init()`, `spi_transf
 `spi_write()`/`spi_read()`, and chip-select helpers for the three slaves on the bus
 (EPD, NFC, flash). The SPI clock source is a `#define` at the top of the header; the default
 (0xD8) is the LibMF LCD driver's setting, and 0x06 (SYSCLK) also works.
+
+### NFC — `src/nfc.h`
+
+Driver for the tag's NFC chip, a **Fudan FM11NT081DS**: an NFC Forum Type 2 tag with a
+924-byte EEPROM, an SPI *contact* interface next to the 13.56 MHz one, and a factory
+programmed 7-byte UID — the tag's serial number. The protocol notes this driver is built on
+are written up in `documentation/FM11NT081DS-spi-notes.md`.
+
+```c
+#include "nfc.h"
+
+nfc_init();                              /* take the SPI pads over as GPIO */
+if (nfc_read_serial(serial))             /* 7-byte UID, check bytes verified */
+    ...;
+nfc_read(0x010, nfc_buf, 16);            /* any address, up to 256 bytes */
+nfc_release();                           /* back to the hardware SPI unit */
+```
+
+`main.c` does exactly that in `nfc_report()`: serial number, capability container, then a
+hexdump of the whole EEPROM, all before the panel is brought up.
+
+**Why it is bit-banged.** The FM11NT081DS slave only speaks SPI **mode 1** (CPOL=0, CPHA=1,
+the factory default) or mode 3, while the IL0373 e-paper controller needs mode 0 — and mode 0
+is what the AX8052's SPI unit is set up for. A mode-0 master driving a mode-1 slave is a
+timing race (the master changes MOSI on the very edge the slave samples it), so `nfc.c`
+sidesteps the undocumented SPMODE mode bits: it switches the SPI unit off, drives SCK/MOSI as
+GPIO, reads MISO from `PINC`, then hands the bus back. While it does so it also clears the
+PALTC bits of PC1/PC2 (so the peripheral output and the PORT register cannot fight over the
+pad) and restores them afterwards. The bit rate lands around 100-250 kHz, far below the
+chip's 5 MHz limit — the full 924-byte dump takes well under a second.
+
+Reading the chip at any other time works the same way; the NFC chip's chip select (PB1) is
+held high whenever the hardware SPI unit is in use, so the flash and the panel are unaffected.
+
+A boot log looks like this:
+
+```
+--- NFC chip (FM11NT081DS) ---
+serial number (7-byte UID): 04 5A 3C 7D 21 E8 B6  [check bytes ok]
+capability container: E1 10 6F 00 (NFC Forum Type 2 tag)
+EEPROM dump, 924 bytes:
+0000: 04 5A 3C EA 7D 21 E8 B6 02 00 00 00 E1 10 6F 00  |.Z<.}!........|
+...
+--- end of NFC dump ---
+```
+
+(The UID sits either side of its first check byte, so the dump reads
+`SN0 SN1 SN2 BCC0 SN3 SN4 SN5 SN6 BCC1` — here `BCC0 = 0x88 ^ 04 ^ 5A ^ 3C = EA` and
+`BCC1 = 7D ^ 21 ^ E8 ^ B6 = 02`.)
+
+`[check bytes ok]` means the two ISO/IEC 14443-3 check bytes that live next to the UID
+(`BCC0 = 0x88 ^ UID0 ^ UID1 ^ UID2`, `BCC1 = UID3 ^ UID4 ^ UID5 ^ UID6`) matched, so the
+bytes really came off the chip. If the UID reads back as all `00` or all `FF` and the check
+bytes say *BAD*, nothing reached the chip — in rough order of likelihood:
+
+1. **The chip may have no supply.** PA2/PA5 switch unidentified transistor loads (`pwr.h`);
+   if the NFC chip is behind one of them, try `PWR_USE_U5 1` and/or flip the polarity defines.
+2. **The chip was not awake yet.** Raise `NFC_WAKE_US` in `nfc.c` (the datasheet asks for
+   >= 100 us between SSN going low and the first clock edge).
+3. **The pads never became GPIO.** Verify the `PALTC` handling in `nfc_init()` against the
+   port pin schematic in the AX8052F143 datasheet (figure 10).
+4. **MOSI/MISO**: the chip's MOSI is an open-drain I/O with an external pull-up; check the
+   signal list against the chip's DFN10 pinout (`documentation/FM11NT0X1D_ps_eng.pdf`).
 
 ### Serial flash — `src/flash.h`
 
@@ -205,8 +278,10 @@ Two hardware notes that will matter on first bring-up:
 - Flash/debug recipe for the AX8052 debug link, so `SDCC: Flash` actually flashes.
 - Hardware verification of the e-paper driver (init + first frame), settling the BUSY
   polarity question.
+- Hardware verification of the NFC read: the serial number should come back with
+  `[check bytes ok]` and the capability container should read `E1 10 6F 00`.
 - Identification of the PA2/PA5 transistor lines.
-- NFC (FM11NT081DS) and serial flash device drivers — chip selects are in place.
+- Serial flash device driver (chip select is in place; `flash.c` only reads).
 - Repo weight: `libraries/` is ~120 MB, of which only `libraries/libmf/include` is needed
   to build.
 
