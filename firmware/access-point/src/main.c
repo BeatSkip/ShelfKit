@@ -549,9 +549,9 @@ static void link_image_data(void) __reentrant
  * allows its own refresh 30 s). So IMG_END is transmitted *once* and then
  * waited for: sending it again after the panel update has started could make
  * the tag display the image a second time, which is the one failure this
- * direction must not cause. A host that sees the timeout can send IMG_END
- * again itself - it is the party that knows whether the panel had already
- * changed - and the transfer stays open here so that it can. */
+ * direction must not cause. A lost IMG_END therefore costs the transfer - and
+ * the host is told so, rather than being left waiting - because a host that
+ * knew the panel had already changed would have to start again anyway. */
 static void link_image_end(void) __reentrant
 {
     uint8_t reply;
@@ -593,7 +593,11 @@ static void link_image_end(void) __reentrant
         return;
     }
 
-    /* Nothing came back inside the panel-refresh budget. */
+    /* Nothing came back inside the panel-refresh budget. The tag gives up on
+     * a transfer it has heard nothing about for 30 s, so by now there is no
+     * transfer at the tag either: close this one and say so, rather than let
+     * the host wait another minute for an answer that cannot come. */
+    xfer_active = 0;
     host_status(SK_ST_BAD_SERIAL, LINK_D_TIMEOUT);
 }
 

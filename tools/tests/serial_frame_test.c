@@ -970,6 +970,11 @@ static void test_data_retries_exhausted(void)
     CHECK(tx_log_len[0] == 4 + SK_IMG_DATA_MAX + 1, "a full block is 101 bytes, got %u",
           tx_log_len[0]);
     CHECK(xfer_active == 1, "the transfer should stay open for a retry");
+    /* The tag abandons a transfer after 30 s of radio silence, so the whole
+     * data budget has to fit inside that window. */
+    CHECK(LINK_DATA_TRIES * LINK_DATA_WAIT_MS < 30000,
+          "the DATA budget (%u ms) reaches past the tag's 30 s silence limit",
+          LINK_DATA_TRIES * LINK_DATA_WAIT_MS);
     expect_status(SK_ST_BAD_SERIAL, LINK_D_TIMEOUT);
 }
 
@@ -1029,10 +1034,10 @@ static void test_end_is_sent_exactly_once(void)
           virtual_ms - t0, LINK_END_WAIT_MS);
     CHECK(LINK_END_WAIT_MS >= 30000, "the panel refresh budget is only %u ms",
           LINK_END_WAIT_MS);
-    /* The transfer is deliberately left open: a host that saw this timeout can
-     * send IMG_END again, and that is the only party that knows whether the
-     * panel had already changed. */
-    CHECK(xfer_active == 1, "the transfer should stay open for a host retry");
+    /* By the time this 60 s is up the tag has long since abandoned a transfer
+     * it heard nothing about for 30 s, so the access point closes its own and
+     * says so rather than letting the host wait another minute. */
+    CHECK(xfer_active == 0, "the transfer should be over after an END timeout");
     expect_status(SK_ST_BAD_SERIAL, LINK_D_TIMEOUT);
 }
 
