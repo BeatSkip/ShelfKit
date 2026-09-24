@@ -210,13 +210,18 @@ static uint8_t  reply_status;
  *                          being written. 6 s total, comfortably inside the
  *                          30 s of radio silence after which the tag abandons
  *                          a transfer by itself.
- *   IMG_END        60 s   - see link_image_end(): sent once, and then waited
- *                          for, because the answer is only sent after the tag
- *                          has flushed its last page, checked the image CRC
- *                          and driven the e-paper panel (~20 s).
+ *   IMG_END        62 s   - see link_image_end(): sent, and then sent once
+ *                          more 2 s later if nothing came back, because the
+ *                          answer is only sent after the tag has flushed its
+ *                          last page, checked the image CRC and driven the
+ *                          e-paper panel (~20 s). The second transmission
+ *                          rescues an END frame the air lost - without it the
+ *                          tag would sit in its receive state until it
+ *                          abandoned the transfer at 30 s. Two is the limit:
+ *                          a third would mean the tag is not there.
  *
  * Worst case per host frame, radio_tx()'s own ~300 ms timeout included:
- * ~13 s for BEGIN, ~9 s for DATA, ~60 s for END. All bounded on purpose -
+ * ~13 s for BEGIN, ~9 s for DATA, ~62 s for END. All bounded on purpose -
  * the host is always answered, and the access point never blocks on the
  * radio without a deadline. */
 #define LINK_BEGIN_TRIES     4
@@ -224,6 +229,7 @@ static uint8_t  reply_status;
 #define LINK_BEGIN_BUDGET_MS 12000
 #define LINK_DATA_TRIES      10
 #define LINK_DATA_WAIT_MS    600
+#define LINK_END_RESEND_MS   2000
 #define LINK_END_WAIT_MS     60000
 
 /* ── the serial frame CRC ───────────────────────────────────────────────
@@ -546,12 +552,18 @@ static void link_image_data(void) __reentrant
  * The tag answers this one only after it has flushed its last flash page,
  * verified the whole image against the CRC from IMG_BEGIN and refreshed the
  * e-paper panel - ~20 s, and longer if the panel is slow (the tag firmware
- * allows its own refresh 30 s). So IMG_END is transmitted *once* and then
- * waited for: sending it again after the panel update has started could make
- * the tag display the image a second time, which is the one failure this
- * direction must not cause. A lost IMG_END therefore costs the transfer - and
- * the host is told so, rather than being left waiting - because a host that
- * knew the panel had already changed would have to start again anyway. */
+ * allows its own refresh 30 s). So IMG_END goes out, and if nothing comes
+ * back in LINK_END_RESEND_MS it goes out exactly once more, and then the
+ * answer is waited for.
+ *
+ * The early resend is safe *because* the answer is so late. When it arrives,
+ * the tag is either still in its receive state - the first frame was lost on
+ * the air, and this is what rescues the transfer instead of paying those 35 s
+ * for nothing - or it has already taken the frame and is refreshing, in which
+ * case the duplicate is answered from its stored verdict once its loop comes
+ * back: the same ACK(total, status), never a second panel refresh. It also
+ * cannot arrive while the tag is still expecting data, because this only runs
+ * once every block has been acknowledged. */
 static void link_image_end(void) __reentrant
 {
     uint8_t reply;
@@ -569,7 +581,20 @@ static void link_image_end(void) __reentrant
         host_status(SK_ST_BAD_SERIAL, LINK_D_RADIO);
         return;
     }
-    reply = radio_wait_reply(LINK_END_WAIT_MS);
+    reply = radio_wait_reply(LINK_END_RESEND_MS);
+
+    if (reply == REPLY_NONE) {
+        /* Silence this early means the frame never made it: the answer,
+         * whenever the refresh starts, is ~20 s away, so 2 s of nothing is
+         * not the tag being slow. Send it once more - and only once, because
+         * a third would mean the tag is not there at all and the host should
+         * be told rather than kept waiting. */
+        if (radio_send(tx_pkt, 3)) {
+            host_status(SK_ST_BAD_SERIAL, LINK_D_RADIO);
+            return;
+        }
+        reply = radio_wait_reply(LINK_END_WAIT_MS);
+    }
 
     if (reply == REPLY_STATUS) {
         xfer_active = 0;

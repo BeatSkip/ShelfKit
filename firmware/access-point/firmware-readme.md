@@ -148,8 +148,15 @@ stay in the tree because they are the tag's, and this project folder started as 
   line in the middle of a host frame would cost the host that frame.
 - **Timing.** `delay(1000)` from libmf is ~1 ms of the 20 MHz core, which is what the retry
   budgets in `main.c` are written in. A radio round trip plus a flash page write is a few
-  hundred milliseconds; `IMG_END` is the exception, because the tag answers it only after its
-  e-paper refresh, which is why that one is sent once and waited for over 60 s.
+  hundred milliseconds. Two waits are much longer because they cover the *tag's* work rather
+  than the air: `IMG_BEGIN` is answered only after the tag has erased three flash sectors
+  (~150 ms typically, 3 s hard timeout each, hence the 12 s budget, during which a second
+  `IMG_BEGIN` is answered `SK_ST_BUSY` — "already on it", not a refusal), and `IMG_END` only
+  after the ~20 s e-paper refresh, hence the 60 s wait. `IMG_END` is the one frame that is sent
+  **twice**: if nothing comes back in 2 s the air almost certainly ate it, and sending it again
+  while the tag is still in its receive state is what saves the transfer. It is safe because the
+  answer is ~20 s away either way — a duplicate that arrives after the tag has taken the frame
+  is answered from its stored verdict, not by refreshing the panel again. Never a third time.
 - The parser gives up on a half-received frame after ~0.1 s of silence (`SER_IDLE_LIMIT`). That
   is what stops a frame the host abandoned mid-way from being completed with the *next* frame's
   bytes; the constant is only good to a factor of a few, and deliberately sits far from both the

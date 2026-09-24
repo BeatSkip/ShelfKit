@@ -1004,22 +1004,49 @@ static void test_end_crc_failure(void)
     xfer_total = SK_IMG_TOTAL_BYTES;
 
     /* The tag answers only after its panel refresh (~20 s), with off = the
-     * whole image and the CRC verdict in the status. */
+     * whole image and the CRC verdict in the status. The early resend fires
+     * first, because 2 s of silence is nothing when the answer is 20 s away. */
     tag_reply_ack(20000, SK_IMG_TOTAL_BYTES, SK_ST_CRC);
     host_end_cmd();
     CHECK(run_pending() == 1, "the END frame was not parsed");
-    CHECK(radio_tx_calls == 1, "IMG_END went out %u times, wanted 1", radio_tx_calls);
+    CHECK(radio_tx_calls == 2, "IMG_END went out %u times, wanted 2 (one resend)",
+          radio_tx_calls);
     CHECK(tx_log_len[0] == 3 && tx_log[0][1] == SK_PKT_IMG_END &&
           tx_log[0][2] == xor8(tx_log[0], 2), "the IMG_END frame is malformed");
+    CHECK(tx_log_len[1] == tx_log_len[0] && memcmp(tx_log[0], tx_log[1], 3) == 0,
+          "the END resend was not byte-identical to the first transmission");
     CHECK(xfer_active == 0, "the transfer should be over");
     expect_ack(SK_IMG_TOTAL_BYTES, SK_ST_CRC);
 }
 
-static void test_end_is_sent_exactly_once(void)
+static void test_end_rescued_by_the_resend(void)
 {
     uint32_t t0;
 
-    printf("-- IMG_END never answered: one transmission, one long wait\n");
+    printf("-- the first IMG_END is lost; the 2 s resend rescues the transfer\n");
+    reset_world();
+    xfer_active = 1;
+    xfer_total = SK_IMG_TOTAL_BYTES;
+    t0 = virtual_ms;
+
+    /* Nothing for the first transmission (the air ate it), then the answer
+     * lands after the resend - the tag was still in its receive state and
+     * took the second frame. */
+    tag_reply_ack(LINK_END_RESEND_MS + 500, SK_IMG_TOTAL_BYTES, SK_ST_OK);
+    host_end_cmd();
+    CHECK(run_pending() == 1, "the END frame was not parsed");
+    CHECK(radio_tx_calls == 2, "IMG_END went out %u times, wanted 2", radio_tx_calls);
+    CHECK(virtual_ms - t0 < 10000, "the rescue took %u ms, it should be seconds",
+          virtual_ms - t0);
+    CHECK(xfer_active == 0, "the transfer should be over");
+    expect_ack(SK_IMG_TOTAL_BYTES, SK_ST_OK);
+}
+
+static void test_end_is_bounded_and_never_sent_a_third_time(void)
+{
+    uint32_t t0;
+
+    printf("-- IMG_END never answered: one early resend, then one long wait\n");
     reset_world();
     xfer_active = 1;
     xfer_total = SK_IMG_TOTAL_BYTES;
@@ -1027,18 +1054,37 @@ static void test_end_is_sent_exactly_once(void)
 
     host_end_cmd();
     CHECK(run_pending() == 1, "the END frame was not parsed");
-    CHECK(radio_tx_calls == 1, "IMG_END went out %u times - it must go out once, "
-          "or a tag that has already refreshed its panel displays again",
+    CHECK(radio_tx_calls == 2, "IMG_END went out %u times - it must be exactly two: "
+          "one early resend to rescue a lost frame, and no more",
           radio_tx_calls);
-    CHECK(virtual_ms - t0 == LINK_END_WAIT_MS, "the wait was %u ms, wanted %u",
-          virtual_ms - t0, LINK_END_WAIT_MS);
+    CHECK(virtual_ms - t0 == (uint32_t)LINK_END_RESEND_MS + LINK_END_WAIT_MS,
+          "the wait was %u ms, wanted %u", virtual_ms - t0,
+          LINK_END_RESEND_MS + LINK_END_WAIT_MS);
     CHECK(LINK_END_WAIT_MS >= 30000, "the panel refresh budget is only %u ms",
           LINK_END_WAIT_MS);
-    /* By the time this 60 s is up the tag has long since abandoned a transfer
+    /* The resend has to land well inside the tag's own 30 s abandonment. */
+    CHECK(LINK_END_RESEND_MS < 30000,
+          "the END resend at %u ms is outside the tag's 30 s window",
+          LINK_END_RESEND_MS);
+    /* By the time this wait is up the tag has long since abandoned a transfer
      * it heard nothing about for 30 s, so the access point closes its own and
      * says so rather than letting the host wait another minute. */
     CHECK(xfer_active == 0, "the transfer should be over after an END timeout");
     expect_status(SK_ST_BAD_SERIAL, LINK_D_TIMEOUT);
+}
+
+static void test_end_answered_early_is_not_resent(void)
+{
+    printf("-- IMG_END answered inside the resend window: no second transmission\n");
+    reset_world();
+    xfer_active = 1;
+    xfer_total = SK_IMG_TOTAL_BYTES;
+
+    tag_reply_ack(500, SK_IMG_TOTAL_BYTES, SK_ST_OK);
+    host_end_cmd();
+    CHECK(run_pending() == 1, "the END frame was not parsed");
+    CHECK(radio_tx_calls == 1, "IMG_END went out %u times, wanted 1", radio_tx_calls);
+    expect_ack(SK_IMG_TOTAL_BYTES, SK_ST_OK);
 }
 
 static void test_end_with_a_short_image(void)
@@ -1135,7 +1181,9 @@ int main(void)
     test_data_retries_exhausted();
     test_data_offset_error();
     test_end_crc_failure();
-    test_end_is_sent_exactly_once();
+    test_end_rescued_by_the_resend();
+    test_end_is_bounded_and_never_sent_a_third_time();
+    test_end_answered_early_is_not_resent();
     test_end_with_a_short_image();
     test_radio_failure();
     test_announcements_still_print();
