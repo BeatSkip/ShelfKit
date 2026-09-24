@@ -2,7 +2,13 @@
   "name": "ShelfKit-Dumptool",
   "board": "axsem-8052f143",
   "sources": [
-    "src"
+    "src",
+    {
+      "exclude": [
+        "src/epd.c",
+        "src/epd_image.c"
+      ]
+    }
   ],
   "includes": [
     "../shared/include",
@@ -22,9 +28,12 @@
     "hooks": {}
   },
   "upload": {
-    "tool": "python ../../tools/axsem-flasher.py",
+    "tool": "python",
     "args": [
-      "Flash tool not configured"
+      "../../tools/axsem-flasher.py",
+      "${outputHex}",
+      "-p",
+      "${config:comPort}"
     ]
   }
 }

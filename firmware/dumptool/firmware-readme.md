@@ -1,45 +1,105 @@
-# ShelfKit - Firmware
+# ShelfKit — Dumptool
 
-Firmware and tooling for the **SES-imagotag Vusion 2.6" BWR shelf label** (UU340 variant).
-The tag is built around an **Axsem AX8052F143** — a 2.4 GHz radio transceiver with an 8051
-core — running from a 26 MHz crystal. It drives a Good Display **GDEW026Z39** e-paper panel
-(296×152, black/white/red, IL0373 controller), an NFC chip and a serial flash.
+Firmware for the **SES-imagotag Vusion 2.6" BWR shelf label** (UU340 variant) whose only job
+is to read every memory on the board and print it over UART. Build it, flash it, capture the
+serial stream — that is the whole tool.
 
-The original firmware was built with IAR EW8051. This repository builds it with **SDCC**
-instead, using the **SDCC-MDF** extension for VS Code.
+The tag is built around an **Axsem AX8052F143** (8051 core, 26 MHz crystal). It drives a Good
+Display **GDEW026Z39** e-paper panel (296×152, IL0373), a Fudan **FM11NT081DS** NFC Forum
+Type 2 tag chip, and a serial (SPI) flash.
 
-## Current status
+## What it dumps
 
-- The project **builds cleanly with SDCC**; roughly 18 KB of the ~58 KB usable flash is used.
-- `main.c` is a **flash dump tool**: it boots, powers the transistor lines, brings up UART0
-  (38400 8N1 — the AXSEM bootloader rate) and the SPI unit, then streams the whole SPI flash
-  over UART as a hexdump (JEDEC ID first), then blinks the blue LED. Reset the tag to dump
-  again; `tools/flashdump.py` automates the reset (boot pin via DTR, reset via RTS) and
-  saves the dump to a file.
-- **SPI and e-paper drivers are implemented but not yet verified on hardware.** The e-paper
-  init sequence was transcribed from three independent drivers for this exact panel, but
-  `main.c` no longer calls it; the BUSY polarity question is still open (see below).
-- **Flashing is not configured.** The `upload` section of `sdcc-project.json` is a
-  placeholder. The AX8052F143 is programmed over its debug link, which no tool in this repo
-  drives yet.
-- The NFC chip has chip-select support in the SPI driver, but no device driver. The
-  transistor-driven lines on PA2/PA5 are driven by `pwr.c` (config in `pwr.h`), their loads
-  still unidentified.
+In this order, back to back:
+
+| # | Memory | What comes out |
+|---|---|---|
+| 1 | **NFC chip** — FM11NT081DS, 924-byte EEPROM | 7-byte serial number (UID) + its ISO 14443-3 check bytes, the capability container, then the whole EEPROM |
+| 2 | **SPI flash** — 128 KiB (see `FLASH_SIZE`) | JEDEC ID, then the whole chip |
+| 3 | **MCU flash** — the AX8052's own 64 KiB code space | only when `DUMP_MCU_FLASH` is set to 1 in `src/main.c`; see *Extras* |
+
+The order is not cosmetic: the NFC chip is a **mode-1** SPI slave while the flash and the panel
+sit on the hardware SPI unit, which is set up for **mode 0**. `src/nfc.c` bit-bangs the pads in
+mode 1, then hands the bus back to the hardware SPI unit for the flash section.
+
+A capture looks like this (abridged):
+
+```
+*** imagotag memory dump ***
+--- NFC (FM11NT081DS) ---
+NFC serial: 04 5A 3C 7D 21 E8 B6  [check bytes ok]
+NFC CC: E1 10 6F 00
+NFC EEPROM: 924 bytes
+000000: 04 5A 3C EA 7D 21 E8 B6 02 00 00 00 E1 10 6F 00  |.Z<.!.........|
+...
+--- end of NFC ---
+--- SPI flash ---
+JEDEC ID: 1F 42 00
+000000: 01 01 FF FF FF FF FF FF FF FF FF FF FF FF FF FF  |................|
+...
+--- end of SPI flash ---
+*** end of dump ***
+```
+
+`[check bytes ok]` means the two check bytes stored next to the UID matched, so the NFC read
+really came off the chip. The format of the protocol is written up in
+`documentation/FM11NT081DS-spi-notes.md`.
+
+## Using it
+
+1. **Build and flash this project.** In VS Code make `firmware/dumptool` the active folder and
+   run *SDCC: Build*, then *SDCC: Flash* (the port comes from `ShelfKit.code-workspace` →
+   `"sdcc.comPort"`). Build **before** flashing — the extension deletes stale
+   `firmware.hex`/`.bin` on every build.
+2. **Capture** — reset the tag and save the stream, splitting it into binaries as it goes:
+
+   ```powershell
+   python tools/memdump.py COM8
+   ```
+
+   ```
+   memdump summary  (395123 bytes in 103.4s -> memdump_20260924_210500.txt)
+     NFC serial      04 5A 3C 7D 21 E8 B6  [check bytes ok]
+     NFC CC          E1 10 6F 00
+     SPI flash ID    1F 42 00
+     nfc             memdump_20260924_210500_nfc.bin       924 bytes
+     spiflash        memdump_20260924_210500_spiflash.bin  131072 bytes
+     mcu             - (section not in the capture)
+   ```
+
+   `memdump.py` drives the same wiring as the flasher (DTR = boot pin, RTS = reset), so it
+   resets the tag into the application by itself. It imports `tools/flashdump.py` for the
+   serial handling; `tools/flashdump.py` on its own still works if you just want the raw text.
+
+   Anything that can read a serial port at 38400 8N1 works too — the sections are plain,
+   labelled hexdumps and the capture always ends with `*** end of dump ***`.
+
+The dump takes **~100 s** at 38400 baud, almost all of it the 128 KiB SPI flash. Nothing is
+lost while the board is still printing, so start the capture first and reset afterwards.
+
+## Extras
+
+- **MCU flash dump.** Setting `DUMP_MCU_FLASH` to 1 in `src/main.c` adds a section that reads
+  the AX8052's own 64 KiB code space with `MOVC` (no unlock needed — the flash lock only
+  guards the debug link). It adds ~80 s to the capture, so raise the timeout:
+  `python tools/memdump.py COM8 --timeout 400`. Mostly useful to inspect what is actually
+  programmed (bootloader area, calibration), since a reflash has already overwritten the stock
+  application.
+- **Unused e-paper sources are excluded from the build.** `src/epd.c`, `src/epd_image.c` and
+  the boot image are still in the tree (they belong to `shelfkit-vusion`), but SDCC links every
+  object file it is handed — unused code is *not* dropped — so `sdcc-project.json` excludes them
+  with a `{"exclude": ["src/epd.c", "src/epd_image.c"]}` rule. That is the difference between a
+  ~19 KB and a ~6 KB firmware; reach for the same trick in any other dump-style project.
 
 ## Repository layout
 
 | Path | Contents |
 |---|---|
-| `src/` | Application code: `main.c` (flash dumper), `board.c/h`, `hal.h`, drivers `spi.c/h`, `epd.c/h`, `flash.c/h`, `pwr.c/h`, and the generated boot image `epd_image.c/h` |
-| `tools/` | Helper scripts: `png2epd.py` converts a PNG into e-paper plane data |
-| `include/` | Project-local headers (currently empty) |
-| `lib/` | Prebuilt Axsem LibMF SDK libraries as SDCC archives: `libmf`, `libaxdvk2`, `libaxdsp`, `libmfcrypto` |
-| `libraries/` | Full Axsem SDK source tree (IAR/Keil/SDCC/ARM build makefiles and headers) |
-| `documentation/` | AX8052F100/F131/F143 datasheets |
-| `.sdcc/boards/` | Board definition for the SDCC-MDF extension (project-scoped, travels with the repo) |
-| `.vscode/` | Build tasks, IntelliSense config, workspace settings |
+| `src/` | `main.c` (the dump tool), `nfc.c/h` (FM11NT081DS driver), `flash.c/h` (SPI NOR), `spi.c/h`, `board.c/h`, `pwr.c/h`, `hal.h`, plus the unused e-paper driver |
+| `documentation/` | AX8052F100/F143 datasheets, the panel datasheet, the NFC protocol notes, `signal-list.md` |
+| `build/` | Build output (`firmware.ihx`, `.hex`, `.bin`, `.map`, `.mem`) |
+| `.sdcc/boards/` | Board definition for the SDCC-MDF extension (project-scoped) |
 | `sdcc-project.json` | SDCC-MDF project configuration |
-| `GDEW026Z39-init-reference.md` | Notes on the e-paper init sequence and the sources of each byte |
 
 ## Pin map
 
@@ -49,16 +109,12 @@ Full authoritative mapping: `documentation/signal-list.md`.
 |---|---|---|
 | LED white / blue / green | `PB0` / `PB7` / `PB6` | active low |
 | LED red | `PC4` | active low |
-| UART0 TX / RX | `PB4` / `PB5` | 38400 8N1, timer 0 baud (off while the e-paper is driven) |
-| SPI SCK / MOSI / MISO | `PC1` / `PC2` / `PC3` | hardware SPI unit |
+| UART0 TX / RX | `PB4` / `PB5` | 38400 8N1; TX only, PB5 is also the panel reset |
+| SPI SCK / MOSI / MISO | `PC1` / `PC2` / `PC3` | hardware SPI unit, or GPIO while the NFC chip is read |
 | CS flash / NFC / EPD | `PC0` / `PB1` / `PA1` | active low |
-| EPD D/C, RST, BUSY | `PA0`, `PB5`, `PB2` | D/C: 0 = command, 1 = data |
-| NFC field detect / boot | `PB3` | |
+| EPD D/C, RST, BUSY | `PA0`, `PB5`, `PB2` | unused by the dump tool |
+| NFC field detect / boot | `PB3` | the flasher and `memdump.py` use it as the boot pin |
 | Transistor U4 / U5 | `PA5` / `PA2` | function not identified yet |
-
-One conflict worth knowing about: **EPD reset shares PB5 with the UART RX function.**
-Enabling UART0 hands the pin to the UART, so the boot demo leaves UART0 off — if a future
-firmware needs UART, it must release PB5 (or reset the panel) before driving the display.
 
 ## Building
 
@@ -66,152 +122,86 @@ Required: [SDCC](https://sdcc.sourceforge.net/) (tested with 3.6.0) and the
 [SDCC-MDF extension](https://marketplace.visualstudio.com/items?itemName=dzantemir.sdcc-mdf)
 (tested with 0.29.11) in VS Code.
 
-1. Open the repository in VS Code.
+1. Open the repository in VS Code (the `ShelfKit.code-workspace` file opens every project).
 2. If the extension does not detect SDCC, set the path via *SDCC-MDF: Select Toolchain*.
-3. **Ctrl+Shift+B** (or the *SDCC: Build* task). Output lands in `build/`:
-   - `firmware.ihx` — linker output
-   - `firmware.hex` — Intel HEX, ready for flashing once flashing is wired up
-   - `firmware.map` / `firmware.mem` — placement and usage report
+3. Select `firmware/dumptool`, then **Ctrl+Shift+B** (*SDCC: Build*); *SDCC: Flash* writes it
+   through the AXSEM serial bootloader.
 
-The same build by hand, from the repository root (PowerShell needs `&` before a quoted
+This project currently uses ~6 KB of the ~58 KB usable flash.
+
+The same build by hand, from `firmware/dumptool` (PowerShell needs `&` before a quoted
 executable path):
 
 ```powershell
+$sdcc  = 'C:\Program Files\SDCC\bin\sdcc.exe'
 $flags = @('-mmcs51','--model-small','--iram-size','256','--xram-size','8192','--code-size','59389')
+$inc   = @('-I../shared/include','-I../shared/libraries/libmf/include','-I../shared/libraries/libaxdvk2/include')
+$srcs  = @('main','board','spi','nfc','flash','pwr')   # see the exclude rule in sdcc-project.json
 
-& 'C:\Program Files\SDCC\bin\sdcc.exe' -c @flags '-Iinclude' '-Ilibraries/libmf/include' 'src/main.c'  -o 'build/obj/src/main.rel'
-& 'C:\Program Files\SDCC\bin\sdcc.exe' -c @flags '-Iinclude' '-Ilibraries/libmf/include' 'src/board.c' -o 'build/obj/src/board.rel'
-& 'C:\Program Files\SDCC\bin\sdcc.exe' -c @flags '-Iinclude' '-Ilibraries/libmf/include' 'src/spi.c'   -o 'build/obj/src/spi.rel'
-& 'C:\Program Files\SDCC\bin\sdcc.exe' -c @flags '-Iinclude' '-Ilibraries/libmf/include' 'src/epd.c'   -o 'build/obj/src/epd.rel'
+foreach ($s in $srcs) {
+    & $sdcc -c @flags @inc "src/$s.c" -o "build/obj/src/$s.rel"
+}
 
-& 'C:\Program Files\SDCC\bin\sdcc.exe' @flags '-Iinclude' '-Ilibraries/libmf/include' `
-    'build/obj/src/main.rel' 'build/obj/src/board.rel' 'build/obj/src/spi.rel' 'build/obj/src/epd.rel' `
-    'lib/libaxdsp.lib' 'lib/libaxdvk2.lib' 'lib/libmf.lib' 'lib/libmfcrypto.lib' `
+& $sdcc @flags @inc ($srcs | ForEach-Object { "build/obj/src/$_.rel" }) `
+    '../shared/lib/libaxdsp.lib' '../shared/lib/libaxdvk2.lib' `
+    '../shared/lib/libmf.lib'    '../shared/lib/libmfcrypto.lib' `
     -o 'build/firmware.ihx'
+
+# The hex the flasher eats has to be plain ASCII - PowerShell's '>' would
+# write UTF-16 with a BOM and the bootloader would choke on the first line.
+& 'C:\Program Files\SDCC\bin\packihx.exe' 'build/firmware.ihx' |
+    Set-Content -Encoding ascii 'build/firmware.hex'
 ```
 
-Memory model is `--model-small`, with 256 B IRAM, 8 KB XRAM and ~58 KB code (the top of the
-64 KB flash is reserved, matching the boundary the original IAR linker file used).
+## Driver notes
 
-## Drivers
+### NFC — `src/nfc.c`
 
-### Transistor lines — `src/pwr.h`
+Fudan FM11NT081DS: NFC Forum Type 2 tag, 924-byte EEPROM, SPI contact interface, 7-byte
+factory UID at EEPROM address 0x000 — the tag's serial number. Protocol details, the memory
+map and the read framing (`011_000xx` + address byte, address auto-increments, ≥100 µs
+power-up after SSN goes low, SPI **mode 1**) are in `documentation/FM11NT081DS-spi-notes.md`.
 
-Controls the unidentified transistor lines PA2 (U5) and PA5 (U4). Which pins are driven and
-their polarity are `#define`s at the top of `pwr.h`:
+The AX8052's SPI unit cannot do mode 1 as wired here, so the driver turns the SPI unit off,
+drives SCK/MOSI as GPIO, reads MISO from `PINC`, and restores everything afterwards
+(`nfc_release()` calls `spi_init()`). The bit rate lands around 100–250 kHz, far below the
+chip's 5 MHz limit.
 
-```c
-#define PWR_USE_U4  1       /* PA5 */      #define PWR_USE_U5  1       /* PA2 */
-#define PWR_U4_ACTIVE_HIGH  1              #define PWR_U5_ACTIVE_HIGH  1
+If the serial number reads back as all `00`/`FF` with `[check bytes BAD]`, nothing reached the
+chip. In rough order of likelihood: the chip has no supply (PA2/PA5 switch unidentified
+transistor loads — see `pwr.h`), the wake-up delay is too short, or the pads never became
+GPIO (see the `PALTC` handling in `nfc_init()`).
 
-pwr_init();                /* selected pins become outputs, driven off */
-pwr_on();                  /* drive all selected pins to their on level */
-pwr_off();
-pwr_pulse(100, 100, 0);    /* 100 ms on, 100 ms off, forever */
-```
-
-The boot demo calls `pwr_on()` before touching the panel, on the assumption one of the
-transistors gates the display supply. If that misbehaves, flip the polarity defines or
-disable one pin and rebuild.
-
-### SPI — `src/spi.h`
-
-A thin wrapper over the AX8052's built-in SPI unit, mode 0, MSB first — the same
-configuration the vendor's own LCD code uses. Provides `spi_init()`, `spi_transfer()`,
-`spi_write()`/`spi_read()`, and chip-select helpers for the three slaves on the bus
-(EPD, NFC, flash). The SPI clock source is a `#define` at the top of the header; the default
-(0xD8) is the LibMF LCD driver's setting, and 0x06 (SYSCLK) also works.
-
-### Serial flash — `src/flash.h`
+### Serial flash — `src/flash.c`
 
 Thin 25-series SPI NOR driver: `extflash_release_powerdown()`, `extflash_read_jedec_id()`,
-`extflash_read()`. The dump size lives in `FLASH_SIZE` (default 128 KiB for the suspected
-1 Mbit chip; the JEDEC capacity byte tells the truth). The boot firmware prints the JEDEC ID
-and a full hexdump of the chip on UART0 at 38400 8N1 (TX = PB4); `tools/flashdump.py`
-resets the board (boot pin via DTR, reset via RTS, same wiring as `tools/axsem-flasher.py`)
-and saves the stream to a file. Use `--bootloader` to reset into the serial bootloader
-instead.
+`extflash_read()`. The dump size is `FLASH_SIZE` in `flash.h` (128 KiB by default — check the
+JEDEC capacity byte against the real chip).
 
-### E-paper — `src/epd.h`
+### UART — `src/main.c`
 
-Driver for the GDEW026Z39 (IL0373), driven **rotated — 152 wide × 296 tall** — the same
-orientation the stock tag firmware uses. It relies on the panel's built-in OTP LUT, so no
-waveform tables are needed.
-
-A full frame is two 5624-byte planes (black/white and red), which together exceed the 8 KB
-of XRAM. The API therefore streams the frame in two halves, reusing one buffer:
-
-```c
-#include "spi.h"
-#include "epd.h"
-
-uint8_t __xdata buf[EPD_PLANE_BYTES];   /* 5624 bytes; 0 = ink, 1 = white */
-
-spi_init();                             /* call after periph_init() */
-epd_init();                             /* resets the panel, clears it to white */
-
-epd_plane_ink(buf, 10, 10);             /* bit 0 = ink, MSB = leftmost pixel */
-epd_upload(0x10, buf, EPD_PLANE_BYTES); /* black/white plane */
-
-/* refill buf with the red plane (bit 0 = red ink) and send it */
-epd_upload(0x13, buf, EPD_PLANE_BYTES);
-
-epd_refresh();                          /* starts the update, waits for BUSY */
-epd_sleep();                            /* panel deep sleep */
-```
-
-`epd_clear(0xFF, 0xFF)` wipes the screen white without any buffer; static images can live in
-`const` (flash) and be passed straight to `epd_upload()`.
-
-### Boot image
-
-`main.c` shows `polyform-eink.png` on boot. The image was converted to the two 1-bit
-planes in `src/epd_image.c` by:
-
-```
-python tools/png2epd.py polyform-eink.png --dither
-```
-
-The converter composites transparency over white, quantizes to black/white/red
-(optionally with Floyd-Steinberg dithering) and rotates the image to the panel's mounted
-orientation. If the logo shows up sideways on the tag, regenerate with a different
-`--rotate` (0/90/180/270; 90 = image's left edge on top).
-
-Two hardware notes that will matter on first bring-up:
-
-- **UART0 is off in the demo.** Its RX pin (PB5) doubles as the panel reset line; with the
-  UART enabled, the pin belongs to the UART and the reset pulse never reaches the panel.
-- **BUSY polarity.** Every driver found for this panel on this tag polls BUSY *low* while
-  busy — the tag board inverts the line, although the bare Good Display module is
-  active-high. `epd.c` defaults to active-low. If `epd_init()` hangs or updates render
-  corrupt, flip `EPD_BUSY_ACTIVE_HIGH` and retry.
-- The init bytes and their provenance are written up in `GDEW026Z39-init-reference.md`.
+UART0 at 38400 8N1 on PB4, TX only, written straight to the UART registers: the prebuilt
+`libmf.lib` in this link has broken FIFO size tables, which wedges `libmf`'s `uart0_tx()`
+after a few bytes. The FRC oscillator is slaved to the 32 kHz crystal with the same sequence
+the AXSEM bootloader uses — without it the baud rate is ~10% off and nothing decodes.
 
 ## Known issues and quirks
 
 - **SDCC-MDF vs PowerShell** (extension ≤ 0.29.11): the extension emits single-quoted tool
   paths without the `&` call operator, so with a PowerShell terminal every build fails with
   `Unexpected token '-mmcs' …`. This repo works around it with `"sdcc.shellPath": "cmd.exe"`
-  in `.vscode/settings.json` (workspace-scoped). After changing it, reload the VS Code
-  window — the extension reuses its existing build terminal.
-- **Board definitions are cached** by the extension; after editing `axsem-8051.json`,
-  reload the window for the change to take effect.
+  in `.vscode/settings.json` (workspace-scoped). After changing it, reload the VS Code window.
+- **Board definitions are cached** by the extension; after editing
+  `.sdcc/boards/…/axsem-8052f143.json`, reload the window for the change to take effect.
 - The `lib/*.lib` files are SDCC archives built from `libraries/` with the vendor's
-  `buildsdcc` makefiles. Only `libmf` is currently linked; the other three are present for
-  future drivers.
+  `buildsdcc` makefiles. Only `libmf` is really needed.
+- The hexdump goes out at **38400 8N1** with no flow control. A capture tool that drops bytes
+  silently produces gaps; `memdump.py` reports any address it never saw.
 
 ## Not done yet
 
-- Flash/debug recipe for the AX8052 debug link, so `SDCC: Flash` actually flashes.
-- Hardware verification of the e-paper driver (init + first frame), settling the BUSY
-  polarity question.
-- Identification of the PA2/PA5 transistor lines.
-- NFC (FM11NT081DS) and serial flash device drivers — chip selects are in place.
-- Repo weight: `libraries/` is ~120 MB, of which only `libraries/libmf/include` is needed
-  to build.
-
-## License
-
-The code in `src/` has no license declared yet. The Axsem SDK under `libraries/` and `lib/`
-retains its original terms (compiler headers are GPL with a linking exception; the rest is
-vendor-licensed) — see the individual files.
+- Hardware verification of the NFC read: the serial number should come back with
+  `[check bytes ok]` and the CC should read `E1 10 6F 00`.
+- Identification of the PA2/PA5 transistor lines (they may gate the flash/NFC supply).
+- Debug-link recipe for the AX8052 (the serial bootloader path works; the debug link is only
+  needed for breakpoints and recovery).

@@ -1,16 +1,29 @@
 /**
  * @file main.c
- * @brief Show the polyform logo on the e-paper, log over UART TX
+ * @brief Dump every memory on the tag over UART
  *
- * Boots, brings up the e-paper display (GDEW026Z39, 2.6"), uploads the
- * polyform boot image (both black/white and red planes), refreshes the
- * panel, powers it down, and flashes the blue LED once when the refresh
- * has finished. The panel holds the image in deep sleep.
+ * Boots, brings up UART0 (38400 8N1 on PB4 - the AXSEM bootloader rate) and
+ * then dumps, back to back:
  *
- * UART0 is TX-only debug logging at 38400 8N1 on PB4, using the same
- * register-level output path as the flash-dump firmware (avoids the
- * broken libmf FIFO tables). RX is never enabled, so PB5 stays free for
- * the panel's reset line.
+ *   1. the NFC chip   FM11NT081DS: 7-byte serial number, capability
+ *                     container, and the whole 924-byte EEPROM
+ *   2. the SPI flash  JEDEC ID plus a 128 KiB hexdump
+ *   3. the MCU flash  the AX8052's own 64 KiB code space, optional
+ *                     (DUMP_MCU_FLASH, off by default)
+ *
+ * Order matters. The NFC chip is a mode-1 SPI slave while the flash and the
+ * panel sit on the hardware SPI unit, which runs mode 0 (see nfc.c), so the
+ * NFC section bit-bangs the pads, prints, and hands the bus back before the
+ * flash section starts.
+ *
+ * Every section is labelled ("--- NFC ... ---", "--- SPI flash ---") so
+ * tools/memdump.py can split the capture back into binary images; the final
+ * line is always "*** end of dump ***", which tools/flashdump.py looks for.
+ *
+ * UART0 is TX-only - its RX pin (PB5) doubles as the panel reset line - and
+ * TX goes straight to the UART registers, because the prebuilt libmf.lib has
+ * broken FIFO size tables in this link (they read 0x75 instead of 0x40 and
+ * wedge libmf's uart0_tx() after a few bytes).
  */
 
 #include <ax8052f143.h>
@@ -22,10 +35,17 @@
 #include "board.h"
 #include "pwr.h"
 #include "spi.h"
-#include "epd.h"
-#include "epd_image.h"      /* epd_image_bw / epd_image_red */
+#include "flash.h"
+#include "nfc.h"
 
-/* ── UART TX debug logging (register-level) ──────────────────────────── */
+/* Dump the AX8052's own 64 KiB code space as well. Off by default: it holds
+ * the firmware you just flashed (plus the AXSEM bootloader at the top), it
+ * adds ~80 s to the capture, and tools/memdump.py needs --timeout raised. */
+#define DUMP_MCU_FLASH  0
+
+#define MCU_FLASH_SIZE  0x10000UL   /* 64 KiB code space */
+
+/* ── UART output ──────────────────────────────────────────────────────── */
 
 static void uart_putc(uint8_t c)
 {
@@ -41,167 +61,227 @@ static void uart_puts(const char *s)
         uart_putc((uint8_t)*s++);
 }
 
-/* ── small helpers ────────────────────────────────────────────────────── */
-
-static void ms_delay(uint16_t ms)
+/* Wait until everything has left the shift register (U0TXEMPTY and U0TXIDLE
+ * both set - the same test the bootloader's 'R' uses). */
+static void uart_flush(void)
 {
-    while (ms--)
-        delay(1000);
+    while (0x44 & (uint8_t)~U0STATUS)
+        ;
 }
 
-/* BUSY helpers are level-agnostic (work with either tag polarity):
- * wait for an edge away from a level, then wait for a return to it. */
-
-static void wait_busy_change(uint8_t from_level, uint16_t timeout_ms)
+static void uart_puthex8(uint8_t v)
 {
-    uint16_t t = timeout_ms;
-    while (EPD_BUSY == from_level) {
-        if (!--t)
-            break;
-        delay(1000);
+    static const char hex[] = "0123456789ABCDEF";
+    uart_putc(hex[v >> 4]);
+    uart_putc(hex[v & 0x0F]);
+}
+
+static void uart_puthex24(uint32_t v)
+{
+    uart_puthex8((uint8_t)(v >> 16));
+    uart_puthex8((uint8_t)(v >> 8));
+    uart_puthex8((uint8_t)v);
+}
+
+/* ── hexdump helper ───────────────────────────────────────────────────── */
+
+/* One line per 16 bytes:
+ *   000000: 04 5A 3C EA ...  |.Z<.|
+ * Short lines (the tail of the NFC EEPROM) are padded so the ASCII column
+ * stays put. buf may live in data or XRAM - the pointer is generic. */
+static void dump_hexline(uint32_t addr, const uint8_t *buf, uint8_t n)
+{
+    uint8_t i;
+
+    uart_puthex24(addr);
+    uart_puts(": ");
+    for (i = 0; i < n; i++) {
+        uart_puthex8(buf[i]);
+        uart_putc(' ');
     }
-}
-
-static void wait_busy_return(uint8_t to_level, uint16_t timeout_ms)
-{
-    uint16_t t = timeout_ms;
-    while (EPD_BUSY != to_level) {
-        if (!--t)
-            break;
-        delay(1000);
+    for (i = n; i < 16; i++)
+        uart_puts("   ");
+    uart_puts(" |");
+    for (i = 0; i < n; i++) {
+        uint8_t c = buf[i];
+        uart_putc((c >= 32 && c <= 126) ? c : '.');
     }
+    uart_puts("|\r\n");
 }
 
-static void epd_write_cmd(uint8_t cmd)
+/* ── the memories ─────────────────────────────────────────────────────── */
+
+/* 16 bytes of scratch shared by every dump, in XRAM: an 8051 has 256 bytes
+ * of internal RAM and all of it should stay available for the stack. */
+static uint8_t __xdata dump_buf[16];
+
+static void dump_nfc(void)
 {
-    EPD_DC = 0;
-    spi_select(SPI_DEV_EPD);
-    spi_transfer(cmd);
-    spi_deselect(SPI_DEV_EPD);
-    EPD_DC = 1;
+    uint8_t serial[NFC_SERIAL_LEN];
+    uint8_t ok, i, n;
+    uint16_t addr;
+
+    uart_puts("--- NFC (FM11NT081DS) ---\r\n");
+
+    nfc_init();                     /* SPI unit off, pads bit-banged */
+
+    ok = nfc_read_serial(serial);
+    uart_puts("NFC serial: ");
+    for (i = 0; i < NFC_SERIAL_LEN; i++) {
+        uart_puthex8(serial[i]);
+        uart_putc(' ');
+    }
+    uart_puts(ok ? "[check bytes ok]\r\n"
+                 : "[check bytes BAD - read is not trustworthy]\r\n");
+
+    /* Capability container: E1 10 <user bytes/8> <access> for a Type 2 tag */
+    nfc_read(NFC_CC_ADDR, dump_buf, 4);
+    uart_puts("NFC CC: ");
+    for (i = 0; i < 4; i++) {
+        uart_puthex8(dump_buf[i]);
+        uart_putc(' ');
+    }
+    uart_puts("\r\n");
+
+    uart_puts("NFC EEPROM: 924 bytes\r\n");
+    for (addr = 0; addr < NFC_EEPROM_SIZE; addr += 16) {
+        n = 16;
+        if (NFC_EEPROM_SIZE - addr < 16)
+            n = (uint8_t)(NFC_EEPROM_SIZE - addr);   /* 924 = 57*16 + 12 */
+        nfc_read(addr, dump_buf, n);
+        dump_hexline(addr, dump_buf, n);
+    }
+
+    nfc_release();                  /* back to the hardware SPI unit */
+    uart_puts("--- end of NFC ---\r\n");
 }
 
-static void epd_write_data(uint8_t data)
+static void dump_spi_flash(void)
 {
-    spi_select(SPI_DEV_EPD);
-    spi_transfer(data);
-    spi_deselect(SPI_DEV_EPD);
+    uint32_t addr;
+    uint8_t id[3];
+
+    uart_puts("--- SPI flash ---\r\n");
+
+    spi_init();
+    extflash_release_powerdown();
+    extflash_read_jedec_id(id);
+
+    uart_puts("JEDEC ID: ");
+    uart_puthex8(id[0]);
+    uart_putc(' ');
+    uart_puthex8(id[1]);
+    uart_putc(' ');
+    uart_puthex8(id[2]);
+    uart_puts("\r\n");
+
+    for (addr = 0; addr < FLASH_SIZE; addr += 16) {
+        extflash_read(addr, dump_buf, 16);
+        dump_hexline(addr, dump_buf, 16);
+    }
+
+    uart_puts("--- end of SPI flash ---\r\n");
 }
 
-/* ── start the display ────────────────────────────────────────────────── */
-
-static void epd_init_panel(void)
+#if DUMP_MCU_FLASH
+/* The AX8052 executes from flash, and MOVC reads it back - no unlock needed
+ * (the lock bit only guards the debug link, not the CPU). */
+static uint8_t mcu_flash_read(uint16_t addr)
 {
-    uint8_t idle;
-
-    /* DC out (PA0), RST out (PB5), BUSY in (PB2); CS (PA1) per spi_init */
-    DIRA |= 0x01;
-    DIRB |= 0x20;
-    DIRB &= (uint8_t)~0x04;
-    EPD_DC = 1;
-    EPD_RST = 1;
-
-    /* Hardware reset: 100 ms low, 100 ms settle */
-    EPD_RST = 0;
-    ms_delay(100);
-    EPD_RST = 1;
-    ms_delay(100);
-
-    /* Booster soft start */
-    epd_write_cmd(0x06);
-    epd_write_data(0x17);
-    epd_write_data(0x17);
-    epd_write_data(0x17);
-
-    /* Power on and let the booster pulse settle */
-    idle = EPD_BUSY;
-    epd_write_cmd(0x04);
-    wait_busy_change(idle, 1500);
-    wait_busy_return(idle, 2500);
-
-    /* Panel setting: LUT from OTP, BWR */
-    epd_write_cmd(0x00);
-    epd_write_data(0x0F);
-
-    /* Resolution: 152 x 296 (from epd.h), 3-byte form */
-    epd_write_cmd(0x61);
-    epd_write_data((uint8_t)EPD_W);
-    epd_write_data((uint8_t)((uint16_t)EPD_H >> 8));
-    epd_write_data((uint8_t)EPD_H);
-
-    /* VCOM and data interval */
-    epd_write_cmd(0x50);
-    epd_write_data(0x77);
+    const uint8_t __code *p = (const uint8_t __code *)addr;
+    return *p;
 }
+
+static void dump_mcu_flash(void)
+{
+    uint32_t addr;
+    uint8_t i;
+
+    uart_puts("--- MCU flash (AX8052 code space) ---\r\n");
+
+    for (addr = 0; addr < MCU_FLASH_SIZE; addr += 16) {
+        for (i = 0; i < 16; i++)
+            dump_buf[i] = mcu_flash_read((uint16_t)(addr + i));
+        dump_hexline(addr, dump_buf, 16);
+    }
+
+    uart_puts("--- end of MCU flash ---\r\n");
+}
+#endif /* DUMP_MCU_FLASH */
+
+/* ── boot ─────────────────────────────────────────────────────────────── */
 
 void main()
 {
-    uint8_t idle;
-
     periph_init();
 
-    /* Power rails via the PA2/PA5 transistor lines (see pwr.h) */
+    /* Power rails via the PA2/PA5 transistor lines (see pwr.h) - the flash
+     * and the NFC chip need their supply before anything else happens. */
     pwr_init();
     pwr_on();
 
-    /* UART0 TX debug output, 38400 8N1 on PB4 (PALTB muxes PB4 to
-     * U0TX). Only the TX direction is used; RX stays disabled so the
-     * panel reset line on PB5 is untouched. */
-    PALTB |= 0x10;
-    DIRB |= 0x10;
-    DIRB &= (uint8_t)~0x20;
-    PORTB |= 0x30;
+    /* Debug marker: two short LED blinks = reached main, before UART. */
+    PIN_SET_LOW(LEDB_PORT, LEDB_PIN);
+    delay(25000);
+    PIN_SET_HIGH(LEDB_PORT, LEDB_PIN);
+    delay(25000);
+    PIN_SET_LOW(LEDB_PORT, LEDB_PIN);
+    delay(25000);
+    PIN_SET_HIGH(LEDB_PORT, LEDB_PIN);
+    delay(25000);
 
-    /* Start the 20 MHz FRC oscillator, slaved to the 32 kHz LPX crystal
-     * - the AXSEM bootloader's sequence, needed for exact 38400. */
+    /* UART0 on PB4(TX) / PB5(RX) - the SAME pins the AXSEM serial
+     * bootloader uses (PALTB = 0x10, PB4 output, PB5 input) and the only
+     * UART pins wired to the serial converter on this tag. The dump only
+     * transmits; PB5 stays configured as the bootloader leaves it. */
+    PALTB |= 0x10;                  /* PB4 -> U0TX alternate function */
+    DIRB  |= 0x10;                  /* PB4 = output */
+    DIRB  &= (uint8_t)~0x20;        /* PB5 = input (U0RX) */
+    PORTB |= 0x30;                  /* TX idle high, RX latch high */
+
+    /* Start the 20 MHz FRC oscillator and slave it to the 32 kHz LPX
+     * crystal - byte-for-byte the sequence the AXSEM serial bootloader runs
+     * on this tag. Without it the FRC runs free at ~10 MHz +/-10% and the
+     * UART baud rate is wrong. */
     FRCOSCREF = 19531;
     FRCOSCKFILT = 2800;
     LPXOSCGM = 0x90;
-    OSCFORCERUN |= 0x04;
-    FRCOSCCONFIG = (6 << 3) | CLKSRC_LPXOSC;
+    OSCFORCERUN |= 0x04;                        /* force the FRC to run */
+    FRCOSCCONFIG = (6 << 3) | CLKSRC_LPXOSC;    /* FRC slaved to LPXOSC */
     WTCFGB = (1 << 3) | CLKSRC_LPXOSC;
     {
         uint8_t i = 128;
         OSCCALIB = 0x01;
-        IE_5 = 1;
+        IE_5 = 1;                               /* clock-management IRQ */
         do {
             while (!(OSCCALIB & 0x40))
                 enter_standby();
-            (void)FRCOSCFREQ1;
+            (void)FRCOSCFREQ1;                  /* feed the calibration filter */
         } while (--i);
         IE_5 = 0;
         OSCCALIB = 0x00;
     }
 
     uart_timer0_baud(CLKSRC_FRCOSC, 38400, 20000000);
-    uart0_init(0, 8, 1);
+    uart0_init(0, 8, 1);        /* enables the UART hardware; TX is driven
+                                 * directly via uart_putc() (EA stays off) */
 
-    uart_puts("\r\n*** polyform demo ***\r\n");
+    uart_puts("\r\n*** imagotag memory dump ***\r\n");
 
-    spi_init();
-    epd_init_panel();
-    uart_puts("panel init ok\r\n");
+    dump_nfc();
+    dump_spi_flash();
+#if DUMP_MCU_FLASH
+    dump_mcu_flash();
+#endif
 
-    /* Upload the polyform logo: black/white plane, then red plane */
-    uart_puts("uploading image\r\n");
-    epd_upload(0x10, epd_image_bw, EPD_PLANE_BYTES);
-    epd_upload(0x13, epd_image_red, EPD_PLANE_BYTES);
+    uart_puts("*** end of dump ***\r\n");
+    uart_flush();
 
-    /* Refresh and wait for the panel to finish */
-    uart_puts("refreshing\r\n");
-    idle = EPD_BUSY;
-    epd_write_cmd(0x12);
-    wait_busy_change(idle, 3000);
-    wait_busy_return(idle, 30000);
-    uart_puts("refresh done\r\n");
-
-    /* Panell off (keeps the image), then signal completion */
-    epd_write_cmd(0x02);            /* POF */
-
-    PIN_SET_HIGH(LEDB_PORT, LEDB_PIN);   /* blue LED: one flash */
-    ms_delay(300);
-    PIN_SET_LOW(LEDB_PORT, LEDB_PIN);   /* blue LED: one flash */
-
-    for (;;)
-        ;
+    /* Heartbeat: the dump is done, capturing can stop. */
+    while (1) {
+        PIN_SET_LOW(LEDB_PORT, LEDB_PIN);
+        delay(25000);
+        PIN_SET_HIGH(LEDB_PORT, LEDB_PIN);
+        delay(25000);
+    }
 }
