@@ -21,10 +21,12 @@
     "output_name": "firmware"
   },
   "upload": {
-    "tool": "python tools/axsem-flasher.py",
+    "tool": "python",
     "args": [
+      "../../tools/axsem-flasher.py",
       "${outputHex}",
-      "-p ${config:comPort}"
+      "-p",
+      "${config:comPort}"
     ]
   },
   "debug": {

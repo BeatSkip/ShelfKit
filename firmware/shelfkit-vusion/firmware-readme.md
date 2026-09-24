@@ -20,9 +20,12 @@ instead, using the **SDCC-MDF** extension for VS Code.
   hardware yet** — the check bytes are printed exactly so the first boot says whether the
   transaction worked. The e-paper init sequence was transcribed from three independent drivers
   for this exact panel; the BUSY polarity question is still open (see below).
-- **Flashing is not configured.** The `upload` section of `sdcc-project.json` is a
-  placeholder. The AX8052F143 is programmed over its debug link, which no tool in this repo
-  drives yet.
+- **Flashing works through the AXSEM serial bootloader.** `SDCC: Flash` runs
+  `tools/axsem-flasher.py` (see `sdcc-project.json` → `upload`), which resets the tag into its
+  bootloader over the CH9102 USB-serial converter and streams the hex at 38400 baud. The port
+  comes from `ShelfKit.code-workspace` → `"sdcc.comPort"` (COM8 by default). **Build first**:
+  the extension deletes stale `firmware.hex`/`.bin` on every build, so flashing a tree that
+  has not been built yet only gets you "Hex file not found".
 - The transistor-driven lines on PA2/PA5 are driven by `pwr.c` (config in `pwr.h`), their loads
   still unidentified.
 
@@ -275,7 +278,9 @@ Two hardware notes that will matter on first bring-up:
 
 ## Not done yet
 
-- Flash/debug recipe for the AX8052 debug link, so `SDCC: Flash` actually flashes.
+- Flash/debug recipe for the AX8052 **debug link** (JTAG-ish AXSEM debug adapter). The serial
+  bootloader path behind `SDCC: Flash` does work; the debug link is only needed for
+  breakpoints and for recovering a tag whose bootloader is gone.
 - Hardware verification of the e-paper driver (init + first frame), settling the BUSY
   polarity question.
 - Hardware verification of the NFC read: the serial number should come back with
