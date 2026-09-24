@@ -687,11 +687,16 @@ static void img_data(uint8_t len) __reentrant
     uint16_t off, k;
 
     /* Version, type, two offset bytes, at least one image byte and the
-     * checksum. A frame without image bytes has nothing to stage. */
-    if (len < (uint8_t)(SK_HDR_LEN + 2 + 1 + 1))
+     * checksum. Note the body starts at byte 2, not at SK_HDR_LEN: that
+     * constant is the header of the packets that carry a *serial* (version,
+     * type, length), and IMG_DATA has no serial-length byte - it goes
+     * straight to the offset. Using SK_HDR_LEN here cost one image byte per
+     * frame and left the acknowledged offset one short of the sender's, so
+     * every block was retried forever. */
+    if (len < 2 + 2 + 1 + 1)
         return;
 
-    k = (uint16_t)(len - SK_HDR_LEN - 2 - 1);
+    k = (uint16_t)(len - 2 - 2 - 1);
     off = (uint16_t)(((uint16_t)rx_pkt[2] << 8) | rx_pkt[3]);
 
     if (rx_state == RX_DONE) {
@@ -727,7 +732,7 @@ static void img_data(uint8_t len) __reentrant
         return;
     }
 
-    if (!stage_data(&rx_pkt[SK_HDR_LEN + 2], k)) {
+    if (!stage_data(&rx_pkt[2 + 2], k)) {
         uart_puts("img: flash write failed at ");
         uart_puthex16(rx_next);
         uart_puts("\r\n");

@@ -21,21 +21,33 @@ png2epd.py compiles into the firmware: `--rotate 90` means the same thing in
 both tools (the source's left edge becomes the top of the frame) and the
 classifier thresholds default to the same values.
 
+The usual way to use it is `--watch`, which does not poll the folder at all: the
+access point prints a "TAG <serial> rssi=<db>" line every time a tag announces
+itself (about every 10 s), and the tool sends that tag's image when it checks in
+and only if the image is new or has changed since the last successful send. The
+pair of (serial, file fingerprint) that was sent is remembered in
+`images/.sent.json`, so restarting the tool does not resend anything.
+
 Usage:
-    python tools/send_image.py COM8
-    python tools/send_image.py COM8 -s 1408F525          # one tag only
+    python tools/send_image.py COM8 --watch               # the normal way
+    python tools/send_image.py COM8                       # one-shot: send
+                                                          # every image once
+    python tools/send_image.py COM8 -s 1408F525           # one tag only
     python tools/send_image.py COM8 -d pictures --fit cover --rotate 0
-    python tools/send_image.py COM8 --watch --interval 2 # send files as they appear
-    python tools/send_image.py --dry-run                 # convert only, no port
-    python tools/send_image.py --selftest                # conversion + framing checks
-    python tools/send_image.py --list                    # serial ports
+    python tools/send_image.py COM8 --monitor             # just print what the
+                                                          # access point says
+    python tools/send_image.py COM8 --ping                # is the AP hearing me?
+    python tools/send_image.py --dry-run                  # convert only, no port
+    python tools/send_image.py --selftest                 # conversion + framing
+    python tools/send_image.py --list                     # serial ports
 
 Options:
     -d, --dir DIR      image folder (default: images, created if missing)
-    -s, --serial SNR   send only this tag's image
-    -w, --watch        keep running and re-scan the folder every --interval s
+    -s, --serial SNR   only this tag's image (with --watch: only this tag)
+    -w, --watch        send when the access point reports that a tag checked in
     -p, --port PORT    serial port (may also be the first positional argument)
     -b, --baud RATE    serial rate (default: 38400, the access point's rate)
+        --resend       forget the send record and push every tag's image once
         --fit MODE     contain (default, letterbox on white), cover, stretch
         --rotate DEG   auto (default), 0, 90, 180, 270 - clockwise; with auto a
                        landscape source is turned 90 deg clockwise into portrait
@@ -44,18 +56,24 @@ Options:
         --red-dominance N    red must beat green and blue by N (default: 40)
         --dither       Floyd-Steinberg dithering, as in png2epd.py
         --dry-run      convert, report and write <name>.bw.bin/.red.bin, no port
-        --timeout SEC  seconds to wait for one IMG_DATA ack (default: 5)
+        --timeout SEC  seconds to wait for one IMG_DATA ack (default: 10)
+        --begin-timeout SEC  seconds to wait for the IMG_BEGIN ack, which comes
+                       after the tag has erased its flash (default: 20)
         --end-timeout SEC    seconds to wait for the IMG_END ack, which arrives
                        after the ~20 s panel refresh (default: 60)
         --retries N    extra attempts per frame (default: 5)
-        --verbose      show the frames on the wire
+        --monitor      print the access point's lines for 30 s, send nothing
+        --ping         prove the host -> access point link without a tag
+        --verbose      show the frames on the wire and every check-in
 """
 
 import argparse
+import json
 import math
 import os
 import re
 import sys
+import tempfile
 import time
 
 try:
@@ -103,6 +121,14 @@ SK_ST_OFFSET = 4
 SK_ST_BUSY = 5
 SK_ST_UNSUPPORTED = 6
 
+# The detail byte of an SK_U_STATUS that the *access point* originated, as
+# opposed to a tag's refusal forwarded with LINK_D_TAG. Mirrors the LINK_D_*
+# defines in firmware/access-point/src/main.c.
+LINK_D_TIMEOUT = 0
+LINK_D_RADIO = 1
+LINK_D_NO_XFER = 2
+LINK_D_TAG = 3
+
 SK_SERIAL_MAX = 16
 SK_IMG_DATA_MAX = 96
 
@@ -125,17 +151,50 @@ SK_UART_PAYLOAD_MAX = 2 + SK_IMG_DATA_MAX       # 98
 
 DEFAULT_BAUD = 38400                    # the access point's rate (see uart.c)
 DEFAULT_DIR = "images"
-DEFAULT_TIMEOUT = 5.0                   # one acknowledgement
+DEFAULT_TIMEOUT = 10.0                  # one acknowledgement. The access point
+                                        # retries a data frame on the radio for
+                                        # up to 6 s before it gives up, so this
+                                        # has to outlast that - otherwise its
+                                        # answer ("I heard you, but the tag did
+                                        # not") is never seen, and a tag problem
+                                        # looks like a dead serial port.
+DEFAULT_BEGIN_TIMEOUT = 20.0            # IMG_BEGIN is the slow one: the tag
+                                        # erases three flash sectors before it
+                                        # answers, and the access point allows
+                                        # 12 s for the whole exchange
 DEFAULT_END_TIMEOUT = 60.0              # the tag refreshes the panel first
 DEFAULT_RETRIES = 5                     # extra attempts per frame
-DEFAULT_INTERVAL = 2.0                  # --watch re-scan period
 DEFAULT_THRESHOLD = 110                 # same luminance cut as png2epd.py
 DEFAULT_RED_THRESHOLD = 110
 DEFAULT_RED_DOMINANCE = 40
 DEFAULT_FIT = "contain"
 DEFAULT_ROTATE = "auto"
 
+# --watch reads the access point instead of polling the folder. These two
+# shape that loop: how long one read waits for a line, and how long silence
+# has to last before the tool points at the port as the likely problem.
+WATCH_READ_TIMEOUT = 0.5
+WATCH_SILENCE_HINT = 30.0
+WATCH_SILENCE_REPEAT = 60.0
+WATCH_LINE_MAX = 512                    # drop a "line" longer than this
+
+# What the access point prints for every announcement it hears
+# (report_packet() in firmware/access-point/src/main.c):
+#
+#   uart_puts("TAG "); <serial, printable chars, '?' for the rest>
+#   uart_puts(" rssi="); uart_putdec(rssi); uart_puts("\r\n");
+#
+# so: "TAG 1408F525 rssi=-41". The serial is printed byte for byte, so a
+# non-printable byte arrives as '?'; a space would arrive as a space, which is
+# why the serial part is matched as printable non-space characters.
+TAG_RE = re.compile(r"^TAG ([!-~]{1,%d}) rssi=(-?\d+)$" % SK_SERIAL_MAX)
+
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".gif")
+
+# The send record: which image each tag has already been given. Kept next to
+# the images (and gitignored), so restarting the tool does not resend them.
+STATE_FILE = ".sent.json"
+STATE_VERSION = 1
 
 # A file name is a tag serial when it is 1..SK_SERIAL_MAX letters/digits with
 # no separator, e.g. 1408F525.
@@ -294,10 +353,37 @@ class FrameReader:
             except OSError as exc:
                 raise TransferError(f"serial read failed: {exc}") from exc
             if chunk:
+                self._show_access_point_text(chunk)
                 frames = self._parser.feed(chunk)
                 if frames:
                     self._pending.extend(frames[1:])
                     return frames[0]
+
+    def _show_access_point_text(self, chunk):
+        """Print the access point's plain-text lines seen during a transfer.
+
+        The port carries both binary frame answers and human-readable lines,
+        and the binary path throws the text away. That is fine until
+        something goes wrong *during* a transfer, which is exactly when the
+        access point's own trace ("link: sent ...", "link: heard ...", "??
+        STATUS ... ignored") is the only thing that says whether the tag
+        answered. Runs of four or more printable characters are printed as
+        "ap: ..." lines; a binary frame cannot survive that filter.
+        """
+        text, run = "", []
+        for b in chunk:
+            if 32 <= b < 127:
+                run.append(chr(b))
+                continue
+            if len(run) >= 4:
+                text += "".join(run) + "\n"
+            run = []
+        if len(run) >= 4:
+            text += "".join(run) + "\n"
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                print(f"ap: {line}")
 
 
 def write_all(ser, data):
@@ -328,9 +414,23 @@ def read_ack(reader, timeout, verbose=False):
         if ptype == SK_U_STATUS:
             status = payload[0] if payload else None
             detail = payload[1] if len(payload) > 1 else None
-            message = f"the access point refused the transfer: {status_text(status)}"
-            if detail is not None:
-                message += f" (detail 0x{detail:02X})"
+            # The access point reports its own failures with a status byte
+            # borrowed from the tag's vocabulary, so the detail byte is what
+            # actually says what happened. Detail 0 is "the tag never
+            # answered", which used to surface as "not my serial number" and
+            # sent everyone looking at serial numbers and NFC records.
+            if detail == LINK_D_TIMEOUT:
+                message = ("the tag did not answer: the access point sent the "
+                           "frame but heard nothing back")
+            elif detail == LINK_D_RADIO:
+                message = "the access point could not transmit (radio failure)"
+            elif detail == LINK_D_NO_XFER:
+                message = ("the access point has no transfer open - a BEGIN "
+                           "did not get through")
+            else:
+                message = f"the tag refused: {status_text(status)}"
+            message += f" (status 0x{status:02X}, detail 0x{detail:02X})" \
+                if status is not None and detail is not None else ""
             raise TransferError(message)
         if ptype == SK_U_ACK:
             if len(payload) != 3:
@@ -425,12 +525,14 @@ def make_bar(total, enabled):
 
 
 def transfer(ser, serial_no, image, timeout=DEFAULT_TIMEOUT,
+             begin_timeout=DEFAULT_BEGIN_TIMEOUT,
              end_timeout=DEFAULT_END_TIMEOUT, retries=DEFAULT_RETRIES,
              progress=True, verbose=False):
     """Run SK_U_IMG_BEGIN / DATA* / END against the access point.
 
     `ser` is an open pyserial port (or anything with read/write/
     reset_input_buffer). `timeout` covers one IMG_DATA acknowledgement,
+    `begin_timeout` the answer to IMG_BEGIN (the tag erases flash first),
     `end_timeout` the answer to IMG_END: the tag only acknowledges that one
     after it has finished the ~20 s e-paper refresh. Returns a stats dict;
     raises TransferError.
@@ -450,7 +552,7 @@ def transfer(ser, serial_no, image, timeout=DEFAULT_TIMEOUT,
              + bytes([total >> 8, total & 0xFF, image_crc >> 8, image_crc & 0xFF]))
     started = time.monotonic()
     (offset, status), retry_count = exchange(
-        ser, reader, build_frame(SK_U_IMG_BEGIN, begin), timeout, retries,
+        ser, reader, build_frame(SK_U_IMG_BEGIN, begin), begin_timeout, retries,
         f"IMG_BEGIN serial {serial_bytes.decode('ascii')} total {total} "
         f"crc 0x{image_crc:04X}", verbose)
     if status != SK_ST_OK:
@@ -668,10 +770,100 @@ def find_images(directory, only=None):
     return found
 
 
-def file_key(path):
-    """Change detector for --watch: size and mtime together."""
+def find_image(directory, serial):
+    """The image for one tag: [(SERIAL, path)] has at most one entry, or None.
+
+    Name order decides when a folder holds two files for the same serial
+    (1408F525.bmp and 1408F525.png), so the choice is at least repeatable.
+    """
+    found = find_images(directory, only=serial)
+    return found[0] if found else None
+
+
+def fingerprint(path):
+    """Size and mtime of an image: what decides whether it needs sending again.
+
+    Replacing a file with different bytes changes at least one of the two;
+    rewriting identical bytes may not, which is fine - the panel would show
+    the same picture.
+    """
     info = os.stat(path)
     return (info.st_size, info.st_mtime_ns)
+
+
+class SendRecord:
+    """What each tag has already been given, persisted as JSON.
+
+    Keyed by serial number, valued by the source file's name plus its
+    fingerprint. Only successful transfers are recorded (see send_file()), so
+    a tag that checks in again after a failure gets the image retried, and a
+    tool that is restarted does not resend everything it sent before.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.entries = {}
+
+    def __len__(self):
+        return len(self.entries)
+
+    def load(self):
+        """Read the record; a missing or unreadable file just means 'nothing sent'."""
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            self.entries = {}
+            return self
+        except (OSError, ValueError) as exc:
+            print(f"{self.path}: ignoring the send record: {exc}", file=sys.stderr)
+            self.entries = {}
+            return self
+        sent = data.get("sent") if isinstance(data, dict) else None
+        if not isinstance(sent, dict):
+            print(f"{self.path}: ignoring the send record: no 'sent' table",
+                  file=sys.stderr)
+            self.entries = {}
+            return self
+        self.entries = {}
+        for serial, entry in sent.items():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                self.entries[str(serial)] = (str(entry["file"]),
+                                             int(entry["size"]),
+                                             int(entry["mtime_ns"]))
+            except (KeyError, TypeError, ValueError):
+                continue                    # a hand-edited entry is dropped
+        return self
+
+    def save(self):
+        """Write the record atomically, so a crash cannot truncate it."""
+        data = {"version": STATE_VERSION,
+                "sent": {serial: {"file": name, "size": size, "mtime_ns": mtime}
+                         for serial, (name, size, mtime) in self.entries.items()}}
+        tmp = self.path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, sort_keys=True)
+                f.write("\n")
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            print(f"{self.path}: cannot write the send record: {exc}", file=sys.stderr)
+
+    def is_current(self, serial, path, fp):
+        """True when this exact file was already sent to this tag."""
+        return self.entries.get(serial) == (os.path.basename(path), fp[0], fp[1])
+
+    def record(self, serial, path, fp):
+        """Note a successful send and persist it."""
+        self.entries[serial] = (os.path.basename(path), fp[0], fp[1])
+        self.save()
+
+    def clear(self):
+        """Forget everything (--resend)."""
+        self.entries = {}
+        self.save()
 
 
 def dry_run_one(args, serial, path):
@@ -703,6 +895,274 @@ def dry_run_one(args, serial, path):
     print("  dry run - the serial port was not opened")
 
 
+def ping(ser, timeout=DEFAULT_TIMEOUT, retries=1):
+    """Ask the access point to prove it is reading its serial port.
+
+    IMG_END with no transfer open needs no radio, no tag and no flash: the
+    access point answers SK_U_STATUS(offset, SK_ST_OFFSET) with its "no
+    transfer" detail as soon as it parses the frame. So this separates the two
+    halves of "nothing happened":
+
+      any valid answer   the host -> access point link is fine, so the fault
+                         is downstream: the radio, or the tag
+      no answer          the access point is not hearing the host at all -
+                         wrong port, wrong rate, or (the trap this tool fell
+                         into) the board being held in reset by an asserted
+                         DTR/RTS that was never released
+
+    Note the answer to a ping is a *refusal* - SK_U_STATUS, not SK_U_ACK - so
+    it must be read as proof of life, not run through the transfer path's
+    "a status is fatal" logic.
+    """
+    reader = FrameReader(ser)
+    reader.flush()
+    frame = build_frame(SK_U_IMG_END)
+    attempts = retries + 1
+
+    for attempt in range(1, attempts + 1):
+        write_all(ser, frame)
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            got = reader.read_frame(remaining)
+            if got is None:
+                break
+            ptype, payload = got
+            if ptype == SK_U_ACK and len(payload) == 3:
+                print(f"the access point answered IMG_END with ACK(offset "
+                      f"{(payload[0] << 8) | payload[1]}, "
+                      f"{status_text(payload[2])}) after {attempt} attempt(s)")
+                print("host -> access point is working; anything still wrong is "
+                      "the radio or the tag")
+                return 0
+            if ptype == SK_U_STATUS and payload:
+                detail = payload[1] if len(payload) > 1 else None
+                extra = f", detail 0x{detail:02X}" if detail is not None else ""
+                print(f"the access point answered IMG_END with "
+                      f"{status_text(payload[0])}{extra} after {attempt} "
+                      f"attempt(s)")
+                print("host -> access point is working: that refusal is the "
+                      "correct answer to a ping with no transfer open, and it "
+                      "proves the frame was parsed")
+                print("anything still wrong is the radio or the tag")
+                return 0
+            # Any other frame is still an answer from a live access point.
+            print(f"the access point answered with frame type 0x{ptype:02X} "
+                  f"after {attempt} attempt(s) - it is reading the host")
+            return 0
+        if attempt < attempts:
+            print(f"  no answer within {timeout:g}s - retry {attempt}/{retries}",
+                  file=sys.stderr)
+
+    print("the access point did not answer: check the port, the baud rate "
+          "(38400), that its firmware is running, and that nothing is holding "
+          "the board in reset (the tool releases DTR/RTS when it opens the "
+          "port; a terminal that asserts them will silence the board)",
+          file=sys.stderr)
+    return 1
+
+
+class LineReader:
+    """Read the access point's text output off the same port as the frames.
+
+    The port carries two kinds of bytes: the human-readable lines the access
+    point prints while it is idle (banner, "TAG ...", "?? checksum mismatch"),
+    and the binary frame answers that come back while a transfer is running.
+    This class owns the text side and keeps its own partial-line buffer, so a
+    line split across two reads is still one line. Nothing here ever feeds the
+    frame parser, and the frame parser never reads through this buffer:
+    - before starting a transfer, drop_partial() throws away the half-line the
+      transfer is about to take bytes away from (the transfer's own
+      FrameReader.flush() empties the port buffer);
+    - after a transfer, whatever text arrived meanwhile is read normally, at
+      worst with a truncated first line, which simply prints and is ignored.
+    """
+
+    def __init__(self, ser):
+        self._ser = ser
+        self._buf = b""
+
+    def drop_partial(self):
+        """Forget a line that was never terminated (call before a transfer)."""
+        self._buf = b""
+
+    def read_line(self, timeout=WATCH_READ_TIMEOUT):
+        """The next line without its CR/LF, or None if none arrived in time.
+
+        An empty string means an empty line: the access point only ever sends
+        CR LF between lines, but a blank line is not worth filtering here.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            if b"\n" in self._buf:
+                line, self._buf = self._buf.split(b"\n", 1)
+                return line.rstrip(b"\r").decode("ascii", "replace")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                chunk = self._ser.read(4096)
+            except OSError as exc:
+                raise TransferError(f"serial read failed: {exc}") from exc
+            if chunk:
+                self._buf += chunk
+                if len(self._buf) > WATCH_LINE_MAX and b"\n" not in self._buf:
+                    # Not a line at all: noise, or a rate mismatch. Keep the
+                    # tail, it may still be the start of a real line.
+                    self._buf = self._buf[-WATCH_LINE_MAX:]
+
+
+def parse_tag_line(line):
+    """The serial number from "TAG 1408F525 rssi=-41", or None.
+
+    The exact shape comes from report_packet() in the access point's main.c:
+    "TAG ", the serial as printed, " rssi=" and a signed decimal. Anything
+    else - the boot banner, "?? checksum mismatch", a half-received line - is
+    not a check-in.
+    """
+    match = TAG_RE.match(line.strip())
+    return match.group(1).upper() if match else None
+
+
+def send_file(args, ser, serial, path, record=None):
+    """Convert one image, push it to its tag and record the success.
+
+    The fingerprint is taken before the transfer: if the file is edited while
+    the radio is busy, the next check-in sees the new one and sends it.
+    Returns the stats dict; raises TransferError/OSError/ValueError.
+    """
+    fp = fingerprint(path)
+    if args.dry_run:
+        dry_run_one(args, serial, path)
+        return None
+    stats = send_one(args, ser, serial, path)
+    if record is not None:
+        record.record(serial, path, fp)
+    return stats
+
+
+def process_pending(args, ser, record=None):
+    """One-shot mode: send every image in the folder once, changed or not.
+
+    The send record is updated for each success but never consulted, so
+    `send_image.py COM8` means "push these images now" whatever was sent
+    before. Returns (done, failed, seen).
+    """
+    images = find_images(args.dir, args.serial)
+    done = failed = 0
+    for serial, path in images:
+        try:
+            send_file(args, ser, serial, path, record)
+        except (TransferError, OSError, ValueError) as exc:
+            print(f"{os.path.basename(path)}: {exc}", file=sys.stderr)
+            failed += 1
+            continue
+        done += 1
+    return done, failed, len(images)
+
+
+def check_in(args, ser, serial, record, notes=None):
+    """Act on one "TAG <serial>" line from the access point.
+
+    Sends that tag's image when the folder has one and it differs from what
+    this tag was last given. Returns one of "sent", "up-to-date", "no-image",
+    "failed" or "ignored".
+    """
+    if args.serial and serial != args.serial.strip().upper():
+        return "ignored"
+    found = find_images(args.dir, only=serial)
+    if not found:
+        if notes is not None and ("no-image", serial) not in notes:
+            notes.add(("no-image", serial))
+            print(f"{serial}: checked in - no {serial}.png/jpg/bmp/gif in "
+                  f"{os.path.abspath(args.dir)}")
+        return "no-image"
+    if len(found) > 1 and notes is not None and ("many", serial) not in notes:
+        notes.add(("many", serial))
+        print(f"{serial}: {len(found)} images match this tag, using "
+              f"{os.path.basename(found[0][1])} and ignoring the rest",
+              file=sys.stderr)
+    path = found[0][1]
+    try:
+        fp = fingerprint(path)
+    except OSError as exc:
+        print(f"{serial}: cannot stat {os.path.basename(path)}: {exc}",
+              file=sys.stderr)
+        return "failed"
+    if record is not None and record.is_current(serial, path, fp):
+        if args.verbose and notes is not None and ("current", serial) not in notes:
+            notes.add(("current", serial))
+            print(f"{serial}: checked in - {os.path.basename(path)} is already "
+                  f"on the tag")
+        return "up-to-date"
+    print(f"{serial}: checked in - sending {os.path.basename(path)}")
+    try:
+        send_file(args, ser, serial, path, record)
+    except (TransferError, OSError, ValueError) as exc:
+        # Deliberately not recorded: the tag announces itself again in about
+        # 10 s, and that check-in retries the transfer.
+        print(f"{serial}: {exc}", file=sys.stderr)
+        print(f"{serial}: will try again when the tag checks in next",
+              file=sys.stderr)
+        return "failed"
+    if notes is not None:
+        notes.discard(("current", serial))
+    return "sent"
+
+
+def watch_loop(args, ser, record=None, max_iterations=None):
+    """Send an image when the access point reports that its tag checked in.
+
+    Reads the access point's lines; every line is printed (the boot banner and
+    its messages are the operator's only view of the radio side), and a
+    "TAG <serial> rssi=<db>" line is a check-in. Ctrl-C stops.
+
+    `max_iterations` bounds the loop and exists so the tests can run the real
+    loop over a fake port; None means "until interrupted".
+    """
+    record = SendRecord(os.path.join(args.dir, STATE_FILE)) if record is None \
+        else record
+    record.load()
+    if args.resend and len(record):
+        print(f"forgetting {len(record)} send record(s): {record.path}")
+        record.clear()
+    reader = LineReader(ser)
+    notes = set()
+    print(f"watching {os.path.abspath(args.dir)}: an image is sent when its tag "
+          f"checks in (Ctrl-C to stop)")
+    print(f"  send record   {record.path} ({len(record)} tag(s))"
+          + ("" if len(record) else " - nothing sent yet"))
+    print("  a tag announces itself about every 10s; --monitor shows the access "
+          "point's own output")
+
+    silent_since = time.monotonic()
+    iterations = 0
+    while max_iterations is None or iterations < max_iterations:
+        iterations += 1
+        line = reader.read_line(WATCH_READ_TIMEOUT)
+        if line is None:
+            if time.monotonic() - silent_since > WATCH_SILENCE_HINT:
+                silent_since = time.monotonic() + WATCH_SILENCE_REPEAT
+                print(f"no output from the access point for "
+                      f"{WATCH_SILENCE_HINT:g}s - is it on {args.port}? "
+                      f"(--monitor, --ping)", file=sys.stderr)
+            continue
+        silent_since = time.monotonic()
+        if not line:
+            continue
+        print(f"ap: {line}")
+        serial = parse_tag_line(line)
+        if serial is None:
+            continue
+        # The tag's line is done; anything half-read now belongs to the
+        # transfer, not to the text stream.
+        reader.drop_partial()
+        check_in(args, ser, serial, record, notes)
+    return 0
+
+
 def send_one(args, ser, serial, path):
     """Convert one image and push it to its tag."""
     (bw, red), note = convert_file(path, args.fit, args.rotate, args.threshold,
@@ -712,6 +1172,7 @@ def send_one(args, ser, serial, path):
     print(f"{os.path.basename(path)} -> tag {serial}  ({note}; "
           f"black {count_ink(bw)} px, red {count_ink(red)} px)")
     stats = transfer(ser, serial, image, timeout=args.timeout,
+                     begin_timeout=args.begin_timeout,
                      end_timeout=args.end_timeout,
                      retries=args.retries, progress=not args.no_progress,
                      verbose=args.verbose)
@@ -723,46 +1184,42 @@ def send_one(args, ser, serial, path):
     return stats
 
 
-def process_pending(args, ser, state):
-    """Handle every image that is new or changed since the last scan.
+def monitor(ser, seconds=30.0):
+    """Print what the access point says, without sending anything.
 
-    `state` maps path -> file_key() of what has been handled; a file that
-    changes is sent again. Returns (done, failed, seen).
+    A tag running this firmware re-announces itself about every 10 seconds,
+    so a TAG line appearing here (and repeating) is the proof that the tag is
+    alive, flashed, in range and talking to the access point. Everything else
+    on the line - the boot banner, its own error messages - is printed too,
+    because that is the only view of the radio side the host gets.
     """
-    images = find_images(args.dir, args.serial)
-    done = failed = 0
-    for serial, path in images:
-        try:
-            key = file_key(path)
-        except OSError as exc:
-            print(f"{os.path.basename(path)}: cannot stat: {exc}", file=sys.stderr)
-            failed += 1
-            continue
-        if state.get(path) == key:
-            continue
-        try:
-            if args.dry_run:
-                dry_run_one(args, serial, path)
-            else:
-                send_one(args, ser, serial, path)
-        except (TransferError, OSError, ValueError) as exc:
-            print(f"{os.path.basename(path)}: {exc}", file=sys.stderr)
-            failed += 1
-            state.pop(path, None)       # stays pending, the next scan retries
-            continue
-        state[path] = key
-        done += 1
-    return done, failed, len(images)
-
-
-def watch_loop(args, ser):
-    """Send images as they appear; Ctrl-C stops."""
-    state = {}
-    print(f"watching {os.path.abspath(args.dir)} every {args.interval:g}s "
-          f"(Ctrl-C to stop)")
-    while True:
-        process_pending(args, ser, state)
-        time.sleep(args.interval)
+    print(f"listening for {seconds:g}s - a live tag prints TAG <serial> rssi=<db> "
+          f"every ~10s (Ctrl-C to stop)")
+    reader = LineReader(ser)
+    deadline = time.monotonic() + seconds
+    lines = 0
+    tags = {}
+    try:
+        while time.monotonic() < deadline:
+            line = reader.read_line(min(WATCH_READ_TIMEOUT, max(0.0, deadline - time.monotonic())))
+            if line is None:
+                continue
+            if not line:
+                continue
+            lines += 1
+            print(f"ap: {line}")
+            serial = parse_tag_line(line)
+            if serial is not None:
+                tags[serial] = tags.get(serial, 0) + 1
+    except KeyboardInterrupt:
+        print()
+    if tags:
+        summary = ", ".join(f"{serial} x{count}" for serial, count in sorted(tags.items()))
+        print(f"{lines} line(s) from the access point; tags heard: {summary}")
+    else:
+        print(f"{lines} line(s) from the access point, no TAG line - no tag is "
+              f"announcing itself (out of range, unpowered, or not flashed)")
+    return 0
 
 
 # ── selftest ──────────────────────────────────────────────────────────────
@@ -838,6 +1295,29 @@ def run_selftest(verbose=False):
     if verbose:
         print(f"       image CRC 0x{crc16_ccitt_false(image):04X}")
 
+    # 5. the access point's check-in line
+    check("a TAG line parses to its serial",
+          parse_tag_line("TAG 1408F525 rssi=-41") == "1408F525"
+          and parse_tag_line("TAG 1408F525 rssi=-41\r") == "1408F525")
+    check("the banner and other access point lines are not check-ins",
+          parse_tag_line("*** ShelfKit access point ***") is None
+          and parse_tag_line("?? checksum mismatch (12 bytes, noise?)") is None
+          and parse_tag_line("TAG rssi=-41") is None
+          and parse_tag_line("TAG 1408F525 rssi=") is None)
+
+    # 6. the send record: what stops a tag being re-sent every 10 seconds
+    with tempfile.TemporaryDirectory() as tmp:
+        png = os.path.join(tmp, "1408F525.png")
+        record = SendRecord(os.path.join(tmp, STATE_FILE))
+        record.record("1408F525", png, (100, 200))
+        reloaded = SendRecord(os.path.join(tmp, STATE_FILE)).load()
+        check("the send record survives a reload",
+              reloaded.is_current("1408F525", png, (100, 200)),
+              f"{len(reloaded)} tag(s)")
+        check("a changed file or another tag is not current",
+              not reloaded.is_current("1408F525", png, (100, 201))
+              and not reloaded.is_current("ABCD1234", png, (100, 200)))
+
     failed = [name for name, ok, _ in results if not ok]
     print(f"\nselftest: {len(results) - len(failed)}/{len(results)} checks passed")
     return 1 if failed else 0
@@ -874,12 +1354,15 @@ def build_parser():
     ap.add_argument("-d", "--dir", default=DEFAULT_DIR,
                     help=f"image folder (default: {DEFAULT_DIR})")
     ap.add_argument("-s", "--serial", default=None,
-                    help="send only this tag's image")
+                    help="send only this tag's image (with --watch: only act on "
+                         "this tag's check-ins)")
     ap.add_argument("-w", "--watch", action="store_true",
-                    help="keep running and send images as they appear")
-    ap.add_argument("--interval", type=float, default=DEFAULT_INTERVAL,
-                    help=f"seconds between folder scans with --watch "
-                         f"(default: {DEFAULT_INTERVAL:g})")
+                    help="keep running: send a tag's image when the access point "
+                         "reports that the tag checked in, if the image is new or "
+                         "has changed")
+    ap.add_argument("--resend", action="store_true",
+                    help=f"forget {STATE_FILE} first, so every tag gets one push "
+                         f"again")
     ap.add_argument("--fit", choices=["contain", "cover", "stretch"],
                     default=DEFAULT_FIT,
                     help=f"how the image fills the panel (default: {DEFAULT_FIT})")
@@ -902,6 +1385,16 @@ def build_parser():
     ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
                     help=f"seconds to wait for one IMG_DATA acknowledgement "
                          f"(default: {DEFAULT_TIMEOUT:g})")
+    ap.add_argument("--begin-timeout", type=float, default=DEFAULT_BEGIN_TIMEOUT,
+                    help=f"seconds to wait for the answer to IMG_BEGIN, which "
+                         f"comes after the tag erases its flash "
+                         f"(default: {DEFAULT_BEGIN_TIMEOUT:g})")
+    ap.add_argument("--ping", action="store_true",
+                    help="check the host -> access point link without using the "
+                         "radio, then exit")
+    ap.add_argument("--monitor", action="store_true",
+                    help="print what the access point says for 30s and send "
+                         "nothing; a live tag announces itself every ~10s")
     ap.add_argument("--end-timeout", type=float, default=DEFAULT_END_TIMEOUT,
                     help=f"seconds to wait for the answer to IMG_END, which the "
                          f"tag sends after the panel refresh "
@@ -937,17 +1430,20 @@ def parse_args(argv=None):
         ap.error("--retries must not be negative")
     if args.timeout <= 0:
         ap.error("--timeout must be positive")
+    if args.begin_timeout <= 0:
+        ap.error("--begin-timeout must be positive")
     if args.end_timeout <= 0:
         ap.error("--end-timeout must be positive")
-    if args.interval <= 0:
-        ap.error("--interval must be positive")
+    if args.dry_run and (args.watch or args.monitor or args.ping):
+        ap.error("--dry-run cannot be combined with --watch, --monitor or --ping: "
+                 "they all read the access point's port")
     return args
 
 
 def open_port(port, baud):
     """Open the serial port with clear diagnostics."""
     try:
-        return serial.Serial(
+        ser = serial.Serial(
             port=port,
             baudrate=baud,
             bytesize=serial.EIGHTBITS,
@@ -960,6 +1456,21 @@ def open_port(port, baud):
         )
     except OSError as exc:
         raise TransferError(f"cannot open {port}: {exc}") from exc
+
+    # Release DTR and RTS immediately - do not remove this.
+    #
+    # On these tag boards the CH9102's two handshake lines are wired to the
+    # board's reset and boot pins. That is how tools/axsem-flasher.py gets a
+    # tag into its bootloader, and it is why flashing always works. But
+    # pyserial *drives both lines the moment it opens a port*, and an
+    # asserted DTR/RTS holds the board in reset. The symptom is brutally
+    # misleading: a perfectly healthy access point prints no banner, no TAG
+    # lines and answers nothing at all, so it looks like dead firmware or a
+    # broken UART receive - while the same board talks normally the instant
+    # these two lines are released.
+    ser.dtr = False
+    ser.rts = False
+    return ser
 
 
 def main(argv=None):
@@ -991,11 +1502,24 @@ def main(argv=None):
         if not args.dry_run:
             ser = open_port(args.port, args.baud)
 
+        if args.monitor:
+            return monitor(ser, 30.0)
+
+        if args.ping:
+            return ping(ser, timeout=args.timeout, retries=args.retries)
+
         if args.watch:
             watch_loop(args, ser)
             return 0
 
-        done, failed, seen = process_pending(args, ser, {})
+        # One-shot: every image goes out, whatever the record says. Successes
+        # are recorded, so a later --watch does not repeat them.
+        record = SendRecord(os.path.join(args.dir, STATE_FILE))
+        record.load()
+        if args.resend and len(record) and not args.dry_run:
+            print(f"forgetting {len(record)} send record(s): {record.path}")
+            record.clear()
+        done, failed, seen = process_pending(args, ser, record)
         if not seen:
             if args.serial:
                 print(f"no image for tag {args.serial.upper()} in "

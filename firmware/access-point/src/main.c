@@ -166,6 +166,16 @@ static uint8_t __xdata tx_pkt[SK_PKT_MAX];
  * it: the tag ends its transfer at that offset, whatever it is. */
 static uint16_t __xdata xfer_total;
 
+/* The serial this transfer is addressed to, taken from IMG_BEGIN. It is what
+ * tells the target's own answers apart from another tag's: IMG_BEGIN is a
+ * broadcast on the air, so every tag in range hears it and every tag that is
+ * *not* the target refuses it with IMG_STATUS + SK_ST_BAD_SERIAL. A refusal
+ * that cannot be attributed to the target must never be taken as the verdict
+ * for the frame we sent - with one tag on the bench it makes no difference,
+ * with two it is the difference between working and not. */
+static uint8_t __xdata xfer_serial[SK_SERIAL_MAX];
+static uint8_t xfer_slen;
+
 /* A tag has taken the transfer on (IMG_ACK(off = 0) after IMG_BEGIN). */
 static uint8_t xfer_active;
 
@@ -308,6 +318,14 @@ static void host_status(uint8_t status, uint8_t detail) __reentrant
 
 /* ── the radio side of the bridge ─────────────────────────────────────── */
 
+/* Set to 1 to trace the bridge on the serial console: every radio packet
+ * sent, and every packet heard while waiting for an answer. The lines are
+ * plain text interleaved with the binary answers; the host tool
+ * resynchronises on the frame sync and prints them as "ap: ..." lines, so
+ * this is safe to leave on. It answers "did the tag answer at all, and what
+ * did it say" without a logic analyser. */
+#define AP_LINK_DEBUG 1
+
 /* Send one radio packet and put the receiver back on the air. radio_tx()
  * powers the chip down when it is done (radio.c), so without this the tag's
  * answer - and every later announcement - would be missed. Doing it in one
@@ -317,17 +335,62 @@ static uint8_t radio_send(const uint8_t *pkt, uint8_t len) __reentrant
     uint8_t err = radio_tx(pkt, len);
 
     radio_rx_start();
+#if AP_LINK_DEBUG
+    uart_puts("link: sent type ");
+    uart_puthex8(len > 1 ? pkt[1] : 0);
+    uart_puts(" len ");
+    uart_puthex8(len);
+    uart_puts(err ? " FAILED\r\n" : "\r\n");
+#endif
     return err;
+}
+
+/* Serials are compared case-insensitively: the tag folds case, so the same
+ * label is "1408F525" in the image file name and "1408f525" out of some NFC
+ * URIs, and they are the same tag. */
+static uint8_t serial_eq(const uint8_t *a, const uint8_t *b, uint8_t n) __reentrant
+{
+    uint8_t i;
+
+    for (i = 0; i < n; i++) {
+        uint8_t x = a[i];
+        uint8_t y = b[i];
+
+        if (x >= 'a' && x <= 'z')
+            x = (uint8_t)(x - 'a' + 'A');
+        if (y >= 'a' && y <= 'z')
+            y = (uint8_t)(y - 'a' + 'A');
+        if (x != y)
+            return 0;
+    }
+    return 1;
+}
+
+/* A refusal from a tag that is not the one we are talking to. Worth its own
+ * line: it explains why a transfer is slow - a second tag is answering every
+ * broadcast - instead of leaving the operator to guess. */
+static void report_foreign_status(const uint8_t *pkt, uint8_t n) __reentrant
+{
+    uint8_t i;
+
+    uart_puts("?? STATUS from ");
+    for (i = 0; i < n; i++) {
+        uint8_t c = pkt[SK_HDR_LEN + i];
+        uart_putc((c >= 32 && c <= 126) ? c : '?');
+    }
+    uart_puts(" (not the target), ignored\r\n");
+    uart_flush();
 }
 
 /* Poll the receiver for @p ms milliseconds and pick out the tag's answer.
  *
  * Polling rather than sleeping, because the answer can land at any point in
  * the window and radio_rx() is non-blocking: the packet is taken as it
- * arrives. Anything that is not an answer - another tag announcing, a frame
- * whose XOR checksum did not survive the air - is dropped and the wait
- * carries on. The loop is bounded by @p ms iterations, so neither noise nor
- * a tag that never answers can keep this here forever. */
+ * arrives. Anything that is not an answer *to this transfer* - another tag
+ * announcing, a frame whose XOR checksum did not survive the air, another
+ * tag's refusal - is dropped and the wait carries on. The loop is bounded by
+ * @p ms iterations, so neither noise nor a tag that never answers can keep
+ * this here forever. */
 static uint8_t radio_wait_reply(uint16_t ms) __reentrant
 {
     uint8_t len, n;
@@ -339,6 +402,19 @@ static uint8_t radio_wait_reply(uint16_t ms) __reentrant
             continue;
         }
 
+#if AP_LINK_DEBUG
+        /* Everything heard, before any filtering - this is the line that
+         * says whether the tag answered at all, and whether its XOR survived
+         * the air. Without it a rejected answer is indistinguishable from
+         * silence. */
+        uart_puts("link: heard len ");
+        uart_puthex8(len);
+        uart_puts(" type ");
+        uart_puthex8(len > 1 ? rx_pkt[1] : 0);
+        uart_puts(sk_checksum(rx_pkt, (uint8_t)(len - 1)) == rx_pkt[len - 1]
+                  ? " xor ok\r\n" : " xor BAD\r\n");
+#endif
+
         if (len < SK_HDR_LEN + 1)
             continue;               /* no room for a type and a checksum */
         if (rx_pkt[0] != SK_PROTO_VERSION)
@@ -347,21 +423,24 @@ static uint8_t radio_wait_reply(uint16_t ms) __reentrant
             continue;
 
         if (rx_pkt[1] == SK_PKT_IMG_ACK && len >= 6) {
-            /* [ver][type][off hi][off lo][status][xor] */
+            /* [ver][type][off hi][off lo][status][xor]. Only the addressed
+             * tag ever acknowledges, so an ACK needs no attribution. */
             reply_off = (uint16_t)(((uint16_t)rx_pkt[2] << 8) | rx_pkt[3]);
             reply_status = rx_pkt[4];
             return REPLY_ACK;
         }
         if (rx_pkt[1] == SK_PKT_IMG_STATUS) {
-            /* [ver][type][slen][serial n][status][xor]: the status is the
-             * byte after the serial, and the slen field is clamped to what
-             * the length byte actually left, the same way report_packet()
-             * treats it. Any tag's refusal is taken: it is a definite answer
-             * to a transfer attempt, and the protocol carries no addressing
-             * that would let us tell whose it was. */
+            /* [ver][type][slen][serial n][status][xor]. Every tag that heard
+             * the IMG_BEGIN but is not the target answers one of these with
+             * SK_ST_BAD_SERIAL, so the serial is what decides whether this is
+             * a verdict on our transfer or somebody else's business. */
             n = rx_pkt[2];
-            if (n > (uint8_t)(len - SK_HDR_LEN - 1))
-                n = (uint8_t)(len - SK_HDR_LEN - 1);
+            if (n < 1 || n > SK_SERIAL_MAX || len != (uint8_t)(n + 5))
+                continue;           /* unreadable: it must not kill a transfer */
+            if (xfer_slen != n || !serial_eq(rx_pkt + SK_HDR_LEN, xfer_serial, n)) {
+                report_foreign_status(rx_pkt, n);
+                continue;           /* another tag: not our verdict */
+            }
             reply_status = rx_pkt[SK_HDR_LEN + n];
             return REPLY_STATUS;
         }
@@ -405,6 +484,12 @@ static void link_image_begin(void) __reentrant
     tx_pkt[len] = sk_checksum(tx_pkt, len);
     len++;
 
+    /* Remember who this is addressed to, before the first wait: every later
+     * answer is checked against it, so that another tag's refusal of this
+     * broadcast is not mistaken for the target's verdict. */
+    for (i = 0; i < n; i++)
+        xfer_serial[i] = ser_buf[3 + i];
+    xfer_slen = n;
     xfer_total = (uint16_t)(((uint16_t)ser_buf[3 + n] << 8) | ser_buf[4 + n]);
 
     /* A new BEGIN supersedes whatever was running: the protocol allows one

@@ -51,6 +51,15 @@ class Tag:
             dsrdtr=False,
         )
 
+        # Release DTR and RTS before doing anything else. On these tag boards
+        # they are wired to the board's reset and boot pins (axsem-flasher.py
+        # drives them on purpose to reach the bootloader), and pyserial
+        # asserts both when it opens a port - which holds the board in reset
+        # and makes a running firmware look completely dead. The tag here is
+        # read, never reset, so both lines stay low for the whole session.
+        self.serial.dtr = False
+        self.serial.rts = False
+
     def close(self):
         if self.serial.is_open:
             self.serial.close()

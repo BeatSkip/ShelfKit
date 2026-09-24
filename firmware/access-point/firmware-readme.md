@@ -157,6 +157,14 @@ stay in the tree because they are the tag's, and this project folder started as 
   while the tag is still in its receive state is what saves the transfer. It is safe because the
   answer is ~20 s away either way — a duplicate that arrives after the tag has taken the frame
   is answered from its stored verdict, not by refreshing the panel again. Never a third time.
+- **`IMG_BEGIN` is a broadcast on the air**, so every tag in range hears it and every tag that
+  is not the target refuses it with `IMG_STATUS` + `SK_ST_BAD_SERIAL`. Only an answer that can be
+  *attributed* to the addressed tag may decide the transfer's fate: an `IMG_STATUS` is matched
+  against the target serial from `IMG_BEGIN` (case-insensitively — the tag folds case), and a
+  refusal from any other tag is logged and ignored, as is a status too malformed to read a
+  serial out of. Without that check a second tag on the bench silently kills transfers to the
+  first — `?? STATUS from ABCD1234 (not the target), ignored` is what that looks like in the log.
+  `IMG_ACK` needs no such check: only the addressed tag ever sends one.
 - The parser gives up on a half-received frame after ~0.1 s of silence (`SER_IDLE_LIMIT`). That
   is what stops a frame the host abandoned mid-way from being completed with the *next* frame's
   bytes; the constant is only good to a factor of a few, and deliberately sits far from both the

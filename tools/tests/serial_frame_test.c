@@ -312,8 +312,23 @@ static void reset_world(void)
     ser_idle = 0;
     xfer_active = 0;
     xfer_total = 0;
+    xfer_slen = 0;
+    memset(xfer_serial, 0, sizeof xfer_serial);
     reply_off = 0;
     reply_status = 0;
+}
+
+/* The state a completed BEGIN handshake leaves behind: a live transfer
+ * addressed to 1408F525, which is what the DATA and END cases below start
+ * from. The serial matters now - the bridge checks every IMG_STATUS against
+ * it, so that a second tag's refusal of the broadcast does not pass for the
+ * target's verdict. */
+static void pretend_begin_ok(void)
+{
+    xfer_active = 1;
+    xfer_total = SK_IMG_TOTAL_BYTES;
+    memcpy(xfer_serial, "1408F525", 8);
+    xfer_slen = 8;
 }
 
 static void feed(const uint8_t *b, size_t n)
@@ -373,6 +388,26 @@ static int run_pending(void)
 static void mark_tx(void)
 {
     frame_pos = tx_capture_len;
+}
+
+/* Look for @p s in what the access point has printed and, if it is there,
+ * skip past the end of it - the same thing mark_tx() does, for the case where
+ * a diagnostic line lands in front of the host's answer. */
+static int tx_skip_past(const char *s)
+{
+    size_t n = strlen(s);
+    size_t i;
+
+    if (tx_capture_len >= n) {
+        for (i = 0; i + n <= tx_capture_len; i++) {
+            if (memcmp(tx_capture + i, s, n) == 0) {
+                frame_pos = i + n;
+                return 1;
+            }
+        }
+    }
+    frame_pos = 0;
+    return 0;
 }
 
 /* Check that the bytes emitted since the last call are exactly one host
@@ -685,8 +720,7 @@ static void test_payload_may_contain_sync(void)
 
     printf("-- 0xAA 0x55 inside a payload is data, not a new frame\n");
     reset_world();
-    xfer_active = 1;                        /* pretend BEGIN was accepted */
-    xfer_total = SK_IMG_TOTAL_BYTES;
+    pretend_begin_ok();                     /* a BEGIN was accepted earlier */
 
     p[0] = 0x00; p[1] = 0x60;
     p[2] = 0xAA; p[3] = 0x55; p[4] = 0xAA; p[5] = 0x55;
@@ -868,16 +902,123 @@ static void test_begin_busy_forever_is_bounded(void)
     expect_status(SK_ST_BAD_SERIAL, LINK_D_TIMEOUT);
 }
 
-static void test_begin_refused(void)
+static void test_begin_ignores_a_foreign_status(void)
 {
-    printf("-- IMG_BEGIN refused by the tag (wrong serial)\n");
+    printf("-- IMG_BEGIN: a foreign tag refuses first, the target still accepts\n");
     reset_world();
-    tag_reply_status(120, "DEADBEEF", SK_ST_BAD_SERIAL);
+    /* The bench case: IMG_BEGIN is a broadcast, so every other tag in range
+     * answers SK_ST_BAD_SERIAL. Taking the first answer as the verdict killed
+     * a transfer the real target would have accepted. */
+    tag_reply_status(200, "DEADBEEF", SK_ST_BAD_SERIAL);
+    tag_reply_ack(1000, 0, SK_ST_OK);
+    host_begin_cmd(SK_IMG_TOTAL_BYTES, 0);
+    CHECK(run_pending() == 1, "the BEGIN frame was not parsed");
+    CHECK(xfer_active == 1, "a foreign refusal must not close the transfer");
+    CHECK(radio_tx_calls == 1, "IMG_BEGIN went out %u times, wanted 1", radio_tx_calls);
+    CHECK(tx_skip_past("?? STATUS from DEADBEEF (not the target), ignored\r\n"),
+          "the foreign refusal was not logged");
+    expect_ack(0, SK_ST_OK);
+}
+
+static void test_begin_ignores_a_foreign_status_in_lower_case(void)
+{
+    printf("-- IMG_BEGIN: case is folded when matching the serial\n");
+    reset_world();
+    /* The target's own answer, written in the other case: still the target. */
+    tag_reply_status(200, "1408f525", SK_ST_BUSY);
+    tag_reply_ack(600, 0, SK_ST_OK);
+    host_begin_cmd(SK_IMG_TOTAL_BYTES, 0);
+    CHECK(run_pending() == 1, "the BEGIN frame was not parsed");
+    CHECK(xfer_active == 1, "the lower-case serial was not recognised as the target");
+    CHECK(radio_tx_calls == 1, "IMG_BEGIN went out %u times, wanted 1", radio_tx_calls);
+    expect_ack(0, SK_ST_OK);
+}
+
+static void test_begin_refused_by_the_target(void)
+{
+    printf("-- IMG_BEGIN refused by the target itself\n");
+    reset_world();
+    tag_reply_status(120, "1408F525", SK_ST_BAD_SERIAL);
     host_begin_cmd(SK_IMG_TOTAL_BYTES, 0);
     CHECK(run_pending() == 1, "the BEGIN frame was not parsed");
     CHECK(radio_tx_calls == 1, "IMG_BEGIN went out %u times, wanted 1", radio_tx_calls);
     CHECK(xfer_active == 0, "a refused BEGIN must not open a transfer");
     expect_status(SK_ST_BAD_SERIAL, LINK_D_TAG);
+}
+
+static void test_begin_ignores_a_malformed_status(void)
+{
+    printf("-- IMG_BEGIN: unreadable statuses are ignored, not fatal\n");
+    reset_world();
+    /* slen = 0: there is no serial to attribute it to. */
+    tag_reply_status(200, "", SK_ST_BAD_SERIAL);
+    /* slen that overruns the frame: likewise unreadable. */
+    {
+        uint8_t p[SK_PKT_MAX];
+
+        p[0] = SK_PROTO_VERSION;
+        p[1] = SK_PKT_IMG_STATUS;
+        p[2] = 20;                      /* claims 20 serial bytes */
+        p[3] = SK_ST_BAD_SERIAL;
+        p[4] = xor8(p, 4);
+        air_push(300, p, 5);            /* ... but the frame is 5 bytes long */
+    }
+    /* A serial length that fits SK_SERIAL_MAX but not the frame it arrived in. */
+    {
+        uint8_t p[SK_PKT_MAX];
+
+        p[0] = SK_PROTO_VERSION;
+        p[1] = SK_PKT_IMG_STATUS;
+        p[2] = 12;
+        p[3] = SK_ST_BAD_SERIAL;
+        p[4] = xor8(p, 4);
+        air_push(400, p, 5);
+    }
+    tag_reply_ack(600, 0, SK_ST_OK);
+    host_begin_cmd(SK_IMG_TOTAL_BYTES, 0);
+    CHECK(run_pending() == 1, "the BEGIN frame was not parsed");
+    CHECK(xfer_active == 1, "an unreadable status killed the transfer");
+    CHECK(radio_tx_calls == 1, "IMG_BEGIN went out %u times, wanted 1", radio_tx_calls);
+    expect_ack(0, SK_ST_OK);
+}
+
+static void test_data_ignores_a_foreign_status(void)
+{
+    printf("-- IMG_DATA: a foreign status does not disturb the offset\n");
+    reset_world();
+    pretend_begin_ok();
+    /* the target serial the transfer was opened to */
+    memcpy(xfer_serial, "1408F525", 8);
+    xfer_slen = 8;
+
+    tag_reply_status(150, "DEADBEEF", SK_ST_BAD_SERIAL);
+    tag_reply_ack(500, 0x00C3, SK_ST_OK);
+    host_data_cmd(0x00C0, 0x40, 3);
+    CHECK(run_pending() == 1, "the DATA frame was not parsed");
+    CHECK(radio_tx_calls == 1, "IMG_DATA went out %u times, wanted 1", radio_tx_calls);
+    CHECK(xfer_active == 1, "a foreign refusal must not close the transfer");
+    CHECK(tx_skip_past("?? STATUS from DEADBEEF (not the target), ignored\r\n"),
+          "the foreign refusal was not logged");
+    expect_ack(0x00C3, SK_ST_OK);
+}
+
+static void test_end_ignores_a_foreign_status(void)
+{
+    printf("-- IMG_END: a foreign status does not stop the resend\n");
+    reset_world();
+    pretend_begin_ok();
+
+    tag_reply_status(200, "DEADBEEF", SK_ST_BAD_SERIAL);
+    /* Nothing answers the first END, so the resend must still happen; the
+     * target's verdict then arrives after it. */
+    tag_reply_ack(LINK_END_RESEND_MS + 500, SK_IMG_TOTAL_BYTES, SK_ST_OK);
+    host_end_cmd();
+    CHECK(run_pending() == 1, "the END frame was not parsed");
+    CHECK(radio_tx_calls == 2, "IMG_END went out %u times, wanted 2", radio_tx_calls);
+    CHECK(xfer_active == 0, "the transfer should be over");
+    CHECK(tx_skip_past("?? STATUS from DEADBEEF (not the target), ignored\r\n"),
+          "the foreign refusal was not logged");
+    expect_ack(SK_IMG_TOTAL_BYTES, SK_ST_OK);
 }
 
 static void test_begin_ack_with_error_status(void)
@@ -912,8 +1053,7 @@ static void test_data_ok(void)
 {
     printf("-- IMG_DATA accepted\n");
     reset_world();
-    xfer_active = 1;
-    xfer_total = SK_IMG_TOTAL_BYTES;
+    pretend_begin_ok();
 
     tag_reply_ack(250, 0x00C3, SK_ST_OK);
     host_data_cmd(0x00C0, 0x40, 3);         /* 3 bytes at offset 192 */
@@ -933,8 +1073,7 @@ static void test_data_retried_until_the_ack_moves(void)
 {
     printf("-- IMG_DATA lost once, sent again\n");
     reset_world();
-    xfer_active = 1;
-    xfer_total = SK_IMG_TOTAL_BYTES;
+    pretend_begin_ok();
 
     /* First answer says the tag still needs byte 192 - the block did not
      * arrive. The second says it has it. */
@@ -956,8 +1095,7 @@ static void test_data_retries_exhausted(void)
 
     printf("-- IMG_DATA with no answer at all\n");
     reset_world();
-    xfer_active = 1;
-    xfer_total = SK_IMG_TOTAL_BYTES;
+    pretend_begin_ok();
     t0 = virtual_ms;
 
     host_data_cmd(0, 0x10, SK_IMG_DATA_MAX);
@@ -982,8 +1120,7 @@ static void test_data_offset_error(void)
 {
     printf("-- the tag reports SK_ST_OFFSET (the block was ahead of it)\n");
     reset_world();
-    xfer_active = 1;
-    xfer_total = SK_IMG_TOTAL_BYTES;
+    pretend_begin_ok();
 
     tag_reply_ack(150, 0x0000, SK_ST_OFFSET);
     host_data_cmd(0x00C0, 0x40, 3);
@@ -1000,8 +1137,7 @@ static void test_end_crc_failure(void)
 {
     printf("-- IMG_END, tag reports a bad image CRC\n");
     reset_world();
-    xfer_active = 1;
-    xfer_total = SK_IMG_TOTAL_BYTES;
+    pretend_begin_ok();
 
     /* The tag answers only after its panel refresh (~20 s), with off = the
      * whole image and the CRC verdict in the status. The early resend fires
@@ -1025,8 +1161,7 @@ static void test_end_rescued_by_the_resend(void)
 
     printf("-- the first IMG_END is lost; the 2 s resend rescues the transfer\n");
     reset_world();
-    xfer_active = 1;
-    xfer_total = SK_IMG_TOTAL_BYTES;
+    pretend_begin_ok();
     t0 = virtual_ms;
 
     /* Nothing for the first transmission (the air ate it), then the answer
@@ -1048,8 +1183,7 @@ static void test_end_is_bounded_and_never_sent_a_third_time(void)
 
     printf("-- IMG_END never answered: one early resend, then one long wait\n");
     reset_world();
-    xfer_active = 1;
-    xfer_total = SK_IMG_TOTAL_BYTES;
+    pretend_begin_ok();
     t0 = virtual_ms;
 
     host_end_cmd();
@@ -1077,8 +1211,7 @@ static void test_end_answered_early_is_not_resent(void)
 {
     printf("-- IMG_END answered inside the resend window: no second transmission\n");
     reset_world();
-    xfer_active = 1;
-    xfer_total = SK_IMG_TOTAL_BYTES;
+    pretend_begin_ok();
 
     tag_reply_ack(500, SK_IMG_TOTAL_BYTES, SK_ST_OK);
     host_end_cmd();
@@ -1091,8 +1224,7 @@ static void test_end_with_a_short_image(void)
 {
     printf("-- IMG_END early: the tag still wants bytes\n");
     reset_world();
-    xfer_active = 1;
-    xfer_total = SK_IMG_TOTAL_BYTES;
+    pretend_begin_ok();
 
     tag_reply_ack(500, 5000, SK_ST_OK);
     host_end_cmd();
@@ -1173,17 +1305,22 @@ int main(void)
     test_begin_late_answer();
     test_begin_busy_is_not_a_refusal();
     test_begin_busy_forever_is_bounded();
-    test_begin_refused();
+    test_begin_ignores_a_foreign_status();
+    test_begin_ignores_a_foreign_status_in_lower_case();
+    test_begin_refused_by_the_target();
+    test_begin_ignores_a_malformed_status();
     test_begin_ack_with_error_status();
     test_data_without_begin();
     test_data_ok();
     test_data_retried_until_the_ack_moves();
     test_data_retries_exhausted();
     test_data_offset_error();
+    test_data_ignores_a_foreign_status();
     test_end_crc_failure();
     test_end_rescued_by_the_resend();
     test_end_is_bounded_and_never_sent_a_third_time();
     test_end_answered_early_is_not_resent();
+    test_end_ignores_a_foreign_status();
     test_end_with_a_short_image();
     test_radio_failure();
     test_announcements_still_print();

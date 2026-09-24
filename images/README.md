@@ -1,4 +1,4 @@
-﻿# Images to send to tags
+# Images to send to tags
 
 Drop an image here and name it after the **serial number of the tag** you want it on:
 
@@ -7,21 +7,42 @@ images/1408F525.png     -> the tag whose NFC serial is 1408F525
 images/20553F69.jpg     -> the tag whose NFC serial is 20553F69
 ```
 
-PNG, JPEG, BMP and GIF all work. Then:
+PNG, JPEG, BMP and GIF all work. Then plug the access point in and start the watcher:
 
 ```powershell
-python tools/send_image.py COM8
+python tools/send_image.py COM8 --watch
 ```
 
-Use the serial the tag itself reports - it reads it out of its NFC chip at boot and announces
-it over the radio, and the access point prints it:
+Power the tag. It announces itself over the radio about every 10 seconds, the access point
+prints a line for each announcement, and this tool sends the image to that tag:
 
 ```
-TAG 1408F525 rssi=-41
+ap: *** ShelfKit access point ***
+ap: TAG 1408F525 rssi=-41
+1408F525: checked in - sending 1408F525.png
+  done: 11248 bytes in 31.4s (358 B/s), 118 blocks, CRC 0x2624 verified
+ap: TAG 1408F525 rssi=-40
 ```
 
-That printed serial is exactly the file name to use. If you do not know it yet, power the tag
-and watch the access point: it announces itself a few seconds after boot.
+Leave it running. Edit the picture, or drop in a new file for another tag, and it goes out
+at that tag's next announcement - within about ten seconds. A tag that is already showing
+the current file is not sent anything, and the tool remembers across restarts what each tag
+has been given (`images/.sent.json`, gitignored). If a transfer fails, it is tried again at
+the next announcement, so an unattended watcher heals itself.
+
+Use the serial the tag itself reports - it reads it out of its NFC chip at boot and
+announces it over the radio, and the access point prints it as the `TAG ...` line above.
+That printed serial is exactly the file name to use. If you do not know it yet, power the
+tag and watch: `python tools/send_image.py COM8 --monitor` prints what the access point
+says for 30 seconds and sends nothing.
+
+## Sending once instead
+
+```powershell
+python tools/send_image.py COM8                 # every image in this folder, once
+python tools/send_image.py COM8 -s 1408F525     # just this tag's image
+python tools/send_image.py COM8 --resend        # push again even if it was sent before
+```
 
 ## What happens to the image
 

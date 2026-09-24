@@ -89,8 +89,15 @@
 
 /* TXPWRCOEFFB (config.c: 0x0FFF) - alpha1 = 1, the maximum output power.
  * It is roughly linear in alpha1, so lower it (e.g. 0x0800) once the link
- * works and the tag has to live on a coin cell. */
-#define RADIO_TXPWR_COEFF    0x0FFF
+ * works and the tag has to live on a coin cell.
+ *
+ * 15 dBm is what the reference assumes for a shelf label talking to a
+ * ceiling-mounted access point across a shop. Two boards on one bench are
+ * centimetres apart instead, and at that range the full power overloads the
+ * other end's front end: handshake frames get through but anything long -
+ * an image block - arrives corrupted often enough to stall the transfer.
+ * 0x0400 is about -12 dB, which is plenty over 20 cm. */
+#define RADIO_TXPWR_COEFF    0x0400
 
 /* How many times a tag repeats its announcement, and how far apart */
 #define RADIO_ANNOUNCE_REPEATS  3

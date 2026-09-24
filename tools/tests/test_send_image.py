@@ -77,17 +77,51 @@ def epd_h_plane(ink_pixels):
 
 # ── a fake access point ───────────────────────────────────────────────────
 
-class FakeAP:
+class FakePort:
+    """A serial port carrying only text: what --watch reads while idle.
+
+    Exposes pyserial's read()/write()/reset_input_buffer(); feed() queues
+    bytes for the host to read, exactly like the access point's UART output.
+    """
+
+    def __init__(self):
+        self._tx = bytearray()
+
+    def feed(self, data):
+        """Queue bytes for the next read()."""
+        self._tx += data
+
+    def write(self, data):
+        return len(data)
+
+    def read(self, size=1):
+        if not self._tx:
+            time.sleep(0.001)
+            return b""
+        chunk = bytes(self._tx[:size])
+        del self._tx[:size]
+        return chunk
+
+    def reset_input_buffer(self):
+        self._tx.clear()
+
+    def close(self):
+        pass
+
+
+class FakeAP(FakePort):
     """Answers the host the way the access point firmware should.
 
-    Serial side: exposes pyserial's read()/write()/reset_input_buffer() so
-    send_image.transfer() can talk to it directly.
+    The same port carries both kinds of traffic the real one sends: the text
+    lines it prints while idle (feed()/queue_text()) and the frame answers it
+    sends while a transfer is running.
     """
 
     def __init__(self, serial=b"1408F525", total=send_image.SK_IMG_TOTAL_BYTES,
                  drop_first=(), no_ack_once=(), no_ack=(), partial=None,
                  begin_status=0, end_status=0, begin_offset=0, end_delay=0.0,
                  data_status=None):
+        super().__init__()
         self.serial = serial
         self.total = total
         self.drop_first = set(drop_first)     # answer "still need it" once
@@ -107,12 +141,17 @@ class FakeAP:
         self.end_seen = 0
         self.types_seen = []
         self._parser = send_image.FrameParser()
-        self._tx = bytearray()
         self._delayed = []
         self._delayed_at = 0.0
         self._tried = set()
 
     # -- pyserial's surface ------------------------------------------------
+    def queue_text(self, text):
+        """Queue access point output, CR LF terminated if the caller wants."""
+        if isinstance(text, str):
+            text = text.encode("latin-1")       # byte for byte, like the UART
+        self.feed(text)
+
     def write(self, data):
         for ptype, payload in self._parser.feed(bytes(data)):
             self.handle(ptype, payload)
@@ -121,18 +160,7 @@ class FakeAP:
     def read(self, size=1):
         if self._delayed and time.monotonic() >= self._delayed_at:
             self._tx += self._delayed.pop(0)
-        if not self._tx:
-            time.sleep(0.001)
-            return b""
-        chunk = bytes(self._tx[:size])
-        del self._tx[:size]
-        return chunk
-
-    def reset_input_buffer(self):
-        self._tx.clear()
-
-    def close(self):
-        pass
+        return super().read(size)
 
     # -- the access point --------------------------------------------------
     def _ack(self, offset, status, delay=0.0):
@@ -145,7 +173,7 @@ class FakeAP:
         else:
             self._tx += frame
 
-    def _status(self, status, detail=0):
+    def _status(self, status, detail=send_image.LINK_D_TAG):
         self._tx += send_image.build_frame(send_image.SK_U_STATUS,
                                            bytes([status, detail]))
 
@@ -771,6 +799,27 @@ class CliTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("no image for tag DEADBEEF", out.getvalue())
 
+    def test_watch_needs_a_port(self):
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                send_image.main(["-d", self.dir, "--watch"])
+
+    def test_watch_cannot_be_a_dry_run(self):
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                send_image.main(["-d", self.dir, "--watch", "--dry-run", "COM1"])
+
+    def test_monitor_needs_a_port(self):
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                send_image.main(["-d", self.dir, "--monitor"])
+
+    def test_the_old_scan_interval_option_is_gone(self):
+        """--watch is announcement-driven now; a stale --interval is an error."""
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                send_image.main(["-d", self.dir, "--dry-run", "--interval", "2"])
+
 
 class DiscoveryTests(unittest.TestCase):
 
@@ -801,15 +850,510 @@ class DiscoveryTests(unittest.TestCase):
     def test_missing_directory_is_empty(self):
         self.assertEqual(send_image.find_images(os.path.join(self.dir, "nope")), [])
 
-    def test_process_pending_skips_unchanged_files(self):
+    def test_process_pending_sends_every_image_once(self):
+        """One-shot mode ignores the record for its decisions but updates it."""
         args = send_image.build_parser().parse_args(["--dry-run", "-d", self.dir])
-        state = {}
         with contextlib.redirect_stdout(io.StringIO()):
-            done, failed, seen = send_image.process_pending(args, None, state)
+            done, failed, seen = send_image.process_pending(args, None)
         self.assertEqual((done, failed, seen), (3, 0, 3))
+        # A dry run sends nothing, so nothing may be recorded.
+        self.assertFalse(os.path.exists(os.path.join(self.dir, send_image.STATE_FILE)))
+
+    def test_serial_filter_limits_the_one_shot_run(self):
+        args = send_image.build_parser().parse_args(
+            ["--dry-run", "-d", self.dir, "-s", "abcd1234"])
         with contextlib.redirect_stdout(io.StringIO()):
-            done, failed, seen = send_image.process_pending(args, None, state)
-        self.assertEqual((done, failed, seen), (0, 0, 3))    # nothing changed
+            done, failed, seen = send_image.process_pending(args, None)
+        self.assertEqual((done, failed, seen), (1, 0, 1))
+
+
+class TagLineTests(unittest.TestCase):
+    """The exact shape report_packet() prints: "TAG <serial> rssi=<db>"."""
+
+    def test_tag_lines(self):
+        self.assertEqual(send_image.parse_tag_line("TAG 1408F525 rssi=-41"),
+                         "1408F525")
+        self.assertEqual(send_image.parse_tag_line("TAG 1408F525 rssi=-41\r"),
+                         "1408F525")
+        self.assertEqual(send_image.parse_tag_line("TAG abcd1234 rssi=0"),
+                         "ABCD1234")
+        self.assertEqual(send_image.parse_tag_line("TAG 1408F525 rssi=12"),
+                         "1408F525")
+        self.assertEqual(send_image.parse_tag_line("TAG 1408F525 rssi=-128"),
+                         "1408F525")
+
+    def test_not_check_ins(self):
+        for line in ("*** ShelfKit access point ***",
+                     "radio ready (silicon rev 51)",
+                     "listening: 868.300 MHz, 4800 bit/s, FSK",
+                     "?? checksum mismatch (12 bytes, noise?)",
+                     "?? short packet (03 bytes)",
+                     "?? unknown packet type 7F",
+                     "ACK off=0000 st=04 (no transfer)",
+                     "IMG_STATUS st=05 (no transfer)",
+                     "TAG rssi=-41",                      # no serial
+                     "TAG 1408F525 rssi=",                # no level
+                     "TAG 1408F525 rssi=-41 extra",       # trailing junk
+                     "tag 1408F525 rssi=-41",             # the AP upper-cases
+                     "TAG 1408F525",                      # half a line
+                     "TAG 1408F525 rssi=-4?",             # mangled level
+                     "TAG " + "A" * 17 + " rssi=-1",      # longer than SK_SERIAL_MAX
+                     "TAG 1408 5 rssi=-1",                # a space is not a serial
+                     ""):
+            self.assertIsNone(send_image.parse_tag_line(line), line)
+
+
+class LineReaderTests(unittest.TestCase):
+
+    def test_lines_split_across_reads(self):
+        port = FakePort()
+        reader = send_image.LineReader(port)
+        port.feed(b"*** ShelfKit access point ***\r\nTAG 140")
+        self.assertEqual(reader.read_line(0.05), "*** ShelfKit access point ***")
+        port.feed(b"8F525 rssi=-41\r\nradio ready\r\n")
+        self.assertEqual(reader.read_line(0.05), "TAG 1408F525 rssi=-41")
+        self.assertEqual(reader.read_line(0.05), "radio ready")
+        self.assertIsNone(reader.read_line(0.05))
+
+    def test_banner_tag_and_garbage_yield_exactly_two_tags(self):
+        port = FakePort()
+        port.feed(b"*** ShelfKit access point ***\r\n"
+                  b"radio ready (silicon rev 51)\r\n"
+                  b"\x00\x01\x02 garbage \xff\r\n"
+                  b"TAG 1408F525 rssi=-41\r\n"
+                  b"?? checksum mismatch (12 bytes, noise?)\r\n"
+                  b"TAG ABCD1234 rssi=-7\r\n"
+                  b"TAG 1408F52")                 # a partial line, no newline
+        reader = send_image.LineReader(port)
+        lines = []
+        while True:
+            line = reader.read_line(0.05)
+            if line is None:
+                break
+            lines.append(line)
+        self.assertEqual([send_image.parse_tag_line(line) for line in lines
+                          if send_image.parse_tag_line(line)],
+                         ["1408F525", "ABCD1234"])
+        self.assertEqual(len(lines), 6, lines)
+
+    def test_drop_partial_forgets_a_half_line(self):
+        port = FakePort()
+        reader = send_image.LineReader(port)
+        port.feed(b"TAG 1408F52")
+        self.assertIsNone(reader.read_line(0.05))
+        reader.drop_partial()
+        port.feed(b"5 rssi=-41\r\n")
+        self.assertEqual(reader.read_line(0.05), "5 rssi=-41")
+
+    def test_unterminated_noise_does_not_grow_without_bound(self):
+        port = FakePort()
+        reader = send_image.LineReader(port)
+        for _ in range(4):
+            port.feed(b"x" * 4096)
+            self.assertIsNone(reader.read_line(0.05))
+        self.assertLessEqual(len(reader._buf), send_image.WATCH_LINE_MAX)
+
+
+class SendRecordTests(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+        self.path = os.path.join(self.dir, send_image.STATE_FILE)
+        self.png = os.path.join(self.dir, "1408F525.png")
+        with open(self.png, "wb") as f:
+            f.write(b"pretend image")
+
+    def test_round_trip(self):
+        record = send_image.SendRecord(self.path)
+        self.assertEqual(len(record), 0)
+        record.record("1408F525", self.png, (11, 22))
+        self.assertTrue(os.path.exists(self.path))
+        again = send_image.SendRecord(self.path).load()
+        self.assertEqual(len(again), 1)
+        self.assertTrue(again.is_current("1408F525", self.png, (11, 22)))
+        self.assertFalse(again.is_current("1408F525", self.png, (11, 23)))
+        self.assertFalse(again.is_current("1408F525", self.png, (12, 22)))
+        self.assertFalse(again.is_current("ABCD1234", self.png, (11, 22)))
+
+    def test_a_renamed_file_is_not_current(self):
+        record = send_image.SendRecord(self.path)
+        record.record("1408F525", self.png, (11, 22))
+        other = os.path.join(self.dir, "1408F525.bmp")
+        with open(other, "wb") as f:
+            f.write(b"pretend image")
+        self.assertFalse(record.is_current("1408F525", other, (11, 22)))
+
+    def test_missing_file_is_not_an_error(self):
+        record = send_image.SendRecord(self.path).load()
+        self.assertEqual(len(record), 0)
+
+    def test_broken_file_is_ignored(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("{not json at all")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            record = send_image.SendRecord(self.path).load()
+        self.assertEqual(len(record), 0)
+        self.assertIn("ignoring the send record", err.getvalue())
+
+    def test_hand_edited_entries_are_dropped(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write('{"version": 1, "sent": {"A": {"file": "A.png", "size": 1,'
+                    ' "mtime_ns": 2}, "B": "nonsense", "C": {"file": "C.png"}}}')
+        record = send_image.SendRecord(self.path).load()
+        self.assertEqual(sorted(record.entries), ["A"])
+
+    def test_fingerprint_follows_size_and_mtime(self):
+        first = send_image.fingerprint(self.png)
+        self.assertEqual(first, send_image.fingerprint(self.png))
+        os.utime(self.png, ns=(first[1] + 0, first[1] + 1_000_000_000))
+        second = send_image.fingerprint(self.png)
+        self.assertNotEqual(first, second)
+        with open(self.png, "ab") as f:
+            f.write(b"more")
+        self.assertEqual(send_image.fingerprint(self.png)[0], second[0] + 4)
+
+    def test_clear(self):
+        record = send_image.SendRecord(self.path)
+        record.record("1408F525", self.png, (11, 22))
+        record.clear()
+        self.assertEqual(len(send_image.SendRecord(self.path).load()), 0)
+
+
+class CheckInTests(unittest.TestCase):
+    """check_in(): what the tool does with one "TAG ..." line."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+        self.record = send_image.SendRecord(
+            os.path.join(self.dir, send_image.STATE_FILE))
+        self.notes = set()
+        self.write_image("1408F525")
+
+    def write_image(self, serial, size=(152, 296), ink=(0, 0, 0), ext=".png"):
+        path = os.path.join(self.dir, serial + ext)
+        im = Image.new("RGB", size, (255, 255, 255))
+        im.putpixel((0, 0), ink)
+        im.save(path)
+        return path
+
+    def args(self, *extra):
+        return send_image.build_parser().parse_args(
+            ["-d", self.dir, "--no-progress", *extra])
+
+    def quiet(self, func, *a, **kw):
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return func(*a, **kw)
+
+    def check(self, ap, serial="1408F525", args=None):
+        return self.quiet(send_image.check_in, args or self.args(), ap, serial,
+                          self.record, self.notes)
+
+    def test_check_in_sends_the_image(self):
+        ap = FakeAP()
+        self.assertEqual(self.check(ap), "sent")
+        self.assertEqual(ap.types_seen.count(send_image.SK_U_IMG_BEGIN), 1)
+        self.assertEqual(ap.end_seen, 1)
+        expected, _note = send_image.convert_file(
+            os.path.join(self.dir, "1408F525.png"))
+        self.assertEqual(bytes(ap.image), expected[0] + expected[1])
+        self.assertEqual(len(self.record), 1)
+        self.assertTrue(self.record.is_current(
+            "1408F525", os.path.join(self.dir, "1408F525.png"),
+            send_image.fingerprint(os.path.join(self.dir, "1408F525.png"))))
+
+    def test_unchanged_image_is_not_sent_again(self):
+        """A tag re-announces every ~10s: that must not resend the picture."""
+        self.assertEqual(self.check(FakeAP()), "sent")
+        second = FakeAP()
+        self.assertEqual(self.check(second), "up-to-date")
+        self.assertEqual(second.types_seen, [])
+        self.assertEqual(len(self.record), 1)
+
+    def test_changed_file_is_sent_again(self):
+        self.assertEqual(self.check(FakeAP()), "sent")
+        before = send_image.fingerprint(os.path.join(self.dir, "1408F525.png"))
+        path = self.write_image("1408F525", size=(64, 64))      # different bytes
+        after = send_image.fingerprint(path)
+        self.assertNotEqual(before, after)
+        ap = FakeAP()
+        self.assertEqual(self.check(ap), "sent")
+        self.assertEqual(ap.types_seen.count(send_image.SK_U_IMG_BEGIN), 1)
+
+    def test_touched_file_with_new_mtime_is_sent_again(self):
+        path = self.write_image("1408F525")
+        self.assertEqual(self.check(FakeAP()), "sent")
+        info = os.stat(path)
+        os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
+        self.assertEqual(self.check(FakeAP()), "sent")
+
+    def test_failed_transfer_is_not_recorded_and_is_retried(self):
+        failing = FakeAP(begin_status=send_image.SK_ST_BAD_SERIAL)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            result = send_image.check_in(self.args(), failing, "1408F525",
+                                         self.record, self.notes)
+        self.assertEqual(result, "failed")
+        self.assertEqual(len(self.record), 0)               # nothing recorded
+        self.assertFalse(os.path.exists(self.record.path))  # not even written
+        self.assertIn("try again", err.getvalue())
+        # ... and the next check-in (about 10 s later) sends it.
+        good = FakeAP()
+        self.assertEqual(self.check(good), "sent")
+        self.assertEqual(bytes(good.image),
+                         b"".join(send_image.convert_file(
+                             os.path.join(self.dir, "1408F525.png"))[0]))
+        self.assertEqual(len(self.record), 1)
+
+    def test_success_is_recorded_only_after_the_transfer(self):
+        """Watch the record file while the transfer runs."""
+        path = os.path.join(self.dir, "1408F525.png")
+        ap = FakeAP()
+        seen = []
+        original = send_image.transfer
+
+        def spy(ser, serial, image, **kwargs):
+            seen.append(os.path.exists(self.record.path))
+            return original(ser, serial, image, **kwargs)
+
+        send_image.transfer = spy
+        self.addCleanup(setattr, send_image, "transfer", original)
+        self.assertEqual(self.check(ap), "sent")
+        self.assertEqual(seen, [False])                     # nothing yet
+        self.assertTrue(os.path.exists(self.record.path))   # recorded after
+
+    def test_no_image_means_nothing_happens(self):
+        ap = FakeAP(serial=b"DEADBEEF")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            result = send_image.check_in(self.args(), ap, "DEADBEEF",
+                                         self.record, self.notes)
+        self.assertEqual(result, "no-image")
+        self.assertEqual(ap.types_seen, [])
+        self.assertIn("no DEADBEEF", out.getvalue())
+        # The note is printed once, not on every announcement.
+        out2 = io.StringIO()
+        with contextlib.redirect_stdout(out2), contextlib.redirect_stderr(out2):
+            send_image.check_in(self.args(), ap, "DEADBEEF", self.record, self.notes)
+        self.assertNotIn("no DEADBEEF", out2.getvalue())
+
+    def test_serial_filter_ignores_other_tags(self):
+        self.write_image("ABCD1234")
+        other = FakeAP(serial=b"ABCD1234")
+        self.assertEqual(self.check(other, "ABCD1234", self.args("-s", "1408F525")),
+                         "ignored")
+        self.assertEqual(other.types_seen, [])
+        sender = FakeAP()
+        self.assertEqual(self.check(sender, "1408F525", self.args("-s", "1408f525")),
+                         "sent")
+        self.assertEqual(sender.types_seen.count(send_image.SK_U_IMG_BEGIN), 1)
+
+    def test_two_files_for_one_tag_prefers_the_first_in_name_order(self):
+        self.write_image("1408F525", ext=".bmp")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            send_image.check_in(self.args(), FakeAP(), "1408F525", self.record,
+                                self.notes)
+        self.assertIn("1408F525.bmp", err.getvalue())
+        self.assertEqual(self.record.entries["1408F525"][0], "1408F525.bmp")
+
+
+class WatchLoopTests(unittest.TestCase):
+    """The loop itself: read lines, act on check-ins, ignore everything else."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+        self.record = send_image.SendRecord(
+            os.path.join(self.dir, send_image.STATE_FILE))
+        self.args = send_image.build_parser().parse_args(
+            ["-d", self.dir, "--no-progress", "--watch"])
+        im = Image.new("RGB", (152, 296), (255, 255, 255))
+        im.putpixel((0, 0), (0, 0, 0))
+        im.save(os.path.join(self.dir, "1408F525.png"))
+        # Keep the loop's "nothing arrived" wait short for the tests.
+        self.addCleanup(setattr, send_image, "WATCH_READ_TIMEOUT",
+                        send_image.WATCH_READ_TIMEOUT)
+        send_image.WATCH_READ_TIMEOUT = 0.02
+
+    def run_loop(self, ap, iterations=8):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            send_image.watch_loop(self.args, ap, self.record, max_iterations=iterations)
+        return out.getvalue()
+
+    def test_banner_is_printed_and_the_tag_is_sent_to_once(self):
+        ap = FakeAP()
+        ap.queue_text("*** ShelfKit access point ***\r\n"
+                      "radio ready (silicon rev 51)\r\n"
+                      "?? checksum mismatch (12 bytes, noise?)\r\n"
+                      "TAG 1408F525 rssi=-41\r\n"
+                      "TAG 1408F525 rssi=-40\r\n")     # queued behind the check-in
+        text = self.run_loop(ap)
+        self.assertIn("ap: *** ShelfKit access point ***", text)
+        self.assertIn("ap: radio ready (silicon rev 51)", text)
+        self.assertIn("ap: ?? checksum mismatch (12 bytes, noise?)", text)
+        self.assertIn("ap: TAG 1408F525 rssi=-41", text)
+        self.assertIn("1408F525: checked in - sending 1408F525.png", text)
+        # Two announcements, one transfer.
+        self.assertEqual(ap.types_seen.count(send_image.SK_U_IMG_BEGIN), 1)
+        self.assertEqual(len(self.record), 1)
+        # Text that was sitting in the port buffer when the transfer started is
+        # flushed away by it (FrameReader.flush() calls reset_input_buffer), so
+        # the second TAG line never reaches the reader. Nothing is lost: the
+        # tag announces itself again in ~10 s and the record makes that a no-op.
+        self.assertNotIn("ap: TAG 1408F525 rssi=-40", text)
+
+    def test_text_that_is_not_a_tag_line_sends_nothing(self):
+        ap = FakeAP()
+        ap.queue_text("*** ShelfKit access point ***\r\n"
+                      "ACK off=0000 st=04 (no transfer)\r\n"
+                      "\x00\xff not a line at all\r\n")
+        text = self.run_loop(ap, iterations=6)
+        self.assertIn("ap: ACK off=0000 st=04 (no transfer)", text)
+        self.assertEqual(ap.types_seen, [])
+        self.assertEqual(len(self.record), 0)
+
+    def test_restarting_does_not_resend(self):
+        """The persisted record is what makes a restart cheap."""
+        ap = FakeAP()
+        ap.queue_text("TAG 1408F525 rssi=-41\r\n")
+        self.run_loop(ap, iterations=4)
+        self.assertEqual(len(self.record), 1)
+        reloaded = send_image.SendRecord(self.record.path).load()
+        second = FakeAP()
+        second.queue_text("TAG 1408F525 rssi=-41\r\n")
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            send_image.watch_loop(self.args, second, reloaded, max_iterations=4)
+        self.assertEqual(second.types_seen, [])
+
+    def test_resend_forgets_the_record_and_pushes_once(self):
+        self.record.record("1408F525", os.path.join(self.dir, "1408F525.png"),
+                           (1, 1))
+        args = send_image.build_parser().parse_args(
+            ["-d", self.dir, "--no-progress", "--watch", "--resend"])
+        ap = FakeAP()
+        ap.queue_text("TAG 1408F525 rssi=-41\r\nTAG 1408F525 rssi=-41\r\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            send_image.watch_loop(args, ap, self.record, max_iterations=6)
+        self.assertIn("forgetting 1 send record(s)", out.getvalue())
+        self.assertEqual(ap.types_seen.count(send_image.SK_U_IMG_BEGIN), 1)
+
+    def test_quiet_access_point_hints_at_the_port(self):
+        ap = FakeAP()
+        old = send_image.WATCH_SILENCE_HINT
+        send_image.WATCH_SILENCE_HINT = 0.0
+        self.addCleanup(setattr, send_image, "WATCH_SILENCE_HINT", old)
+        text = self.run_loop(ap, iterations=2)
+        self.assertIn("no output from the access point", text)
+
+
+class OneShotTests(unittest.TestCase):
+    """`send_image.py COM8`: every image goes out, whatever the record says."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = self.tmp.name
+        self.png = os.path.join(self.dir, "1408F525.png")
+        im = Image.new("RGB", (152, 296), (255, 255, 255))
+        im.putpixel((0, 0), (0, 0, 0))
+        im.save(self.png)
+        self.record = send_image.SendRecord(
+            os.path.join(self.dir, send_image.STATE_FILE))
+
+    def run_once(self, *extra, record=None):
+        args = send_image.build_parser().parse_args(
+            ["-d", self.dir, "--no-progress", *extra])
+        ap = FakeAP()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            done, failed, seen = send_image.process_pending(
+                args, ap, self.record if record is None else record)
+        return done, failed, seen, ap
+
+    def test_one_shot_sends_and_records(self):
+        done, failed, seen, ap = self.run_once()
+        self.assertEqual((done, failed, seen), (1, 0, 1))
+        self.assertEqual(ap.types_seen.count(send_image.SK_U_IMG_BEGIN), 1)
+        self.assertTrue(self.record.is_current("1408F525", self.png,
+                                               send_image.fingerprint(self.png)))
+
+    def test_one_shot_ignores_a_current_record(self):
+        """The record never stops an explicit one-shot push."""
+        self.record.record("1408F525", self.png, send_image.fingerprint(self.png))
+        reloaded = send_image.SendRecord(self.record.path).load()
+        done, _failed, _seen, ap = self.run_once(record=reloaded)
+        self.assertEqual(done, 1)
+        self.assertEqual(ap.types_seen.count(send_image.SK_U_IMG_BEGIN), 1)
+
+    def test_one_shot_keeps_going_after_a_failure(self):
+        second = os.path.join(self.dir, "ABCD1234.png")
+        im = Image.new("RGB", (152, 296), (255, 255, 255))
+        im.save(second)
+        args = send_image.build_parser().parse_args(["-d", self.dir, "--no-progress"])
+        ap = FakeAP(begin_status=send_image.SK_ST_BUSY)
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            done, failed, seen = send_image.process_pending(args, ap, self.record)
+        self.assertEqual((done, failed, seen), (0, 2, 2))
+        self.assertEqual(len(self.record), 0)
+
+    def test_dry_run_records_nothing(self):
+        done, failed, seen, ap = self.run_once("--dry-run")
+        self.assertEqual((done, failed, seen), (1, 0, 1))
+        self.assertEqual(len(self.record), 0)
+        self.assertFalse(os.path.exists(self.record.path))
+        self.assertEqual(ap.types_seen, [])
+
+
+class DiagnosticsTests(unittest.TestCase):
+    """--ping and --monitor: telling "the AP cannot hear me" from everything else."""
+
+    def test_ping_reports_a_working_link(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = send_image.ping(FakeAP(), timeout=0.2)
+        self.assertEqual(rc, 0)
+        self.assertIn("working", out.getvalue())
+
+    def test_ping_reports_a_link_that_answers_nothing(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = send_image.ping(FakePort(), timeout=0.05, retries=0)
+        self.assertEqual(rc, 1)
+        self.assertIn("did not answer", out.getvalue())
+
+    def test_monitor_prints_lines_and_summarises_the_tags(self):
+        port = FakePort()
+        port.feed(b"*** ShelfKit access point ***\r\n"
+                  b"radio ready (silicon rev 51)\r\n"
+                  b"TAG 1408F525 rssi=-41\r\n"
+                  b"TAG ABCD1234 rssi=-70\r\n"
+                  b"TAG 1408F525 rssi=-42\r\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = send_image.monitor(port, seconds=0.2)
+        text = out.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertIn("ap: *** ShelfKit access point ***", text)
+        self.assertIn("tags heard: 1408F525 x2, ABCD1234 x1", text)
+
+    def test_monitor_says_so_when_no_tag_is_heard(self):
+        port = FakePort()
+        port.feed(b"*** ShelfKit access point ***\r\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            send_image.monitor(port, seconds=0.1)
+        self.assertIn("no TAG line", out.getvalue())
 
 
 class BootImageParityTests(unittest.TestCase):
