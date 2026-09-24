@@ -1,0 +1,30 @@
+{
+  "name": "ShelfKit-Bootoloader",
+  "board": "axsem-8052f143",
+  "sources": [
+    "src"
+  ],
+  "includes": [
+    "../shared/include",
+    "../shared/libraries/libmf/include",
+    "../shared/libraries/libaxdvk2/include"
+  ],
+  "defines": [],
+  "libraries": [
+    "../shared/lib"
+  ],
+  "components": [
+    "components"
+  ],
+  "build": {
+    "output_dir": "build",
+    "output_name": "firmware",
+    "hooks": {}
+  },
+  "upload": {
+    "tool": "python ../../tools/axsem-flasher.py",
+    "args": [
+      "Flash tool not configured"
+    ]
+  }
+}

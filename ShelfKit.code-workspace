@@ -1,0 +1,23 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "firmware/access-point"
+		},
+		{
+			"path": "firmware/shelfkit-vusion"
+		},
+		{
+			"path": "firmware/dumptool"
+		},
+		{
+			"path": "firmware/bootloader"
+		}
+	],
+	"settings": {
+		"sdcc.shellPath": "cmd.exe",
+		"sdcc.comPort": "COM8"
+	}
+}

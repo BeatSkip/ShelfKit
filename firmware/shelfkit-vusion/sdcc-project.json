@@ -1,0 +1,40 @@
+{
+  "name": "ShelfKit-Vusion",
+  "board": "axsem-8052f143",
+  "sources": [
+    "src"
+  ],
+  "includes": [
+    "../shared/include",
+    "../shared/libraries/libmf/include",
+    "../shared/libraries/libaxdvk2/include"
+  ],
+  "defines": [],
+  "libraries": [
+    "../shared/lib"
+  ],
+  "components": [
+    "components"
+  ],
+  "build": {
+    "output_dir": "build",
+    "output_name": "firmware"
+  },
+  "upload": {
+    "tool": "python tools/axsem-flasher.py",
+    "args": [
+      "${outputHex}",
+      "-p ${config:comPort}"
+    ]
+  },
+  "debug": {
+    "hardware": {
+      "preset": "custom",
+      "host": "127.0.0.1",
+      "port": 3333,
+      "serverCmd": "",
+      "flash": false,
+      "reset": true
+    }
+  }
+}
