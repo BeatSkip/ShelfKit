@@ -29,10 +29,13 @@
  * The one thing the reference does not decide for us is the packet layer:
  * VusionLink carries a Vusion MAC (four address bytes, ACKs, six channels,
  * a software CRC-16) which this link does not need, because both ends are
- * our own firmware. We keep the ShelfKit application packet
- * (firmware/shared/include/shelfkit_proto.h) with a single length byte and
- * no address bytes, and configure the packet controller so that it filters
- * nothing - see the note in radio.c.
+ * our own firmware. What we put on the air is the ShelfKit link frame from
+ * sk_link.c - addressing, a CRC-16, a hop budget and a record route - and
+ * its layout, and the reasoning behind each field, is in
+ * firmware/shared/include/shelfkit_proto.h. This driver treats it as opaque
+ * bytes with a length: it writes the preamble, the sync word and the length
+ * byte, and the chip's own address filter and CRC stay off (see the note in
+ * radio.c).
  *
  * ── The reference clock ──────────────────────────────────────────────
  * The reference is a 26 MHz TCXO on CLK16P/N, not a crystal: config.c has
@@ -87,17 +90,34 @@
 #define RADIO_PREAMBLE_BYTES 4
 #define RADIO_PREAMBLE_BYTE  0xAA
 
-/* TXPWRCOEFFB (config.c: 0x0FFF) - alpha1 = 1, the maximum output power.
- * It is roughly linear in alpha1, so lower it (e.g. 0x0800) once the link
- * works and the tag has to live on a coin cell.
+/* TXPWRCOEFFB (config.c: 0x0FFF) - alpha1 = 1, the maximum output power,
+ * which is 15 dBm: the reference's value, and what a shelf label talking to
+ * a ceiling-mounted access point across a shop needs.
  *
- * 15 dBm is what the reference assumes for a shelf label talking to a
- * ceiling-mounted access point across a shop. Two boards on one bench are
- * centimetres apart instead, and at that range the full power overloads the
- * other end's front end: handshake frames get through but anything long -
- * an image block - arrives corrupted often enough to stall the transfer.
- * 0x0400 is about -12 dB, which is plenty over 20 cm. */
-#define RADIO_TXPWR_COEFF    0x0400
+ * This is the one setting that depends on how far apart the two boards are,
+ * and it is worth knowing both failure modes, because they look nothing
+ * alike:
+ *
+ *   0x0FFF (0 dB)   fine at any normal distance. With the two boards a few
+ *                   centimetres apart the transmitter overloads the other
+ *                   end's front end instead: handshake frames still get
+ *                   through, but an image block is corrupted often enough
+ *                   that the transfer crawls and eventually stalls.
+ *   0x0400 (-12 dB)   right for boards within arm's reach of each other. At
+ *                   room distance it is too little: the access point stops
+ *                   hearing the tag at all, not even its announcements.
+ *
+ * So: leave it at 0x0FFF unless the boards sit right next to each other, and
+ * if a transfer stalls with everything else healthy, this is the knob. Keep
+ * the two firmwares' radio.h identical - the tag and the access point have
+ * to agree on the link, this value included.
+ *
+ * It can be overridden from the build (-DRADIO_TXPWR_COEFF=0x0400) so that
+ * bench measurements can be taken without editing this file; the committed
+ * value is the one below. */
+#ifndef RADIO_TXPWR_COEFF
+#define RADIO_TXPWR_COEFF    0x0FFF
+#endif
 
 /* How many times a tag repeats its announcement, and how far apart */
 #define RADIO_ANNOUNCE_REPEATS  3
@@ -163,14 +183,42 @@ uint8_t radio_revision(void) __reentrant;
 int8_t radio_rssi(void) __reentrant;
 
 /* Transmit one packet: the driver writes the preamble, the sync word and
- * the length byte + payload into the chip's FIFO. Blocks until the
+ * the length byte + frame into the chip's FIFO. Blocks until the
  * transmission has finished.
+ *
+ * The payload is one whole link frame (sk_link.c) - this driver knows its
+ * length and nothing else about it.
  * @return RADIO_OK, or RADIO_ERR_TX_LEN / RADIO_ERR_XTAL / RADIO_ERR_TX_FIFO. */
 uint8_t radio_tx(const uint8_t *payload, uint8_t len) __reentrant;
+
+/* The same transmit, behind the wake-on-radio preamble: the vendor's long
+ * preamble instead of the normal 32-bit one, so a receiver that is only
+ * listening for a fraction of each wake-up period still catches the packet.
+ * The frame itself is byte-for-byte the same.
+ *
+ * It costs the preamble's air time - see RADIO_WOR_PREAMBLE_UNITS in radio.c,
+ * a few hundred milliseconds - so it is for the first frame to a peer that
+ * may be asleep, not for every frame. */
+uint8_t radio_tx_wor(const uint8_t *payload, uint8_t len) __reentrant;
+
+/* The shared body of the two: the normal preamble is a parameter so the
+ * wake-on-radio one is the same code path, not a second transmit sequence
+ * that could drift from it. */
+uint8_t radio_tx_pre(const uint8_t *payload, uint8_t len,
+                     uint16_t preamble) __reentrant;
 
 /* Put the receiver on the air / take it back off. */
 void radio_rx_start(void) __reentrant;
 void radio_rx_stop(void) __reentrant;
+
+/* Put the receiver into wake-on-radio instead of continuous receive: it
+ * wakes every RADIO_WOR_PERIOD low-power oscillator cycles, listens for
+ * about a preamble, and sleeps in between. This is the battery tag's idle
+ * state; radio_rx_start() is what a tag calls when it has heard something
+ * and wants to stay awake for the rest of a conversation.
+ *
+ * radio_rx() reads a packet the same way in either mode. */
+void radio_rx_wor_start(void) __reentrant;
 
 /* Non-blocking receive: copies a complete packet payload into @p payload
  * and returns its length, or 0 when nothing has arrived. A packet longer

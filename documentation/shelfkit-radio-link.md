@@ -66,7 +66,14 @@ ShelfKit uses **channel 0 only**. Using the pre-computed words rather than calcu
 
 ## The frame
 
-The reference's on-air frame, after the sync word, is:
+What actually goes on the air - the link frame's header, its CRC-16, the
+addressing, the mesh's flooding rules and its record route - is
+[`mesh.md`](mesh.md), with the byte layout also written next to the
+application protocol it wraps in
+[`firmware/shared/include/shelfkit_proto.h`](../firmware/shared/include/shelfkit_proto.h).
+
+For the record, the vendor reference's own frame (which ShelfKit does **not**
+use) is:
 
 ```
 [ length ][ destination address ][ source address ][ payload ][ CRC-16 ]
@@ -77,18 +84,15 @@ with `length` counting the payload plus 4 (the CRC is excluded because the drive
 `axradio_framing_swcrclen` to `PKTLENOFFSET` at init), and the CRC being
 `crc_crc16_msb(frame, n, 0xFFFF)` appended big-endian. That one is **CRC-16/UMTS (poly
 0x8005)** — libmf also ships a CCITT implementation, `crc_ccitt_msb()` (poly 0x1021), and the
-names differ by one letter, so it is worth being explicit about which is which.
-
-ShelfKit does not use either for the radio frame: its own protocol carries an XOR checksum,
-and the image transfer adds a CRC-16/CCITT-FALSE over the whole image (see
-`shelfkit_proto.h`), which both ends compute with `crc_ccitt_msb()` / `crc_hqx()`.
+names differ by one letter, so it is worth being explicit about which is which. ShelfKit
+uses the CCITT one, in the link frame and over the UART.
 
 **ShelfKit keeps its own, simpler application packet on top** and does not implement the
 Vusion MAC layer (address filtering, acknowledgements, retries, channel hopping). Both ends
 are our own firmware, so the tag and access point only have to agree with each other. The
 application payload is defined in
 [`firmware/shared/include/shelfkit_proto.h`](../firmware/shared/include/shelfkit_proto.h):
-version, packet type, serial length, serial, checksum.
+version, packet type, and a type-specific body.
 
 ## Initialisation
 
@@ -119,10 +123,12 @@ powers the radio down again.
 |---|---|
 | Carrier frequency | the `FREQA` word in radio.c — recompute with RadioLAB, do not hand-derive |
 | Sync word | `MATCH0PAT` (each byte bit-reversed, `rev8()`) in both firmwares |
-| TX power | `RADIO_TXPWR_COEFF`, tag only (0x0FFF = the reference's 15 dBm) |
+| TX power | `RADIO_TXPWR_COEFF` (0x0FFF = the reference's 15 dBm), or -DRADIO_TXPWR_COEFF=... for a bench measurement |
 | Preamble length | `RADIO_PREAMBLE_BYTES`, both |
+| Wake-on-radio preamble | `RADIO_WOR_PREAMBLE_UNITS` in radio.c — see [`mesh.md`](mesh.md) §7 |
 | Bit rate / deviation / filter | **regenerate with AX-RadioLAB** — see below |
 | Announcement repeats | `RADIO_ANNOUNCE_REPEATS`/`..._GAP_MS`, tag only |
+| Frame layout, CRC, addressing, mesh | `firmware/shared/include/shelfkit_proto.h` + `sk_link.c` — see [`mesh.md`](mesh.md) |
 
 The one thing not to do by hand is change the bit rate, deviation or any receiver parameter:
 they are a matched set that RadioLAB computes together (decimation, IF frequency, data rate,
@@ -151,9 +157,12 @@ breaks the set.
 
 ## What is deliberately not done yet
 
-* No addressing, acknowledgements, retries or channel access: a tag announces, the access
-  point listens. Fine for a bench with one or two tags, not for a shelf full of them.
 * No channel hopping — channel 0 only, although the reference's other five channels are
-  documented above for when that changes.
-* The AX5043's wake-on-radio and WOR modes are unused: the AP stays in FULLRX.
-* The tag's transmit power is the reference's 15 dBm, which is a lot for a battery tag.
+  documented above for when that changes. The access point stays in FULLRX; a battery tag's
+  idle state is wake-on-radio ([`mesh.md`](mesh.md) §7).
+* No link-layer acknowledgement, LBT, or rate/power adaptation. Reliability is the
+  application's (stop-and-wait, one block at a time) and the hop budget is the mesh's
+  ([`mesh.md`](mesh.md) §§4-5).
+* The tag's transmit power is the reference's 15 dBm, which is a lot for a battery tag — and
+  on a bench with the two boards a hand's width apart it is *too much*: see
+  [`mesh.md`](mesh.md) §9 before concluding that a test failure is a design failure.

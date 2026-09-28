@@ -91,13 +91,23 @@ Required: [SDCC](https://sdcc.sourceforge.net/) (tested with 3.6.0) and the
    - `firmware.map` / `firmware.mem` — placement and usage report
 
 The same build by hand, from `firmware/shelfkit-vusion` (PowerShell needs `&` before a quoted
-executable path):
+executable path). **The source list is not written out here**: it is every `src/*.c` except
+the ones `sdcc-project.json` excludes, and the list below has gone stale more than once.
+`tools/build_firmware.ps1` reads the project file and does all of this, printing the ROM,
+XRAM and free-stack numbers at the end:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/build_firmware.ps1 -Firmware shelfkit-vusion
+powershell -ExecutionPolicy Bypass -File tools/build_firmware.ps1 -Firmware shelfkit-vusion -Define SK_TAG_ROUTER=1
+```
+
+By hand it is:
 
 ```powershell
 $sdcc  = 'C:\Program Files\SDCC\bin\sdcc.exe'
 $flags = @('-mmcs51','--model-small','--iram-size','256','--xram-size','8192','--code-size','59389')
 $inc   = @('-I../shared/include','-I../shared/libraries/libmf/include','-I../shared/libraries/libaxdvk2/include')
-$srcs  = @('main','board','spi','nfc','flash','pwr','epd','epd_image')
+$srcs  = @('main','board','spi','nfc','nfc_ndef','flash','pwr','uart','radio','sk_link','epd','epd_image')
 
 foreach ($s in $srcs) {
     & $sdcc -c @flags @inc "src/$s.c" -o "build/obj/src/$s.rel"
@@ -112,6 +122,13 @@ foreach ($s in $srcs) {
 # write UTF-16 with a BOM and the bootloader would choke on the first line.
 & 'C:\Program Files\SDCC\bin\packihx.exe' 'build/firmware.ihx' |
     Set-Content -Encoding ascii 'build/firmware.hex'
+```
+
+The host tests (the link layer, the access point's bridge and the Python tools) are one
+command from the repository root:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools/run_tests.ps1
 ```
 
 `build/firmware.bin` (32 KB flash image, gaps filled with `0xFF`) is what the SDCC-MDF
@@ -269,6 +286,38 @@ access point carries the same `radio.c`/`radio.h`, and the two copies must stay 
 
 `radio_init()` returns `0` on success and a code otherwise — `main()` prints it together with
 a register-level diagnostic dump from `radio_diag()`.
+
+### The link layer — `src/sk_link.c`, `sk_link.h`
+
+Everything above the radio: the frame's header and CRC-16, the compact address derived from
+this tag's serial, managed flooding, the record route, and whether this tag relays at all.
+`documentation/mesh.md` is the reference; `firmware/shared/include/shelfkit_proto.h` has the
+byte layout next to the application protocol it wraps. The access point carries a
+byte-identical copy of `sk_link.c` (`tools/tests/sk_link_test.c` asserts that, and the same
+for `radio.c`/`radio.h`).
+
+**A tag is a leaf or a router, and that is a build-time choice:**
+
+```powershell
+# a battery label: never relays, and its idle state is wake-on-radio (the default)
+powershell -File tools/build_firmware.ps1 -Firmware shelfkit-vusion
+
+# a mains-powered label: stays in continuous receive and relays other tags' traffic
+powershell -File tools/build_firmware.ps1 -Firmware shelfkit-vusion -Define SK_TAG_ROUTER=1
+```
+
+A leaf announces itself every 60 s and sleeps in wake-on-radio in between; a router announces
+every 10 s and relays. The boot log says which this build is, and prints the tag's link id:
+
+```
+radio: id E5C0F240 (leaf)
+radio: announced
+...
+radio: listening (leaf, wake-on-radio)
+```
+
+That id is `FNV-1a/32` of the serial number and is what the access point addresses frames to,
+so a mismatch between it and what the access point computes looks exactly like dead hardware.
 
 ### UART — `src/uart.h`
 

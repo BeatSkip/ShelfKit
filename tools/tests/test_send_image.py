@@ -17,6 +17,7 @@ import io
 import os
 import random
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,81 @@ import send_image
 EPD_H_PATH = os.path.join(REPO_DIR, "firmware", "shelfkit-vusion", "src", "epd.h")
 PROTO_H_PATH = os.path.join(REPO_DIR, "firmware", "shared", "include",
                             "shelfkit_proto.h")
+
+
+def temp_root():
+    """The directory the tests put their scratch directories in.
+
+    In order: $SHELFKIT_TEST_TMP, the system temp directory, then a scratch
+    directory inside the repository. The repository fallback is not a
+    preference, it is a necessity: see TempDir below. Candidates that cannot
+    actually be written to are skipped, so this picks the first usable root
+    rather than trusting an environment variable.
+    """
+    candidates = [os.environ.get("SHELFKIT_TEST_TMP"),
+                  tempfile.gettempdir(),
+                  os.path.join(REPO_DIR, ".tmp-test")]
+    for root in candidates:
+        if not root:
+            continue
+        try:
+            os.makedirs(root, mode=0o777, exist_ok=True)
+            probe = os.path.join(root, ".shelfkit-write-probe")
+            with open(probe, "w"):
+                pass
+            os.remove(probe)
+            return root
+        except OSError:
+            continue
+    raise RuntimeError("no writable temporary directory for the tests")
+
+
+class TempDir:
+    """A temporary directory these tests can actually write into.
+
+    tempfile.TemporaryDirectory() creates its directory with mode 0700. On
+    Windows a mode becomes an ACL, so the directory ends up owner-only - and
+    under the agent harness's file sandbox the process cannot write into it:
+    every save fails with PermissionError, in a fresh directory *the test
+    itself just created*. Redirecting TEMP/TMP does not help, because the
+    problem is the mode TemporaryDirectory asks for, not where it is asked
+    for; that is why this suite used to report 91 errors that had nothing to
+    do with the code under test.
+
+    Creating the directory with 0o777 fixes it and changes nothing anywhere
+    else: it is still a unique directory that is removed by cleanup(), and a
+    local scratch directory is world-readable for the few milliseconds it
+    lives.
+
+    The API is the part of TemporaryDirectory this suite uses: .name,
+    cleanup(), and use as a context manager.
+    """
+
+    def __init__(self, suffix="", prefix=None, dir=None):
+        root = dir or temp_root()
+        if prefix is None:
+            prefix = tempfile.gettempprefix()
+        self.name = None
+        for _ in range(200):
+            name = os.path.join(root,
+                                prefix + next(tempfile._get_candidate_names()) + suffix)
+            try:
+                os.mkdir(name, 0o777)
+            except FileExistsError:
+                continue
+            self.name = name
+            break
+        if self.name is None:
+            raise FileExistsError("no free name for a temporary directory in " + root)
+
+    def cleanup(self):
+        shutil.rmtree(self.name, ignore_errors=True)
+
+    def __enter__(self):
+        return self.name
+
+    def __exit__(self, *exc_info):
+        self.cleanup()
 
 
 # ── independent references ────────────────────────────────────────────────
@@ -510,7 +586,7 @@ class Png2EpdParityTests(unittest.TestCase):
     """The air path must produce what the boot path (png2epd.py) produces."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = TempDir()
         self.addCleanup(self.tmp.cleanup)
 
     def _write(self, size, name):
@@ -726,7 +802,7 @@ class TransferTests(unittest.TestCase):
 class CliTests(unittest.TestCase):
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = TempDir()
         self.addCleanup(self.tmp.cleanup)
         self.dir = self.tmp.name
         self.path = os.path.join(self.dir, "1408f525.PNG")
@@ -824,7 +900,7 @@ class CliTests(unittest.TestCase):
 class DiscoveryTests(unittest.TestCase):
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = TempDir()
         self.addCleanup(self.tmp.cleanup)
         self.dir = self.tmp.name
         for name in ("notes.txt", "not a serial.png",
@@ -957,7 +1033,7 @@ class LineReaderTests(unittest.TestCase):
 class SendRecordTests(unittest.TestCase):
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = TempDir()
         self.addCleanup(self.tmp.cleanup)
         self.dir = self.tmp.name
         self.path = os.path.join(self.dir, send_image.STATE_FILE)
@@ -1026,7 +1102,7 @@ class CheckInTests(unittest.TestCase):
     """check_in(): what the tool does with one "TAG ..." line."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = TempDir()
         self.addCleanup(self.tmp.cleanup)
         self.dir = self.tmp.name
         self.record = send_image.SendRecord(
@@ -1167,7 +1243,7 @@ class WatchLoopTests(unittest.TestCase):
     """The loop itself: read lines, act on check-ins, ignore everything else."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = TempDir()
         self.addCleanup(self.tmp.cleanup)
         self.dir = self.tmp.name
         self.record = send_image.SendRecord(
@@ -1260,7 +1336,7 @@ class OneShotTests(unittest.TestCase):
     """`send_image.py COM8`: every image goes out, whatever the record says."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = TempDir()
         self.addCleanup(self.tmp.cleanup)
         self.dir = self.tmp.name
         self.png = os.path.join(self.dir, "1408F525.png")

@@ -10,3 +10,12 @@ images/*.red.bin
 # What each tag has already been sent (tools/send_image.py --watch)
 images/.sent.json
 images/.sent.json.tmp
+
+# Scratch build directories. /build-probe/ holds probe builds and the object
+# files the host tests link against; /.tmp-test/ is where the Python suite puts
+# its temporary directories when the system temp root is not usable (see
+# tools/tests/test_send_image.py, TempDir).
+/build-probe/
+/.scratch/
+/.tmp/
+/.tmp-test/

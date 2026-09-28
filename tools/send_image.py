@@ -68,10 +68,12 @@ Options:
 """
 
 import argparse
+import contextlib
 import json
 import math
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -213,6 +215,37 @@ STATUS_NAMES = {
 
 class TransferError(Exception):
     """The transfer could not be completed (bad frame, status, timeout)."""
+
+
+@contextlib.contextmanager
+def scratch_dir():
+    """A temporary directory that is actually writable.
+
+    tempfile.TemporaryDirectory() asks for mode 0700, which on Windows becomes
+    an owner-only ACL. Inside a file sandbox that does not run as that owner -
+    the agent harness's, for instance - every write into the fresh directory
+    fails, and because the failure shows up as a PermissionError from
+    rmtree() during cleanup it masks the original one. Creating the directory
+    with 0o777 sidesteps the whole thing; it is deleted immediately and holds
+    nothing but this tool's own scratch file.
+    """
+    root = tempfile.gettempdir()
+    path = None
+    for _ in range(200):
+        candidate = os.path.join(root, tempfile.gettempprefix()
+                                 + next(tempfile._get_candidate_names()))
+        try:
+            os.mkdir(candidate, 0o777)
+        except FileExistsError:
+            continue
+        path = candidate
+        break
+    if path is None:
+        raise RuntimeError("no free name for a temporary directory in " + root)
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def status_text(status):
@@ -1306,7 +1339,7 @@ def run_selftest(verbose=False):
           and parse_tag_line("TAG 1408F525 rssi=") is None)
 
     # 6. the send record: what stops a tag being re-sent every 10 seconds
-    with tempfile.TemporaryDirectory() as tmp:
+    with scratch_dir() as tmp:
         png = os.path.join(tmp, "1408F525.png")
         record = SendRecord(os.path.join(tmp, STATE_FILE))
         record.record("1408F525", png, (100, 200))

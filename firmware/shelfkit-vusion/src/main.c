@@ -38,6 +38,7 @@
 #include "spi.h"
 #include "nfc.h"
 #include "radio.h"
+#include "sk_link.h"
 #include "uart.h"
 #include "epd.h"
 #include "epd_image.h"      /* epd_image_bw / epd_image_red */
@@ -46,8 +47,52 @@
 
 /* How often an idle tag repeats its announcement, in milliseconds. Long
  * enough not to talk over a transfer, short enough that an access point
- * which comes up after the tag still finds it. */
+ * which comes up after the tag still finds it.
+ *
+ * A leaf says it ten times less often (LEAF_ANNOUNCE_MS): an announcement is
+ * the main thing a leaf transmits on its own account, and a battery label
+ * that is already asleep most of the time should not wake up to say hello
+ * every ten seconds. It is still often enough that an access point which
+ * comes up later finds it within a minute.
+ *
+ * (The leaf's number is written out rather than 10 s x 6 because SDCC is
+ * right to warn about the overflow in the multiply: 60000 does not fit in a
+ * signed 16-bit int.) */
 #define ANNOUNCE_INTERVAL_MS 10000
+#define LEAF_ANNOUNCE_MS     60000
+
+#if SK_TAG_ROUTER
+#define IDLE_ANNOUNCE_MS     ANNOUNCE_INTERVAL_MS
+#else
+#define IDLE_ANNOUNCE_MS     LEAF_ANNOUNCE_MS
+#endif
+
+/* Is this tag a mains-powered router or a battery leaf?
+ *
+ *   0 (default)  leaf: never relays, and spends its idle life in
+ *                wake-on-radio (radio.h). This is what a battery label is.
+ *   1            router: stays in continuous receive and relays other
+ *                nodes' traffic, so tags further away reach the access
+ *                point through it. This is what a label with a permanent
+ *                supply is - and it is the board that makes a mesh out of
+ *                a star.
+ *
+ * Build with -DSK_TAG_ROUTER=1 for the second one; tools/build_firmware.ps1
+ * takes -Define SK_TAG_ROUTER=1. The link layer itself does not care which
+ * this is - it is one bit in every frame it sends, and one decision about
+ * relaying (sk_link.h). */
+#ifndef SK_TAG_ROUTER
+#define SK_TAG_ROUTER 0
+#endif
+
+/* How long a leaf stays in continuous receive after it hears something, in
+ * milliseconds. This is the other half of wake-on-radio: waking up costs the
+ * sender a few hundred milliseconds of long preamble, so once a tag is up it
+ * stays up for the rest of the conversation - an image transfer's frames
+ * arrive every couple of hundred milliseconds, and the tag has to be
+ * listening for them anyway to answer each one. When the window expires with
+ * nothing heard, the tag goes back to WOR. */
+#define LEAF_AWAKE_MS 3000
 
 /* How long a transfer may go without a frame before the tag gives up on it,
  * in milliseconds. The access point is stop-and-wait, so a healthy transfer
@@ -102,6 +147,14 @@ static uint8_t nfc_serial_len;
  * IMG_STATUS. XRAM again: 19 bytes of a 128-byte internal RAM is a lot to
  * spend on a packet. */
 static uint8_t __xdata tx_pkt[SK_PKT_MAX];
+
+/* This tag's link address (sk_link.h), and whether it is currently awake.
+ * Both are XRAM for the same reason as everything else here: the 128 bytes
+ * of directly addressable internal RAM are the stack's, and main() - which
+ * is not __reentrant and therefore keeps its locals in the overlay area
+ * those 128 bytes hold - has no room to spare at all. */
+static uint32_t __xdata tag_id;
+static uint8_t __xdata link_awake;
 
 static void nfc_report(void)
 {
@@ -291,25 +344,21 @@ static uint8_t announce_build(void) __reentrant
     for (i = 0; i < nfc_serial_len; i++)
         tx_pkt[SK_HDR_LEN + i] = (uint8_t)nfc_serial_str[i];
     len = (uint8_t)(SK_HDR_LEN + nfc_serial_len);
-    tx_pkt[len] = sk_checksum(tx_pkt, len);
-    len++;
 
     return len;
 }
 
-/* One announcement from the receive loop. radio_tx() leaves the chip
- * powered down, so the receiver has to be put back on the air explicitly -
- * otherwise the tag would go deaf after every packet it sends. */
+/* One announcement from the receive loop. It is broadcast: the access point
+ * may not know this tag exists yet, so there is nobody to address it to. */
 static void announce_send(void) __reentrant
 {
     uint8_t len = announce_build();
 
     if (len) {
-        if (radio_tx(tx_pkt, len) == RADIO_OK)
+        if (sk_link_send(SK_LINK_BROADCAST, tx_pkt, len) == SK_LINK_OK)
             uart_puts("radio: announced\r\n");
         else
             uart_puts("radio: announce failed\r\n");
-        radio_rx_start();
     }
 }
 
@@ -377,12 +426,10 @@ static void announce(void) __reentrant
     /* A few repeats: the access point may have started listening after the
      * tag powered up, and this beacon is the only way it finds us. */
     for (i = 0; i < RADIO_ANNOUNCE_REPEATS; i++) {
-        err = radio_tx(tx_pkt, len);
+        err = sk_link_send(SK_LINK_BROADCAST, tx_pkt, len);
         if (err) {
             uart_puts("radio: tx failed, code ");
             uart_puthex8(err);
-            uart_puts(" - ");
-            uart_puts(radio_error_str(err));
             uart_puts("\r\n");
             return;
         }
@@ -441,17 +488,30 @@ static uint16_t __xdata rx_crc_run;     /* CRC-16 over the bytes accepted so far
 
 /* ── packets out ──────────────────────────────────────────────────────── */
 
-/* Send tx_pkt (len bytes) and put the receiver back on the air. Nothing is
- * logged: the receive loop may answer a hundred frames in a row. */
+/* Send tx_pkt (len bytes) and leave the receiver in whatever mode the tag is
+ * in (sk_link_rx_mode): radio_tx() powers the chip down when it is done, and
+ * a node that did not re-arm would go deaf. The destination is whoever sent
+ * the frame now being answered - the access point - which the link layer
+ * remembers from the last packet it delivered. Nothing is logged: the
+ * receive loop may answer a hundred frames in a row. */
 static void tx_and_listen(uint8_t len) __reentrant
 {
-    radio_tx(tx_pkt, len);
-    radio_rx_start();
+    uint8_t err = sk_link_send(sk_link_origin(), tx_pkt, len);
+
+    /* A failed transmit used to be invisible here, because the loop answers
+     * too many frames to log every success. It is the one failure worth a
+     * line: a tag that cannot transmit looks exactly like a tag that is out
+     * of range, and this is the difference. */
+    if (err) {
+        uart_puts("radio: tx failed, code ");
+        uart_puthex8(err);
+        uart_puts("\r\n");
+    }
 }
 
-/* IMG_ACK: [ver][type][off hi][off lo][status][xor] - "I have every image
- * byte below off". Also the answer to IMG_BEGIN (off = 0) and, with
- * off = the image size, to IMG_END. */
+/* IMG_ACK: [ver][type][off hi][off lo][status] - "I have every image byte
+ * below off". Also the answer to IMG_BEGIN (off = 0) and, with off = the
+ * image size, to IMG_END. */
 static void ack_send(uint16_t off, uint8_t status) __reentrant
 {
     tx_pkt[0] = SK_PROTO_VERSION;
@@ -459,13 +519,12 @@ static void ack_send(uint16_t off, uint8_t status) __reentrant
     tx_pkt[2] = (uint8_t)(off >> 8);
     tx_pkt[3] = (uint8_t)off;
     tx_pkt[4] = status;
-    tx_pkt[5] = sk_checksum(tx_pkt, 5);
-    tx_and_listen(6);
+    tx_and_listen(5);
 }
 
-/* IMG_STATUS: [ver][type][slen][serial n][status][xor] - a transfer was
- * refused or failed. It carries the serial because an access point may be
- * talking to several tags and has to know which one is unhappy. */
+/* IMG_STATUS: [ver][type][slen][serial n][status] - a transfer was refused or
+ * failed. It carries the serial because an access point may be talking to
+ * several tags and has to know which one is unhappy. */
 static void status_send(uint8_t status) __reentrant
 {
     uint8_t len, i;
@@ -477,8 +536,6 @@ static void status_send(uint8_t status) __reentrant
         tx_pkt[SK_HDR_LEN + i] = (uint8_t)nfc_serial_str[i];
     len = (uint8_t)(SK_HDR_LEN + nfc_serial_len);
     tx_pkt[len] = status;
-    len++;
-    tx_pkt[len] = sk_checksum(tx_pkt, len);
     len++;
 
     tx_and_listen(len);
@@ -582,18 +639,19 @@ static void show_image(void) __reentrant
 
 /* ── the three transfer packets ───────────────────────────────────────── */
 
-/* IMG_BEGIN: [ver][type][slen][serial n][total hi][total lo][crc hi][crc lo][xor] */
+/* IMG_BEGIN: [ver][type][slen][serial n][total hi][total lo][crc hi][crc lo] */
 static void img_begin(uint8_t len) __reentrant
 {
     uint8_t slen = rx_pkt[2];
     uint8_t i, mine, sec;
     uint16_t total;
 
-    /* The frame has to carry a serial, an image size and a CRC, and its
-     * checksum was already verified by the caller. Anything else is not a
-     * BEGIN, and there is no sensible way to answer it. */
+    /* The frame has to carry a serial, an image size and a CRC; the link
+     * layer has already checked the frame's CRC-16. Anything that is not
+     * that shape is not a BEGIN, and there is no sensible way to answer
+     * it. */
     if (slen == 0 || slen > SK_SERIAL_MAX ||
-        len != (uint8_t)(SK_HDR_LEN + slen + 5))
+        len != (uint8_t)(SK_HDR_LEN + slen + 4))
         return;
 
     /* The serial is the only addressing this link has: a transfer is for
@@ -681,22 +739,22 @@ static void img_begin(uint8_t len) __reentrant
     ack_send(0, SK_ST_OK);
 }
 
-/* IMG_DATA: [ver][type][off hi][off lo][data k][xor] */
+/* IMG_DATA: [ver][type][off hi][off lo][data k] */
 static void img_data(uint8_t len) __reentrant
 {
     uint16_t off, k;
 
-    /* Version, type, two offset bytes, at least one image byte and the
-     * checksum. Note the body starts at byte 2, not at SK_HDR_LEN: that
-     * constant is the header of the packets that carry a *serial* (version,
-     * type, length), and IMG_DATA has no serial-length byte - it goes
-     * straight to the offset. Using SK_HDR_LEN here cost one image byte per
-     * frame and left the acknowledged offset one short of the sender's, so
-     * every block was retried forever. */
-    if (len < 2 + 2 + 1 + 1)
+    /* Version, type, two offset bytes and at least one image byte. Note the
+     * body starts at byte 2, not at SK_HDR_LEN: that constant is the header
+     * of the packets that carry a *serial* (version, type, length), and
+     * IMG_DATA has no serial-length byte - it goes straight to the offset.
+     * Using SK_HDR_LEN here cost one image byte per frame and left the
+     * acknowledged offset one short of the sender's, so every block was
+     * retried forever. */
+    if (len < 2 + 2 + 1)
         return;
 
-    k = (uint16_t)(len - 2 - 2 - 1);
+    k = (uint16_t)(len - 2 - 2);
     off = (uint16_t)(((uint16_t)rx_pkt[2] << 8) | rx_pkt[3]);
 
     if (rx_state == RX_DONE) {
@@ -747,7 +805,7 @@ static void img_data(uint8_t len) __reentrant
     ack_send(rx_next, SK_ST_OK);
 }
 
-/* IMG_END: [ver][type][xor] */
+/* IMG_END: [ver][type] */
 static void img_end(void) __reentrant
 {
     uint16_t base, left;
@@ -808,22 +866,37 @@ static void img_end(void) __reentrant
 
     rx_state = RX_DONE;
     /* The answer goes out last: the access point is waiting for exactly this
-     * verdict and knows the refresh takes ~20 s. */
+     * verdict and knows the refresh takes ~20 s. Logged because a lost final
+     * answer is otherwise indistinguishable from a tag that never got the
+     * END at all - and it is the one frame in the transfer that is sent after
+     * ten seconds of driving the panel rather than the radio. */
+    uart_puts("img: answering END (off ");
+    uart_puthex16(rx_total);
+    uart_puts(" status ");
+    uart_puthex8(rx_status);
+    uart_puts(")\r\n");
+    /* Sent twice, deliberately. This is the one answer in the transfer that
+     * goes out after ten seconds of driving the panel rather than the radio,
+     * and on the bench the first copy has been lost every time while the
+     * block answers before it get through - see documentation/mesh.md's
+     * "unverified" list. The access point drops the second copy as a
+     * duplicate (same origin and sequence number), so a repeat costs one
+     * frame and cannot be mistaken for a second verdict. */
+    ack_send(rx_total, rx_status);
+    ms_delay(250);
     ack_send(rx_total, rx_status);
 }
 
-/* One received radio payload. A frame that is not this tag's, that is not
- * this protocol, or whose XOR checksum does not match (the AX5043's own CRC
- * is off - see radio.c) is dropped without an answer: all three are things
- * the access point's own timeout covers, and guessing at a garbled frame
- * could stage the wrong bytes. */
+/* One received application payload, already unwrapped and CRC-checked by the
+ * link layer. A payload that is not this protocol, or not a type this
+ * firmware knows, is dropped without an answer: guessing at a garbled frame
+ * could stage the wrong bytes, and the access point's own timeout covers the
+ * silence. */
 static void handle_packet(uint8_t len) __reentrant
 {
-    if (len < SK_HDR_LEN)               /* version, type and checksum */
+    if (len < SK_MIN_PAYLOAD)           /* version and type */
         return;
     if (rx_pkt[0] != SK_PROTO_VERSION)
-        return;
-    if (sk_checksum(rx_pkt, (uint8_t)(len - 1)) != rx_pkt[len - 1])
         return;
 
     switch (rx_pkt[1]) {
@@ -898,6 +971,27 @@ void main()
      * and hands it back to the hardware SPI unit (mode 0) afterwards. */
     nfc_report();
 
+    /* Then the link layer, which needs the serial: the tag's address is
+     * FNV-1a/32 of it, so both ends can compute the same id without a
+     * handshake and the address costs four bytes in a frame instead of the
+     * whole serial. Printing it matters - a mismatch between this and the
+     * access point's idea of the peer looks exactly like dead hardware.
+     *
+     * The id goes through a static rather than a local: an expression like
+     * sk_link_init(role, sk_id_from_serial(...)) needs a temporary for the
+     * 32-bit result, and main() is not __reentrant, so that temporary would
+     * come out of the overlay area - which on this part has no room. */
+    tag_id = sk_id_from_serial(nfc_serial_str, nfc_serial_len);
+    sk_link_init(SK_TAG_ROUTER ? SK_ROLE_ROUTER : SK_ROLE_LEAF, tag_id);
+    {
+        uart_puts("radio: id ");
+        uart_puthex8((uint8_t)(tag_id >> 24));
+        uart_puthex8((uint8_t)(tag_id >> 16));
+        uart_puthex8((uint8_t)(tag_id >> 8));
+        uart_puthex8((uint8_t)tag_id);
+        uart_puts(SK_TAG_ROUTER ? " (router)\r\n" : " (leaf)\r\n");
+    }
+
     /* Then say hello over the radio, before spending ~20 s on the panel. */
     announce();
 
@@ -935,18 +1029,79 @@ void main()
      * From here everything the tag does is driven by the radio. Nothing in
      * this loop blocks for longer than the panel refresh in show_image(),
      * which is deliberate: the sender is stop-and-wait, so a slow tag costs
-     * a retry, while a tag that is not listening at all costs the transfer. */
+     * a retry, while a tag that is not listening at all costs the transfer.
+     *
+     * A leaf starts in wake-on-radio rather than continuous receive: it is
+     * only on for a fraction of each wake-up period, which is the single
+     * biggest power saving available to a battery label (see radio.h). It
+     * comes back to continuous receive the moment it hears anything, and
+     * drops back to WOR when the conversation has been quiet for
+     * LEAF_AWAKE_MS - so an image transfer pays for one wake-up, not one per
+     * frame. A router stays in continuous receive: it has a supply and its
+     * job is to hear everything.
+     *
+     * The two roles are chosen at compile time, so they are #if'd rather than
+     * tested: a constant test would compile both branches and leave half of
+     * them unreachable, which SDCC quite rightly warns about. */
+#if SK_TAG_ROUTER
+    sk_link_rx_mode(SK_RX_CONTINUOUS);
     radio_rx_start();
-    uart_puts("radio: listening\r\n");
+    uart_puts("radio: listening (router)\r\n");
+#else
+    sk_link_rx_mode(SK_RX_WOR);
+    radio_rx_wor_start();
+    uart_puts("radio: listening (leaf, wake-on-radio)\r\n");
+#endif
 
     quiet_ms = 0;
     for (;;) {
-        len = radio_rx(rx_pkt, sizeof rx_pkt);
+        len = sk_link_poll(rx_pkt, sizeof rx_pkt);
+
+        /* A frame this node forwarded (a router only - a leaf never relays).
+         * Invisible without a line here, and exactly what "which way did that
+         * packet go" is asked about. Checked before the delivery branch,
+         * because a broadcast is delivered *and* relayed: logging it only in
+         * the not-delivered path (as this did at first) hid every relay of a
+         * broadcast - which is the common case, since IMG_BEGIN is one. */
+        if (sk_link_relayed()) {
+            uart_puts("relay msg ");
+            uart_puthex8(sk_link_seq());
+            uart_puts(" origin ");
+            uart_puthex8((uint8_t)(sk_link_origin() >> 24));
+            uart_puthex8((uint8_t)(sk_link_origin() >> 16));
+            uart_puthex8((uint8_t)(sk_link_origin() >> 8));
+            uart_puthex8((uint8_t)sk_link_origin());
+            uart_puts(" hops ");
+            uart_puthex8(sk_link_hops());
+            uart_puts("->");
+            uart_puthex8((uint8_t)(sk_link_hops() - 1));
+            uart_puts("\r\n");
+        }
 
         if (len) {
             quiet_ms = 0;
+#if !SK_TAG_ROUTER
+            /* Heard something: stay awake for the rest of the exchange, so
+             * an image transfer pays for one wake-up rather than one per
+             * frame. */
+            if (!link_awake) {
+                link_awake = 1;
+                sk_link_rx_mode(SK_RX_CONTINUOUS);
+                radio_rx_start();
+                uart_puts("radio: awake\r\n");
+            }
+#endif
             handle_packet(len);
             continue;
+        }
+
+        if (sk_link_bad()) {
+            /* Heard something that was not a frame: the CRC or the framing
+             * did not survive the air. The distinction between "the radio is
+             * hearing nothing" and "the radio is hearing rubbish" is the one
+             * that says whether to look at the aerial or at the protocol, and
+             * it is worth a line on the tag's console too. */
+            uart_puts("radio: bad frame dropped\r\n");
         }
 
         ms_delay(1);                /* 1 ms between polls of the FIFO */
@@ -961,11 +1116,22 @@ void main()
                 rx_state = RX_IDLE;
                 quiet_ms = 0;
             }
-        } else if (quiet_ms >= ANNOUNCE_INTERVAL_MS) {
+        } else if (quiet_ms >= IDLE_ANNOUNCE_MS) {
             /* Idle: keep saying who we are, so an access point that comes up
              * later (or missed the boot beacon) can still find this tag. */
             quiet_ms = 0;
             announce_send();
         }
+
+#if !SK_TAG_ROUTER
+        /* The conversation has gone quiet: back to sleep. A router never
+         * does this - that is what makes it a router. */
+        if (link_awake && quiet_ms >= LEAF_AWAKE_MS) {
+            link_awake = 0;
+            sk_link_rx_mode(SK_RX_WOR);
+            radio_rx_wor_start();
+            uart_puts("radio: idle, back to wake-on-radio\r\n");
+        }
+#endif
     }
 }

@@ -50,10 +50,31 @@ link in one line: **868.300 MHz, deviation 1600 Hz, 4800 bit/s, RX bandwidth 7.2
 15 dBm, 26 MHz TCXO.** The physical layer, the frame format and the reasoning are in
 [`documentation/shelfkit-radio-link.md`](../../documentation/shelfkit-radio-link.md).
 
-**The tag and the access point must carry the same `radio.c`/`radio.h`.** The two copies in
-this repo are byte-identical, and the driver applies the generated register table verbatim
+**The tag and the access point must carry the same `radio.c`/`radio.h`** — and now the same
+`sk_link.c` too. The two copies in this repo are byte-identical (asserted by
+`tools/tests/sk_link_test.c`), and the driver applies the generated register table verbatim
 rather than deriving values by hand — an earlier attempt at deriving them from the programming
 manual produced a link that compiled, ran, and never worked.
+
+**The frame, the addressing and the mesh** are in
+[`documentation/mesh.md`](../../documentation/mesh.md): a CRC-16 over every frame, a 4-byte
+node id derived from a serial, managed flooding with a hop budget and a seen-id ring, and a
+record route. The access point is a **router**: it stays in continuous receive and relays
+other nodes' traffic, and it adds the wake-on-radio preamble only when the peer it is talking
+to is not known to be a router (the frame's role flag says).
+
+What that looks like on the console:
+
+```
+TAG 1408F525 rssi=-64
+   path via F240 (01 hops, 03 left)          <- the tag's frame reached us through a relay
+relay msg 00 origin 1408F525 hops 04->03     <- and this is us relaying someone else's
+link: duplicate msg 00 (our own, handed back by a relay) via F240 (01 hops, 03 left)
+```
+
+The `TAG ... rssi=...` line keeps exactly the shape the host tool matches; the path goes on
+the line *after* it, because appending to it would silently stop `tools/send_image.py
+--watch` from recognising the tag.
 
 ## Building and flashing
 
@@ -98,20 +119,30 @@ foreach ($s in $srcs) {
 
 `main.c`'s parser and bridge have no MCU dependency, so they are tested on the PC: the test
 compiles the real `main.c` against stub headers (`tools/tests/ap_stubs/`) and drives it with a
-scripted serial line and a scripted tag.
+scripted serial line and a scripted tag that answers in real link frames.
+`tools/run_tests.ps1` builds and runs everything (this test, the link layer's own test, and
+the Python tools) in one command; by hand it is:
 
 ```powershell
 gcc -Wall -Wextra -Wno-unused-function -Wno-unused-parameter `
     -I tools/tests/ap_stubs -I firmware/shared/include `
-    -o tools/tests/serial_frame_test.exe tools/tests/serial_frame_test.c
+    -c -o tools/tests/sk_link_host.o firmware/shelfkit-vusion/src/sk_link.c
+gcc -Wall -Wextra -Wno-unused-function -Wno-unused-parameter `
+    -I tools/tests/ap_stubs -I firmware/shared/include `
+    -o tools/tests/serial_frame_test.exe `
+    tools/tests/serial_frame_test.c tools/tests/sk_link_host.o
 ./tools/tests/serial_frame_test.exe
 ```
+
+(The link layer is compiled from the tag's copy; the two are byte-identical and the link test
+asserts that.)
 
 ## Source layout
 
 | File | Contents |
 |---|---|
-| `main.c` | boot, banner, the receive loop, `TAG <serial> rssi=<db>` reporting, the serial frame parser, the host↔radio bridge |
+| `main.c` | boot, banner, the receive loop, `TAG <serial> rssi=<db>` reporting, the serial frame parser, the host↔radio bridge, the relay/duplicate/path console lines |
+| `sk_link.c` / `sk_link.h` | the link layer: frame, CRC-16, addressing, managed flooding, record route (byte-identical to the tag's copy) |
 | `radio.c/h` | the AX5043 driver — init, auto-ranging, transmit, receive |
 | `uart.c/h` | minimal UART0 bring-up at 38400 8N1 on PB4/PB5, TX and polled RX |
 | `board.c/h`, `hal.h`, `pwr.c/h` | board pins and the PA2/PA5 transistor lines |

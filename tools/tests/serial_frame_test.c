@@ -165,39 +165,99 @@ uint8_t sk_checksum(const uint8_t *buf, uint8_t len) { return xor8(buf, len); }
 
 #define AIR_MAX 64
 
-static uint8_t  air[AIR_MAX][SK_PKT_MAX];
+/* The air carries whole link frames now, not bare application payloads: the
+ * access point's main.c goes through sk_link_poll()/sk_link_send() like the
+ * real firmware, so this test drives the real framing as well as the bridge.
+ * The scripted tag therefore builds a link frame around each answer it
+ * queues, the way its own firmware would - with the same header layout, its
+ * own id as the origin and the access point as the destination. */
+static uint8_t  air[AIR_MAX][SK_LINK_MAX];
 static uint8_t  air_len[AIR_MAX];
 static uint32_t air_at[AIR_MAX];
 static int      air_head, air_tail;
 
+static uint8_t  tag_seq;                /* the scripted tag's message counter */
+
 #define TX_LOG_MAX 64
-static uint8_t tx_log[TX_LOG_MAX][SK_PKT_MAX];
+static uint8_t tx_log[TX_LOG_MAX][SK_PKT_MAX];  /* the application payloads sent */
 static uint8_t tx_log_len[TX_LOG_MAX];
 static int     tx_log_n;
+static int     tx_frames;               /* frames the access point transmitted */
+static int     tx_bad_frames;           /* ... whose CRC or layout was wrong */
+static int     tx_wor_frames;           /* ... sent behind the WOR preamble */
 
-static void air_push(uint16_t delay_ms, const uint8_t *payload, uint8_t len)
+/* The test's own CRC-16/CCITT-FALSE over a whole frame, so the access point's
+ * frames are checked against an implementation that is not the one being
+ * tested (sk_link.c has its own). */
+static uint16_t frame_crc(const uint8_t *f, uint8_t len)
 {
+    uint16_t crc = 0xFFFF;
+    uint8_t i;
+    int bit;
+
+    for (i = 0; i < len; i++) {
+        crc ^= (uint16_t)((uint16_t)f[i] << 8);
+        for (bit = 0; bit < 8; bit++)
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021)
+                                 : (uint16_t)(crc << 1);
+    }
+    return crc;
+}
+
+/* Build a link frame from the scripted tag: type and body in @p app. */
+static void air_push(uint16_t delay_ms, const uint8_t *app, uint8_t applen)
+{
+    static uint8_t f[SK_LINK_MAX];
+    uint8_t n = SK_LINK_HDR_LEN;
+    uint16_t crc;
+
     if (air_tail >= AIR_MAX) {
         printf("      (air queue full)\n");
         return;
     }
-    memcpy(air[air_tail], payload, len);
-    air_len[air_tail] = len;
+    f[SK_LINK_O_VER] = SK_LINK_VERSION;
+    f[SK_LINK_O_TYPE] = (uint8_t)(applen >= 2 ? app[1] : 0);
+    f[SK_LINK_O_CTL] = (uint8_t)(SK_LINK_HOPS_INIT << SK_LINK_CTL_HOPS_SHIFT);
+    f[SK_LINK_O_SEQ] = ++tag_seq;
+    /* The tag's id: FNV-1a of its serial, as the tag itself computes it. */
+    {
+        uint32_t id = sk_id_from_serial("1408F525", 8);
+
+        f[SK_LINK_O_ORIGIN] = (uint8_t)(id >> 24);
+        f[SK_LINK_O_ORIGIN + 1] = (uint8_t)(id >> 16);
+        f[SK_LINK_O_ORIGIN + 2] = (uint8_t)(id >> 8);
+        f[SK_LINK_O_ORIGIN + 3] = (uint8_t)id;
+    }
+    /* Answers go to the access point, which is what the real tag does: it
+     * addresses the origin of the frame it is answering (sk_link_origin()). */
+    f[SK_LINK_O_DST] = (uint8_t)(SK_LINK_AP_ID >> 24);
+    f[SK_LINK_O_DST + 1] = (uint8_t)(SK_LINK_AP_ID >> 16);
+    f[SK_LINK_O_DST + 2] = (uint8_t)(SK_LINK_AP_ID >> 8);
+    f[SK_LINK_O_DST + 3] = (uint8_t)SK_LINK_AP_ID;
+    f[SK_LINK_O_ROUTELEN] = 0;
+
+    memcpy(f + n, app, applen);
+    n = (uint8_t)(n + applen);
+    crc = frame_crc(f, n);
+    f[n++] = (uint8_t)(crc >> 8);
+    f[n++] = (uint8_t)crc;
+
+    memcpy(air[air_tail], f, n);
+    air_len[air_tail] = n;
     air_at[air_tail] = virtual_ms + delay_ms;
     air_tail++;
 }
 
 static void tag_reply_ack(uint16_t delay_ms, uint16_t off, uint8_t status)
 {
-    uint8_t p[6];
+    uint8_t p[5];
 
     p[0] = SK_PROTO_VERSION;
     p[1] = SK_PKT_IMG_ACK;
     p[2] = (uint8_t)(off >> 8);
     p[3] = (uint8_t)off;
     p[4] = status;
-    p[5] = xor8(p, 5);
-    air_push(delay_ms, p, 6);
+    air_push(delay_ms, p, 5);
 }
 
 static void tag_reply_status(uint16_t delay_ms, const char *serial, uint8_t status)
@@ -212,8 +272,7 @@ static void tag_reply_status(uint16_t delay_ms, const char *serial, uint8_t stat
     for (i = 0; i < n; i++)
         p[SK_HDR_LEN + i] = (uint8_t)serial[i];
     p[SK_HDR_LEN + n] = status;
-    p[SK_HDR_LEN + n + 1] = xor8(p, (uint8_t)(SK_HDR_LEN + n + 1));
-    air_push(delay_ms, p, (uint8_t)(SK_HDR_LEN + n + 2));
+    air_push(delay_ms, p, (uint8_t)(SK_HDR_LEN + n + 1));
 }
 
 static void tag_announce(uint16_t delay_ms, const char *serial)
@@ -227,8 +286,7 @@ static void tag_announce(uint16_t delay_ms, const char *serial)
     p[2] = n;
     for (i = 0; i < n; i++)
         p[SK_HDR_LEN + i] = (uint8_t)serial[i];
-    p[SK_HDR_LEN + n] = xor8(p, (uint8_t)(SK_HDR_LEN + n));
-    air_push(delay_ms, p, (uint8_t)(SK_HDR_LEN + n + 1));
+    air_push(delay_ms, p, (uint8_t)(SK_HDR_LEN + n));
 }
 
 uint8_t radio_init(void) { return RADIO_OK; }
@@ -237,23 +295,66 @@ void radio_diag(uint8_t *out) { memset(out, 0, RADIO_DIAG_LEN); }
 uint8_t radio_revision(void) { return 0x51; }
 int8_t radio_rssi(void) { return -42; }
 void radio_rx_start(void) { radio_rx_start_calls++; }
+void radio_rx_wor_start(void) { radio_rx_start_calls++; }
 void radio_rx_stop(void) { }
 void periph_init(void) { }
 void pwr_init(void) { }
 void pwr_on(void) { }
 void pwr_off(void) { }
 
+/* The link layer's transmit path: check the frame the access point built
+ * (with the test's own CRC), then keep only the application payload, which is
+ * what all the bridge's assertions below are about. A malformed frame is
+ * counted rather than reported here, so one failure does not print per call;
+ * the tests check tx_bad_frames at the end. */
+static void capture(const uint8_t *frame, uint8_t len)
+{
+    uint8_t routelen, at, applen;
+    uint16_t crc, want;
+
+    tx_frames++;
+    if (len < SK_LINK_HDR_LEN + SK_LINK_CRC_LEN ||
+        frame[SK_LINK_O_VER] != SK_LINK_VERSION) {
+        tx_bad_frames++;
+        return;
+    }
+    routelen = frame[SK_LINK_O_ROUTELEN];
+    if (routelen > SK_LINK_ROUTE_MAX) {
+        tx_bad_frames++;
+        return;
+    }
+    at = (uint8_t)(SK_LINK_HDR_LEN + 2 * routelen);
+    if (len < (uint8_t)(at + SK_LINK_CRC_LEN)) {
+        tx_bad_frames++;
+        return;
+    }
+    crc = frame_crc(frame, (uint8_t)(len - SK_LINK_CRC_LEN));
+    want = (uint16_t)(((uint16_t)frame[len - 2] << 8) | frame[len - 1]);
+    if (crc != want) {
+        tx_bad_frames++;
+        return;
+    }
+    applen = (uint8_t)(len - at - SK_LINK_CRC_LEN);
+    if (tx_log_n < TX_LOG_MAX) {
+        memcpy(tx_log[tx_log_n], frame + at, applen);
+        tx_log_len[tx_log_n] = applen;
+        tx_log_n++;
+    }
+}
+
 uint8_t radio_tx(const uint8_t *payload, uint8_t len)
 {
     radio_tx_calls++;
     if (radio_tx_fail)
         return RADIO_ERR_TX_FIFO;
-    if (tx_log_n < TX_LOG_MAX) {
-        memcpy(tx_log[tx_log_n], payload, len);
-        tx_log_len[tx_log_n] = len;
-        tx_log_n++;
-    }
+    capture(payload, len);
     return RADIO_OK;
+}
+
+uint8_t radio_tx_wor(const uint8_t *payload, uint8_t len)
+{
+    tx_wor_frames++;
+    return radio_tx(payload, len);
 }
 
 uint8_t radio_rx(uint8_t *payload, uint8_t maxlen)
@@ -274,6 +375,11 @@ uint8_t radio_rx(uint8_t *payload, uint8_t maxlen)
 }
 
 /* ── the firmware under test ──────────────────────────────────────────── */
+
+/* sk_link.c is compiled separately (see the build line at the top of the
+ * file) and linked in: the access point's main.c now talks to the link layer
+ * rather than to radio_tx()/radio_rx() directly, so this test exercises the
+ * real framing as well as the bridge. */
 
 /* main.c defines main(); rename it so this file can have its own. */
 #define main ap_main
@@ -305,14 +411,18 @@ static void reset_world(void)
     radio_tx_fail = 0;
     air_head = air_tail = 0;
     tx_log_n = 0;
+    tx_frames = tx_bad_frames = tx_wor_frames = 0;
+    tag_seq = 0;
 
     uart_rxfifo_rd = uart_rxfifo_wr = 0;
     ser_state = SER_WANT_AA;
     ser_len = ser_got = ser_crc_hi = 0;
     ser_idle = 0;
+    sk_link_init(SK_ROLE_ROUTER, SK_LINK_AP_ID);
     xfer_active = 0;
     xfer_total = 0;
     xfer_slen = 0;
+    xfer_id = 0;
     memset(xfer_serial, 0, sizeof xfer_serial);
     reply_off = 0;
     reply_status = 0;
@@ -329,6 +439,7 @@ static void pretend_begin_ok(void)
     xfer_total = SK_IMG_TOTAL_BYTES;
     memcpy(xfer_serial, "1408F525", 8);
     xfer_slen = 8;
+    xfer_id = sk_id_from_serial("1408F525", 8);
 }
 
 static void feed(const uint8_t *b, size_t n)
@@ -410,20 +521,48 @@ static int tx_skip_past(const char *s)
     return 0;
 }
 
-/* Check that the bytes emitted since the last call are exactly one host
- * frame, CRC and all, and hand back its type/len/payload. */
+/* Offset of the next 0xAA 0x55 at or after @p from, or (size_t)-1.
+ *
+ * With AP_LINK_DEBUG on, the console trace ("link: sent type 10 len 10") is
+ * interleaved with the binary host frames on the same UART - deliberately, so
+ * an operator can read what happened. The real host tool copes by
+ * resynchronising on the frame sync (send_image.py's reader does exactly
+ * that), so the test does too: text before the sync bytes is diagnostic
+ * output, not a frame. Without this the test only passed while the trace was
+ * off, which is not a property worth keeping. */
+static size_t find_frame(size_t from)
+{
+    size_t i;
+
+    for (i = from; i + 1 < tx_capture_len; i++) {
+        if (tx_capture[i] == SK_UART_SYNC0 && tx_capture[i + 1] == SK_UART_SYNC1)
+            return i;
+    }
+    return (size_t)-1;
+}
+
+/* Check that the next host frame in what was emitted is exactly one frame,
+ * CRC and all, and hand back its type/len/payload. Diagnostic text in front
+ * of it is skipped. */
 static int take_host_frame(uint8_t *type, uint8_t *len, uint8_t *out)
 {
-    size_t n = tx_capture_len - frame_pos;
+    size_t start, n;
     uint16_t crc = 0xFFFF, want;
     uint8_t i, l;
 
-    if (n < 6) {
-        printf("      (only %u bytes emitted, no frame)\n", (unsigned)n);
+    start = find_frame(frame_pos);
+    if (start == (size_t)-1) {
+        n = tx_capture_len - frame_pos;
+        if (n < 6)
+            printf("      (only %u bytes emitted, no frame)\n", (unsigned)n);
+        else
+            printf("      (no 0xAA 0x55 in the %u bytes emitted)\n", (unsigned)n);
         return 0;
     }
-    if (tx_capture[frame_pos] != SK_UART_SYNC0 || tx_capture[frame_pos + 1] != SK_UART_SYNC1) {
-        printf("      (no 0xAA 0x55 at the start of the emitted bytes)\n");
+    frame_pos = start;
+    n = tx_capture_len - frame_pos;
+    if (n < 6) {
+        printf("      (a sync arrived with only %u bytes after it)\n", (unsigned)n);
         return 0;
     }
     l = tx_capture[frame_pos + 3];
@@ -485,11 +624,13 @@ static void expect_status(uint8_t status, uint8_t detail)
 static void expect_no_frame(void)
 {
     checks++;
-    if (tx_capture_len != frame_pos) {
+    if (find_frame(frame_pos) != (size_t)-1) {
         failures++;
         printf("FAIL expected no host answer, %u bytes were emitted\n",
                (unsigned)(tx_capture_len - frame_pos));
     }
+    /* Consume whatever was printed - diagnostic text is not an answer. */
+    frame_pos = tx_capture_len;
 }
 
 /* ── host frames the test sends ───────────────────────────────────────── */
@@ -728,7 +869,7 @@ static void test_payload_may_contain_sync(void)
     feed_frame(SK_U_IMG_DATA, p, 6);
     CHECK(run_pending() == 1, "a DATA frame holding AA 55 was not parsed");
     CHECK(radio_tx_calls == 1, "expected one IMG_DATA, got %u", radio_tx_calls);
-    CHECK(tx_log_len[0] == 9, "IMG_DATA length = %u, wanted 9", tx_log_len[0]);
+    CHECK(tx_log_len[0] == 8, "IMG_DATA length = %u, wanted 8", tx_log_len[0]);
     CHECK(tx_log[0][4] == 0xAA && tx_log[0][5] == 0x55 &&
           tx_log[0][6] == 0xAA && tx_log[0][7] == 0x55,
           "the data bytes were not carried through unchanged");
@@ -812,7 +953,7 @@ static void test_begin_ok(void)
 
     CHECK(run_pending() == 1, "the BEGIN frame was not parsed");
     CHECK(radio_tx_calls == 1, "IMG_BEGIN went out %u times, wanted 1", radio_tx_calls);
-    CHECK(tx_log_len[0] == 16, "IMG_BEGIN length = %u, wanted 16", tx_log_len[0]);
+    CHECK(tx_log_len[0] == 15, "IMG_BEGIN length = %u, wanted 15", tx_log_len[0]);
     CHECK(tx_log[0][0] == SK_PROTO_VERSION && tx_log[0][1] == SK_PKT_IMG_BEGIN,
           "packet type = %02X %02X", tx_log[0][0], tx_log[0][1]);
     CHECK(tx_log[0][2] == 8, "serial length = %u", tx_log[0][2]);
@@ -821,7 +962,10 @@ static void test_begin_ok(void)
           "total = %02X%02X, wanted 2BF0", tx_log[0][11], tx_log[0][12]);
     CHECK(tx_log[0][13] == 0x12 && tx_log[0][14] == 0x34,
           "the image CRC was not passed through: %02X%02X", tx_log[0][13], tx_log[0][14]);
-    CHECK(tx_log[0][15] == xor8(tx_log[0], 15), "the radio XOR checksum is wrong");
+    CHECK(tx_bad_frames == 0, "%d of the frames the access point built were malformed",
+          tx_bad_frames);
+    CHECK(tx_wor_frames == 1, "IMG_BEGIN went out without the wake-up preamble %d times",
+          tx_frames - tx_wor_frames);
 
     CHECK(xfer_active == 1, "the transfer is not marked live");
     CHECK(xfer_total == SK_IMG_TOTAL_BYTES, "total recorded as %u", xfer_total);
@@ -1059,13 +1203,14 @@ static void test_data_ok(void)
     host_data_cmd(0x00C0, 0x40, 3);         /* 3 bytes at offset 192 */
     CHECK(run_pending() == 1, "the DATA frame was not parsed");
     CHECK(radio_tx_calls == 1, "IMG_DATA went out %u times, wanted 1", radio_tx_calls);
-    CHECK(tx_log_len[0] == 8, "IMG_DATA length = %u, wanted 8", tx_log_len[0]);
+    CHECK(tx_log_len[0] == 7, "IMG_DATA length = %u, wanted 7", tx_log_len[0]);
     CHECK(tx_log[0][1] == SK_PKT_IMG_DATA, "type = %02X", tx_log[0][1]);
     CHECK(tx_log[0][2] == 0x00 && tx_log[0][3] == 0xC0, "offset = %02X%02X",
           tx_log[0][2], tx_log[0][3]);
     CHECK(tx_log[0][4] == 0x40 && tx_log[0][5] == 0x41 && tx_log[0][6] == 0x42,
           "data bytes were not carried through");
-    CHECK(tx_log[0][7] == xor8(tx_log[0], 7), "the radio XOR checksum is wrong");
+    CHECK(tx_bad_frames == 0, "%d of the frames the access point built were malformed",
+          tx_bad_frames);
     expect_ack(0x00C3, SK_ST_OK);
 }
 
@@ -1105,7 +1250,7 @@ static void test_data_retries_exhausted(void)
     CHECK(virtual_ms - t0 == (uint32_t)LINK_DATA_TRIES * LINK_DATA_WAIT_MS,
           "the wait was %u ms, wanted %u", virtual_ms - t0,
           LINK_DATA_TRIES * LINK_DATA_WAIT_MS);
-    CHECK(tx_log_len[0] == 4 + SK_IMG_DATA_MAX + 1, "a full block is 101 bytes, got %u",
+    CHECK(tx_log_len[0] == 4 + SK_IMG_DATA_MAX, "a full block is 100 bytes, got %u",
           tx_log_len[0]);
     CHECK(xfer_active == 1, "the transfer should stay open for a retry");
     /* The tag abandons a transfer after 30 s of radio silence, so the whole
@@ -1147,9 +1292,9 @@ static void test_end_crc_failure(void)
     CHECK(run_pending() == 1, "the END frame was not parsed");
     CHECK(radio_tx_calls == 2, "IMG_END went out %u times, wanted 2 (one resend)",
           radio_tx_calls);
-    CHECK(tx_log_len[0] == 3 && tx_log[0][1] == SK_PKT_IMG_END &&
-          tx_log[0][2] == xor8(tx_log[0], 2), "the IMG_END frame is malformed");
-    CHECK(tx_log_len[1] == tx_log_len[0] && memcmp(tx_log[0], tx_log[1], 3) == 0,
+    CHECK(tx_log_len[0] == 2 && tx_log[0][1] == SK_PKT_IMG_END,
+          "the IMG_END payload is malformed");
+    CHECK(tx_log_len[1] == tx_log_len[0] && memcmp(tx_log[0], tx_log[1], 2) == 0,
           "the END resend was not byte-identical to the first transmission");
     CHECK(xfer_active == 0, "the transfer should be over");
     expect_ack(SK_IMG_TOTAL_BYTES, SK_ST_CRC);

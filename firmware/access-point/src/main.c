@@ -47,6 +47,7 @@
 #include "board.h"
 #include "pwr.h"
 #include "radio.h"
+#include "sk_link.h"
 #include "uart.h"
 #include "shelfkit_proto.h"
 
@@ -175,6 +176,18 @@ static uint16_t __xdata xfer_total;
  * with two it is the difference between working and not. */
 static uint8_t __xdata xfer_serial[SK_SERIAL_MAX];
 static uint8_t xfer_slen;
+
+/* The link id that serial maps to (sk_id_from_serial). IMG_BEGIN goes out
+ * broadcast, because every tag has to hear it so the ones it is not for can
+ * refuse it; every frame after it is addressed to this id. */
+static uint32_t __xdata xfer_id;
+
+/* Whether the peer we are talking to says it is a router (sk_link.h's role
+ * flag, seen in the last frame it sent us). A router is awake by definition,
+ * so it needs no wake-up preamble; a leaf is asleep most of the time and
+ * needs one. Unknown until the peer speaks - assumed asleep, because that is
+ * the safe default. */
+static uint8_t peer_router;
 
 /* A tag has taken the transfer on (IMG_ACK(off = 0) after IMG_BEGIN). */
 static uint8_t xfer_active;
@@ -326,23 +339,70 @@ static void host_status(uint8_t status, uint8_t detail) __reentrant
  * did it say" without a logic analyser. */
 #define AP_LINK_DEBUG 1
 
-/* Send one radio packet and put the receiver back on the air. radio_tx()
- * powers the chip down when it is done (radio.c), so without this the tag's
- * answer - and every later announcement - would be missed. Doing it in one
- * place also covers the radio_tx() failure path. */
-static uint8_t radio_send(const uint8_t *pkt, uint8_t len) __reentrant
+/* Send one application payload to @p dst over the link, and leave the
+ * receiver on the air (sk_link does that itself - radio_tx() powers the chip
+ * down when it is done, so without it the tag's answer, and every later
+ * announcement, would be missed).
+ *
+ * @p wor selects the wake-on-radio preamble. A leaf tag is asleep in WOR
+ * most of the time, and a normal 32-bit preamble can pass entirely between
+ * two of its wake-ups, so the frames that have to reach a sleeping tag -
+ * IMG_BEGIN, and the retries of anything - go out behind the vendor's long
+ * WOR preamble instead. The frames in the middle of a transfer do not: the
+ * tag has just answered, so it is awake and the long preamble would only
+ * cost air time. */
+static uint8_t radio_send(uint32_t dst, const uint8_t __xdata *pkt, uint8_t len,
+                          uint8_t wor) __reentrant
 {
-    uint8_t err = radio_tx(pkt, len);
+    uint8_t err = wor ? sk_link_send_wor(dst, pkt, len)
+                      : sk_link_send(dst, pkt, len);
 
-    radio_rx_start();
 #if AP_LINK_DEBUG
     uart_puts("link: sent type ");
     uart_puthex8(len > 1 ? pkt[1] : 0);
     uart_puts(" len ");
     uart_puthex8(len);
+    if (wor)
+        uart_puts(" wor");
     uart_puts(err ? " FAILED\r\n" : "\r\n");
 #endif
     return err;
+}
+
+/* Print a frame's record route, e.g. " via A3F1 -> 7C02 (2 hops)".
+ * The route is the mesh's answer to "which way did that packet take": every
+ * router that forwarded it appended its own two-byte short id (sk_link.h),
+ * so this is the actual chain, not an inference. Nothing is printed for a
+ * frame that came straight here - the common case should not get noisier. */
+static void print_route(void) __reentrant
+{
+    uint8_t n = sk_link_route_len();
+    uint8_t i;
+
+    if (!n)
+        return;
+    uart_puts(" via ");
+    for (i = 0; i < n; i++) {
+        if (i)
+            uart_puts(" -> ");
+        uart_puthex8((uint8_t)(sk_link_route(i) >> 8));
+        uart_puthex8((uint8_t)sk_link_route(i));
+    }
+    uart_puts(" (");
+    uart_puthex8(n);
+    uart_puts(" hops, ");
+    uart_puthex8(sk_link_hops());
+    uart_puts(" left)");
+}
+
+/* Remember whether the peer is a router, from the role flag of the last frame
+ * it sent (sk_link.h). Only frames from this transfer's target count: another
+ * tag announcing itself must not change how we address this one. Called after
+ * every poll, so it is up to date before the next frame goes out. */
+static void note_peer(void) __reentrant
+{
+    if (xfer_slen && sk_link_origin() == xfer_id)
+        peer_router = sk_link_sender_router();
 }
 
 /* Serials are compared case-insensitively: the tag folds case, so the same
@@ -385,57 +445,81 @@ static void report_foreign_status(const uint8_t *pkt, uint8_t n) __reentrant
 /* Poll the receiver for @p ms milliseconds and pick out the tag's answer.
  *
  * Polling rather than sleeping, because the answer can land at any point in
- * the window and radio_rx() is non-blocking: the packet is taken as it
+ * the window and sk_link_poll() is non-blocking: the frame is taken as it
  * arrives. Anything that is not an answer *to this transfer* - another tag
- * announcing, a frame whose XOR checksum did not survive the air, another
- * tag's refusal - is dropped and the wait carries on. The loop is bounded by
- * @p ms iterations, so neither noise nor a tag that never answers can keep
- * this here forever. */
+ * announcing, another tag's refusal, this node's own frame coming back
+ * through a relay - is dropped and the wait carries on. The loop is bounded
+ * by @p ms iterations, so neither noise nor a tag that never answers can
+ * keep this here forever. */
 static uint8_t radio_wait_reply(uint16_t ms) __reentrant
 {
     uint8_t len, n;
 
     while (ms--) {
-        len = radio_rx(rx_pkt, SK_PKT_MAX);
+        len = sk_link_poll(rx_pkt, SK_PKT_MAX);
+        note_peer();
         if (!len) {
+#if AP_LINK_DEBUG
+            /* Two things worth a line even though neither is an answer: a
+             * frame whose CRC did not survive the air (the link layer drops
+             * it before we see it - this is the distinction between "the
+             * radio is hearing nothing" and "the radio is hearing rubbish"),
+             * and this node's own message handed back by a relay, which is
+             * the proof that the mesh is relaying. */
+            if (sk_link_bad()) {
+                uart_puts("link: bad frame dropped (CRC or framing)\r\n");
+            } else if (sk_link_dup()) {
+                /* A duplicate: the same (origin, seq) as something already
+                 * handled. For the node that sent it, this is the proof that
+                 * the mesh is relaying it; for anything else it is a repeat
+                 * that was dropped where it stands. */
+                uart_puts("link: duplicate msg ");
+                uart_puthex8(sk_link_seq());
+                uart_puts(sk_link_origin() == sk_link_id()
+                          ? " (our own, handed back by a relay)"
+                          : " (already seen, dropped)");
+                print_route();
+                uart_puts("\r\n");
+            }
+#endif
             delay(1000);            /* libmf's delay(): ~1 ms per unit */
             continue;
         }
 
 #if AP_LINK_DEBUG
         /* Everything heard, before any filtering - this is the line that
-         * says whether the tag answered at all, and whether its XOR survived
-         * the air. Without it a rejected answer is indistinguishable from
-         * silence. */
+         * says whether the tag answered at all, how far it had to travel and
+         * how strong it was. Without it a rejected answer is
+         * indistinguishable from silence. */
         uart_puts("link: heard len ");
         uart_puthex8(len);
         uart_puts(" type ");
         uart_puthex8(len > 1 ? rx_pkt[1] : 0);
-        uart_puts(sk_checksum(rx_pkt, (uint8_t)(len - 1)) == rx_pkt[len - 1]
-                  ? " xor ok\r\n" : " xor BAD\r\n");
+        uart_puts(" rssi=");
+        uart_putdec(sk_link_rssi());
+        print_route();
+        uart_puts("\r\n");
 #endif
 
-        if (len < SK_HDR_LEN + 1)
-            continue;               /* no room for a type and a checksum */
+        if (len < SK_MIN_PAYLOAD)
+            continue;               /* no room for a type byte */
         if (rx_pkt[0] != SK_PROTO_VERSION)
             continue;
-        if (sk_checksum(rx_pkt, (uint8_t)(len - 1)) != rx_pkt[len - 1])
-            continue;
 
-        if (rx_pkt[1] == SK_PKT_IMG_ACK && len >= 6) {
-            /* [ver][type][off hi][off lo][status][xor]. Only the addressed
-             * tag ever acknowledges, so an ACK needs no attribution. */
+        if (rx_pkt[1] == SK_PKT_IMG_ACK && len >= 5) {
+            /* [ver][type][off hi][off lo][status]. Only the addressed tag
+             * ever acknowledges, so an ACK needs no attribution. */
             reply_off = (uint16_t)(((uint16_t)rx_pkt[2] << 8) | rx_pkt[3]);
             reply_status = rx_pkt[4];
             return REPLY_ACK;
         }
         if (rx_pkt[1] == SK_PKT_IMG_STATUS) {
-            /* [ver][type][slen][serial n][status][xor]. Every tag that heard
-             * the IMG_BEGIN but is not the target answers one of these with
+            /* [ver][type][slen][serial n][status]. Every tag that heard the
+             * IMG_BEGIN but is not the target answers one of these with
              * SK_ST_BAD_SERIAL, so the serial is what decides whether this is
              * a verdict on our transfer or somebody else's business. */
             n = rx_pkt[2];
-            if (n < 1 || n > SK_SERIAL_MAX || len != (uint8_t)(n + 5))
+            if (n < 1 || n > SK_SERIAL_MAX || len != (uint8_t)(n + 4))
                 continue;           /* unreadable: it must not kill a transfer */
             if (xfer_slen != n || !serial_eq(rx_pkt + SK_HDR_LEN, xfer_serial, n)) {
                 report_foreign_status(rx_pkt, n);
@@ -481,15 +565,18 @@ static void link_image_begin(void) __reentrant
     tx_pkt[SK_HDR_LEN + n + 2] = ser_buf[5 + n];    /* image CRC hi */
     tx_pkt[SK_HDR_LEN + n + 3] = ser_buf[6 + n];    /* image CRC lo */
     len = (uint8_t)(SK_HDR_LEN + n + 4);
-    tx_pkt[len] = sk_checksum(tx_pkt, len);
-    len++;
 
     /* Remember who this is addressed to, before the first wait: every later
      * answer is checked against it, so that another tag's refusal of this
-     * broadcast is not mistaken for the target's verdict. */
+     * broadcast is not mistaken for the target's verdict. And the id: every
+     * frame after this one is addressed to that id rather than broadcast, so
+     * a mesh carries one tag's image blocks to that tag instead of filling
+     * the house with them. */
     for (i = 0; i < n; i++)
         xfer_serial[i] = ser_buf[3 + i];
     xfer_slen = n;
+    xfer_id = sk_id_from_serial((const char *)xfer_serial, xfer_slen);
+    peer_router = 0;             /* unknown again until this tag answers */
     xfer_total = (uint16_t)(((uint16_t)ser_buf[3 + n] << 8) | ser_buf[4 + n]);
 
     /* A new BEGIN supersedes whatever was running: the protocol allows one
@@ -499,7 +586,12 @@ static void link_image_begin(void) __reentrant
 
     waited = 0;
     for (t = 0; t < LINK_BEGIN_TRIES; t++) {
-        if (radio_send(tx_pkt, len)) {
+        /* Broadcast (every tag hears it and the ones it is not for refuse
+         * it, which is how "wrong tag" is told from "no tag"), and behind
+         * the wake-on-radio preamble: the tag this is for may be a battery
+         * leaf asleep in WOR, and this frame is the one that has to reach
+         * it. */
+        if (radio_send(SK_LINK_BROADCAST, tx_pkt, len, (uint8_t)!peer_router)) {
             host_status(SK_ST_BAD_SERIAL, LINK_D_RADIO);
             return;
         }
@@ -584,14 +676,19 @@ static void link_image_data(void) __reentrant
     for (i = 0; i < k; i++)
         tx_pkt[4 + i] = ser_buf[4 + i];
     len = (uint8_t)(4 + k);
-    tx_pkt[len] = sk_checksum(tx_pkt, len);
-    len++;
 
     /* The tag has this block once it reports every byte below off + k. */
     want = (uint16_t)(off + k);
 
     for (t = 0; t < LINK_DATA_TRIES; t++) {
-        if (radio_send(tx_pkt, len)) {
+        /* Addressed to the target tag's id, so a mesh relays one tag's image
+         * blocks towards that tag rather than filling the house with them.
+         * The first attempt uses the short preamble - the tag has just
+         * answered a block, so it is awake - and a retry does not: silence
+         * may mean the tag has dropped back into wake-on-radio, and only the
+         * long preamble reaches it there. */
+        if (radio_send(xfer_id, tx_pkt, len,
+                       (uint8_t)(!peer_router && t > 0))) {
             host_status(SK_ST_BAD_SERIAL, LINK_D_RADIO);
             return;
         }
@@ -660,9 +757,13 @@ static void link_image_end(void) __reentrant
 
     tx_pkt[0] = SK_PROTO_VERSION;
     tx_pkt[1] = SK_PKT_IMG_END;
-    tx_pkt[2] = sk_checksum(tx_pkt, 2);     /* the XOR covers the first two */
 
-    if (radio_send(tx_pkt, 3)) {
+    /* Addressed to the tag, and behind the WOR preamble on the first
+     * attempt: the tag has just finished the last block, but between that
+     * answer and this frame is exactly the kind of gap in which a leaf drops
+     * back to wake-on-radio, and losing this frame costs the whole ~20 s
+     * refresh wait before the resend rescues it. */
+    if (radio_send(xfer_id, tx_pkt, 2, (uint8_t)!peer_router)) {
         host_status(SK_ST_BAD_SERIAL, LINK_D_RADIO);
         return;
     }
@@ -674,7 +775,7 @@ static void link_image_end(void) __reentrant
          * not the tag being slow. Send it once more - and only once, because
          * a third would mean the tag is not there at all and the host should
          * be told rather than kept waiting. */
-        if (radio_send(tx_pkt, 3)) {
+        if (radio_send(xfer_id, tx_pkt, 2, (uint8_t)!peer_router)) {
             host_status(SK_ST_BAD_SERIAL, LINK_D_RADIO);
             return;
         }
@@ -861,12 +962,14 @@ static uint8_t serial_poll(void) __reentrant
 
 /* ── reporting ────────────────────────────────────────────────────────── */
 
-/* One accepted radio packet, while no host frame is being bridged. */
+/* One accepted application payload, while no host frame is being bridged.
+ * The link layer has already checked the frame's CRC and decided the frame
+ * was for this node, so what is left is the application's own business. */
 static void report_packet(const uint8_t *payload, uint8_t len, int8_t rssi)
 {
     uint8_t n, i;
 
-    if (len < SK_HDR_LEN + 1) {
+    if (len < SK_MIN_PAYLOAD) {
         uart_puts("?? short packet (");
         uart_puthex8(len);
         uart_puts(" bytes)\r\n");
@@ -878,17 +981,11 @@ static void report_packet(const uint8_t *payload, uint8_t len, int8_t rssi)
         uart_puts("\r\n");
         return;
     }
-    if (sk_checksum(payload, (uint8_t)(len - 1)) != payload[len - 1]) {
-        uart_puts("?? checksum mismatch (");
-        uart_puthex8(len);
-        uart_puts(" bytes, noise?)\r\n");
-        return;
-    }
 
     if (payload[1] == SK_PKT_ANNOUNCE) {
         n = payload[2];
-        if (n > (uint8_t)(len - SK_HDR_LEN - 1))
-            n = (uint8_t)(len - SK_HDR_LEN - 1);    /* trust the packet, not the field */
+        if (n > (uint8_t)(len - SK_HDR_LEN))
+            n = (uint8_t)(len - SK_HDR_LEN);    /* trust the packet, not the field */
 
         uart_puts("TAG ");
         for (i = 0; i < n; i++) {
@@ -898,6 +995,16 @@ static void report_packet(const uint8_t *payload, uint8_t len, int8_t rssi)
         uart_puts(" rssi=");
         uart_putdec(rssi);
         uart_puts("\r\n");
+        /* The route on its own line, not appended to the TAG line: the host
+         * tool's check-in format is exactly "TAG <serial> rssi=<db>" and
+         * tools/tests/test_send_image.py pins that rule, including that
+         * trailing junk is *not* a check-in. Appending here would silently
+         * stop --watch from recognising the tag, so the path goes below. */
+        if (sk_link_route_len()) {
+            uart_puts("   path");
+            print_route();
+            uart_puts("\r\n");
+        }
         uart_flush();
         return;
     }
@@ -906,11 +1013,12 @@ static void report_packet(const uint8_t *payload, uint8_t len, int8_t rssi)
      * air mangled, or one that answered after the host gave up. Printed
      * anyway - it is the only window into the tag's side of the protocol, and
      * exactly what is wanted while the tag firmware is being brought up. */
-    if (payload[1] == SK_PKT_IMG_ACK && len >= 6) {
+    if (payload[1] == SK_PKT_IMG_ACK && len >= 5) {
         uart_puts("ACK off=");
         uart_puthex16((uint16_t)(((uint16_t)payload[2] << 8) | payload[3]));
         uart_puts(" st=");
         uart_puthex8(payload[4]);
+        print_route();
         uart_puts(" (no transfer)\r\n");
         uart_flush();
         return;
@@ -921,6 +1029,7 @@ static void report_packet(const uint8_t *payload, uint8_t len, int8_t rssi)
             n = (uint8_t)(len - SK_HDR_LEN - 1);
         uart_puts("IMG_STATUS st=");
         uart_puthex8(payload[SK_HDR_LEN + n]);
+        print_route();
         uart_puts(" (no transfer)\r\n");
         uart_flush();
         return;
@@ -1048,8 +1157,16 @@ void main()
     uart_puts(", VCOI ");
     uart_puthex8(d[RADIO_DIAG_VCOI]);
     uart_puts(")\r\nlistening: 868.300 MHz, 4800 bit/s, FSK\r\n");
+    uart_puts("link: router id ");
+    uart_puthex8((uint8_t)(SK_LINK_AP_ID >> 24));
+    uart_puthex8((uint8_t)(SK_LINK_AP_ID >> 16));
+    uart_puthex8((uint8_t)(SK_LINK_AP_ID >> 8));
+    uart_puthex8((uint8_t)SK_LINK_AP_ID);
+    uart_puts(", relaying for others\r\n");
     uart_flush();
 
+    sk_link_init(SK_ROLE_ROUTER, SK_LINK_AP_ID);
+    sk_link_rx_mode(SK_RX_CONTINUOUS);
     radio_rx_start();
 
     for (;;) {
@@ -1059,12 +1176,33 @@ void main()
         if (serial_poll())
             link_frame();
 
-        len = radio_rx(rx_pkt, sizeof rx_pkt);
+        len = sk_link_poll(rx_pkt, sizeof rx_pkt);
+        note_peer();
         if (len) {
-            report_packet(rx_pkt, len, radio_rssi());
+            report_packet(rx_pkt, len, sk_link_rssi());
             PIN_SET_LOW(LEDB_PORT, LEDB_PIN);   /* blue LED: one packet */
             led_hold = LED_HOLD_PASSES;
-        } else if (led_hold) {
+        } else if (sk_link_relayed()) {
+            /* This node just relayed somebody else's frame. The one line
+             * that makes the mesh visible: without it, a router's console
+             * shows nothing at all about the traffic it is carrying. */
+            uart_puts("relay msg ");
+            uart_puthex8(sk_link_seq());
+            uart_puts(" origin ");
+            uart_puthex8((uint8_t)(sk_link_origin() >> 24));
+            uart_puthex8((uint8_t)(sk_link_origin() >> 16));
+            uart_puthex8((uint8_t)(sk_link_origin() >> 8));
+            uart_puthex8((uint8_t)sk_link_origin());
+            uart_puts(" hops ");
+            uart_puthex8(sk_link_hops());
+            uart_puts("->");
+            uart_puthex8((uint8_t)(sk_link_hops() - 1));
+            uart_puts("\r\n");
+        } else if (sk_link_bad()) {
+            uart_puts("link: bad frame dropped (CRC or framing)\r\n");
+        }
+
+        if (!len && led_hold) {
             if (!--led_hold)
                 PIN_SET_HIGH(LEDB_PORT, LEDB_PIN);
         }

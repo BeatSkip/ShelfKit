@@ -1,3 +1,6 @@
 # Compiled host-test binaries
 *.exe
 *.out
+
+# Object files from the C tests
+*.o

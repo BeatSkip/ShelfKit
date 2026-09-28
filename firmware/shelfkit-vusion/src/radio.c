@@ -17,9 +17,11 @@
  * Every block below names the reference function it mirrors, so the two can
  * be diffed by eye. What is *not* copied is the Vusion MAC: no address
  * bytes, no ACKs, no channel hopping, no software CRC-16. Both ends of this
- * link are our own firmware, so the application packet in
- * firmware/shared/include/shelfkit_proto.h (version, type, serial, XOR
- * checksum) is the whole frame after the length byte.
+ * link are our own firmware, so what follows the length byte is the ShelfKit
+ * link frame from sk_link.c - addressing, a CRC-16, a hop budget and a
+ * record route - whose layout and reasoning are in
+ * firmware/shared/include/shelfkit_proto.h. This driver only knows how long
+ * it is.
  *
  * ── The link ─────────────────────────────────────────────────────────
  *
@@ -94,8 +96,33 @@
 #define RADIO_PWR_XTAL_ON    0x05
 #define RADIO_PWR_FIFO_ON    0x07
 #define RADIO_PWR_FULL_RX    0x09
+#define RADIO_PWR_WOR_RX     0x0B   /* easyax5043.h: AX5043_PWRSTATE_WOR_RX */
 #define RADIO_PWR_SYNTH_TX   0x0C
 #define RADIO_PWR_FULL_TX    0x0D
+
+/* ── wake-on-radio ──────────────────────────────────────────────────────
+ * Both numbers are the vendor's, from config.c's WOR block. RADIO_WOR_PERIOD
+ * is axradio_wor_period (128): the wake-up timer counts LPOSC cycles, and the
+ * LPOSC in LPOSCCONFIG's slow mode is the low-power oscillator the WOR
+ * receiver lives on. RADIO_WOR_PREAMBLE_UNITS is the vendor's wake-up
+ * preamble: axradio_phy_preamble_wor_longlen = 4 plus
+ * axradio_phy_preamble_wor_len = 160, whose own comment says the two "total
+ * to 240.0ms plus 32bits" - i.e. long enough to span a whole 200 ms-ish
+ * wake-up period at 4800 bit/s, which is the property that matters: a WOR
+ * receiver that is only on for a fraction of each period must find the
+ * preamble still going when it wakes.
+ *
+ * The unit (bytes or bits) is the one thing about these numbers the vendor's
+ * sources do not state, and it decides whether the preamble is ~270 ms or
+ * ~34 ms. The total is used verbatim, in one REPEATDATA chunk, and the
+ * hardware test is what settles it: a tag that does not wake means the count
+ * has to be eight times longer. */
+#ifndef RADIO_WOR_PERIOD
+#define RADIO_WOR_PERIOD          128
+#endif
+#ifndef RADIO_WOR_PREAMBLE_UNITS
+#define RADIO_WOR_PREAMBLE_UNITS  164
+#endif
 
 /* ── FIFOSTAT commands (manual table 64) ─────────────────────────────── */
 #define RADIO_FIFOSTAT_EMPTY 0x01       /* read: FIFO is empty */
@@ -168,7 +195,7 @@
  * alone, or the byte count including the length byte). Too small a value
  * here is a *silent* drop - SIZEFAIL is not in PKTACCEPTFLAGS - so the
  * headroom is worth the byte. */
-#define RADIO_PKTMAXLEN       ((uint8_t)(SK_PKT_MAX + 2))
+#define RADIO_PKTMAXLEN       ((uint8_t)(SK_LINK_MAX + 2))
 /* PKTACCEPTFLAGS: ACCPT LRGP (0x20, from config.c - needed so a packet that
  * spans more than one FIFO chunk is not dropped) | ACCPT ADDRF (0x08, ours).
  * The address check must never cost us a frame, whatever the mask below
@@ -367,6 +394,16 @@ static const radio_reg_t __code radio_regs_rxcont[] = {
     { AX5043_REG_PKTMISCFLAGS,      0x00 }
 };
 
+/* config.c's ax5043_set_registers_rxwor() - the three registers that differ
+ * from the continuous set above, and only those three. See the WOR section
+ * further down for what each one is for; they are the vendor's generated
+ * values, not ours. */
+static const radio_reg_t __code radio_regs_rxwor[] = {
+    { AX5043_REG_TMGRXAGC,          0x0A },
+    { AX5043_REG_TMGRXPREAMBLE1,    0x19 },
+    { AX5043_REG_PKTMISCFLAGS,      0x03 }
+};
+
 /* The four FREQA bytes of channel 0, low byte first (config.c:
  * axradio_phy_chanfreq[0] = 0x21656A57 -> 868.300001 MHz). */
 static const uint8_t __code radio_freqa[4] = { 0x57, 0x6A, 0x65, 0x21 };
@@ -390,9 +427,10 @@ static uint8_t radio_state[RADIO_DIAG_LEN];
 #define RADIO_RANGE()  ((uint8_t)(radio_state[RADIO_DIAG_RANGING] & 0x0F))
 
 /* FIFO image for one transmit, in XRAM: internal RAM belongs to the stack.
- * Four bytes of REPEATDATA preamble, two header + five bytes of sync word,
- * two header + flags + length byte, then the payload. */
-static uint8_t __xdata radio_fifo[16 + SK_PKT_MAX];
+ * Four bytes of REPEATDATA preamble (or six for a wake-on-radio preamble,
+ * whose repeat count is a byte rather than a nibble), two header + five
+ * bytes of sync word, two header + flags + length byte, then the payload. */
+static uint8_t __xdata radio_fifo[18 + SK_LINK_MAX];
 
 /* ── small helpers ──────────────────────────────────────────────────── */
 
@@ -778,17 +816,11 @@ const char *radio_error_str(uint8_t err) __reentrant
     }
 }
 
-/* The protocol's integrity check - lives here because both firmwares link
- * this file and neither should keep its own copy (see shelfkit_proto.h for
- * why the chip's own CRC is switched off). */
-uint8_t sk_checksum(const uint8_t *buf, uint8_t len) __reentrant
-{
-    uint8_t x = 0, i;
-
-    for (i = 0; i < len; i++)
-        x ^= buf[i];
-    return x;
-}
+/* The protocol's integrity check used to live here: a one-byte XOR over the
+ * application payload. It has been replaced by the link frame's CRC-16
+ * (sk_link.c, described in shelfkit_proto.h) because a byte-wide XOR catches
+ * a single flipped bit and very little else - which is exactly what made the
+ * old link "mostly works". */
 
 /* ── transmit ───────────────────────────────────────────────────────────
  * The chunk sequence is the reference's transmit_isr(), for the case that
@@ -809,20 +841,27 @@ uint8_t sk_checksum(const uint8_t *buf, uint8_t len) __reentrant
  *
  * And the order is the reference's: the FIFO is filled in FIFO_ON state,
  * committed, and only then is the transmitter powered up (ax5043_prepare_tx
- * + the tx_xtalwait branch of the SDK's interrupt handler). */
-uint8_t radio_tx(const uint8_t *payload, uint8_t len) __reentrant
+ * + the tx_xtalwait branch of the SDK's interrupt handler).
+ *
+ * The payload is one whole link frame (sk_link.c), not an application
+ * packet: the link layer decides what a frame looks like and this driver
+ * only knows how long it is. */
+uint8_t radio_tx_pre(const uint8_t *payload, uint8_t len,
+                     uint16_t preamble) __reentrant
 {
     uint8_t n = 0;
     uint8_t i;
     uint16_t t;
 
-    if (!len || len > SK_PKT_MAX)
+    if (!len || len > SK_LINK_MAX)
         return RADIO_ERR_TX_LEN;
 
-    /* Preamble: REPEATDATA, unencoded alternating bits. */
+    /* Preamble: REPEATDATA, unencoded alternating bits. The repeat count is
+     * a byte here because a wake-on-radio preamble is far longer than the
+     * 32-bit one: see RADIO_WOR_PREAMBLE_UNITS. */
     radio_fifo[n++] = RADIO_CHUNK_REPEAT;
     radio_fifo[n++] = RADIO_BYPASS_FLAGS;
-    radio_fifo[n++] = RADIO_PREAMBLE_BYTES;
+    radio_fifo[n++] = (uint8_t)preamble;
     radio_fifo[n++] = RADIO_PREAMBLE_BYTE;
 
     /* Sync word: its own DATA chunk, raw and unencoded, in on-air order. */
@@ -879,6 +918,106 @@ uint8_t radio_tx(const uint8_t *payload, uint8_t len) __reentrant
     radio_write8(AX5043_REG_PWRMODE, RADIO_PWR_POWERDOWN);
 
     return t ? RADIO_OK : RADIO_ERR_TX_FIFO;
+}
+
+/* One packet with the normal 32-bit preamble - what every frame uses except
+ * the first one to a peer that may be asleep. */
+uint8_t radio_tx(const uint8_t *payload, uint8_t len) __reentrant
+{
+    return radio_tx_pre(payload, len, RADIO_PREAMBLE_BYTES);
+}
+
+/* One packet behind a wake-on-radio preamble. See the WOR section below for
+ * where RADIO_WOR_PREAMBLE_UNITS comes from. In WOR mode the receiver is only
+ * on for a fraction of each wake-up period, so it cannot be expected to
+ * catch a normal 32-bit preamble; the long one spans at least one whole
+ * period. The transmitter is otherwise identical, and the packet itself is
+ * exactly the same bytes. */
+uint8_t radio_tx_wor(const uint8_t *payload, uint8_t len) __reentrant
+{
+    return radio_tx_pre(payload, len, RADIO_WOR_PREAMBLE_UNITS);
+}
+
+/* ── wake-on-radio ──────────────────────────────────────────────────────
+ *
+ * The biggest single power lever on a battery tag. Left in continuous
+ * receive (radio_rx_start above), the AX5043 spends its whole life listening
+ * - roughly 12 mA plus the front end's bias, whether or not anything is
+ * there. In WOR the receiver wakes itself every RADIO_WOR_PERIOD low-power
+ * oscillator cycles, listens for about a preamble's worth of time
+ * (TMGRXPREAMBLE1), and sleeps in between, so the average receive current
+ * falls by roughly the duty cycle. The e-paper refresh remains the largest
+ * single energy cost in the tag's life - the point of WOR is not to transmit
+ * less, it is to never sit in receive.
+ *
+ * The sequence follows easyax5043.c's ax5043_receiver_on_wor() line for
+ * line, with the vendor's generated register values:
+ *
+ *   BGNDRSSIGAIN = 0x02     easyax5043.c writes this first. It is the
+ *                           background RSSI measurement's gain, and the
+ *                           vendor sets it for WOR only; the continuous
+ *                           receiver leaves the RadioLAB value alone.
+ *   FIFOSTAT = 3            clear FIFO data and flags, as every receive
+ *                           start does.
+ *   LPOSCCONFIG = 0x01      "start LPOSC, slow mode" - the low-power
+ *                           oscillator the wake-up timer counts.
+ *   RSSIREFERENCE = 0x3A    the same reference as the continuous receiver
+ *                           (config.c: 0xFA + 64).
+ *   TMGRXAGC = 0x0A         from config.c's ax5043_set_registers_rxwor().
+ *   TMGRXPREAMBLE1 = 0x19   from the same table: how much preamble the
+ *                           receiver waits for before it commits to the
+ *                           packet. Only a WOR receiver needs it, because
+ *                           only a WOR receiver is likely to wake up in the
+ *                           middle of a preamble.
+ *   PKTMISCFLAGS = 0x03     RXRSSICLK | RXAGCCLK (manual table 184). The
+ *                           vendor's WOR value. Bit 4 (WORMULTIPKT, "stay on
+ *                           after a packet") is deliberately clear, as in
+ *                           the vendor's table: whether this tag stays awake
+ *                           afterwards is the firmware's business, and the
+ *                           tag does exactly that by calling radio_rx_start()
+ *                           when it hears something (see the tag's main.c).
+ *   PKTSTOREFLAGS &= ~0x40  the same "no RSSI/timer chunks in front of the
+ *                           packet" rule the continuous receiver applies.
+ *   PWRMODE = WOR_RX        the mode itself.
+ *   WAKEUPFREQ = period     the wake-up period in LPOSC cycles, and
+ *   WAKEUP = period + WAKEUPTIMER   the first wake-up, measured from now.
+ *
+ * Two things the vendor does that are deliberately not done here, because
+ * the vendor's own guard for them is false on this board:
+ *
+ *   * the F143_WOR_TCXO power-interrupt dance (IRQMASK0 |= 0x80 and
+ *     POWIRQMASK = 0x90). easyax5043.c only arms it when the TCXO_EN signal
+ *     is passed through to a GPIO - `(PALTRADIO & 0x40) && (PINFUNCPWRAMP &
+ *     0x0F) == 0x07`. config.c sets PALTRADIO = 0x00 and PINFUNCPWRAMP =
+ *     0x82, so the condition is false. If WOR ever fails to wake on this
+ *     hardware, that is the first thing to add.
+ *   * the interrupt enables themselves. This driver polls FIFOSTAT; it never
+ *     enables a radio interrupt and the firmware never enables the radio
+ *     interrupt at the MCU either, which is why the receiver-on path below
+ *     leaves both masks clear. */
+void radio_rx_wor_start(void) __reentrant
+{
+    uint16_t wp;
+
+    radio_init_registers_rx();
+    radio_write8(AX5043_REG_BGNDRSSIGAIN, 0x02);
+    radio_write8(AX5043_REG_FIFOSTAT, RADIO_FIFOCMD_CLEAR);
+    radio_write8(AX5043_REG_LPOSCCONFIG, 0x01);
+    radio_write8(AX5043_REG_RSSIREFERENCE, RADIO_RSSI_REFERENCE);
+    radio_apply(radio_regs_rxwor,
+                (uint8_t)(sizeof radio_regs_rxwor / sizeof radio_regs_rxwor[0]));
+    radio_write8(AX5043_REG_PKTSTOREFLAGS, 0x00);
+    radio_write8(AX5043_REG_IRQMASK0, 0x00);
+    radio_write8(AX5043_REG_IRQMASK1, 0x00);
+
+    radio_write8(AX5043_REG_PWRMODE, RADIO_PWR_WOR_RX);
+
+    wp = RADIO_WOR_PERIOD;
+    radio_write8(AX5043_REG_WAKEUPFREQ1, (uint8_t)(wp >> 8));
+    radio_write8(AX5043_REG_WAKEUPFREQ0, (uint8_t)wp);
+    wp = (uint16_t)(wp + radio_read16(AX5043_REG_WAKEUPTIMER1));
+    radio_write8(AX5043_REG_WAKEUP1, (uint8_t)(wp >> 8));
+    radio_write8(AX5043_REG_WAKEUP0, (uint8_t)wp);
 }
 
 /* ── receive ────────────────────────────────────────────────────────────
