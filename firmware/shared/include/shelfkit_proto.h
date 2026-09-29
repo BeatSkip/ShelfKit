@@ -71,7 +71,7 @@
  * The CRC is the link's only integrity check and it is the one the UART side
  * already uses: CRC-16/CCITT-FALSE, poly 0x1021, init 0xFFFF, MSB first, no
  * reflection, no final xor. Check value of "123456789" is 0x29B1, pinned by
- * tools/tests/sk_link_test.c and by tools/tests/test_send_image.py. Note that
+ * tools/tests/sk_link_test.c and by tools/tests/test_ap_server.py. Note that
  * libmf's *other* entry point, crc_crc16_msb() (poly 0x8005), is a different
  * CRC entirely - the names are one letter apart, so sk_link.c implements its
  * own rather than trusting a name lookup.

@@ -10,7 +10,7 @@
  * range:
  *
  *   *** ShelfKit access point ***
- *   radio ready (silicon rev 51, PLLRANGINGA 0A PLL locked, VCOI 9B)
+ *   radio ready (silicon rev 51, PLLRANGINGA CA PLL locked, VCOI 9B)
  *   listening: 868.300 MHz, 4800 bit/s, FSK
  *   TAG 1408F525 rssi=-42
  *   TAG 1408F525 rssi=-41
@@ -25,6 +25,24 @@
  * it until the tag acknowledges it, and answers with the offset the tag has
  * confirmed (SK_U_ACK) or with a status (SK_U_STATUS). One host frame in, one
  * answer out: the host is never more than one block ahead of the tag's flash.
+ *
+ * ── Tracing ──────────────────────────────────────────────────────────────
+ * Both jobs narrate themselves on the same UART, interleaved with the binary
+ * answers, so the console is the whole story of a transfer:
+ *
+ *   ser: rx IMG_DATA len 62 crc ok            the host's frame arrived intact
+ *   xfer: data @0060 k=60 want=00C0           what it is for
+ *   link: tx IMG_DATA len 64 dst E5C0F240 try 1/10 wor
+ *   link: heard IMG_ACK len 05 origin ... rssi=-42
+ *   xfer: block @0060 stored, the tag is at 00C0
+ *   ser: tx ACK off=00C0 st=00 OK             what the host was told
+ *
+ * AP_TRACE (below, next to the includes) sets how much of it there is:
+ * 0 silences it, 1 (default) is the trace above, 2 adds a heartbeat for each
+ * wait window and the parser's own recovery steps. The lines are plain ASCII
+ * and no line can contain 0xAA or 0x55, so a host tool resynchronises on the
+ * frame sync and reads them as text (tools/ap_server.py prints them as
+ * "ap: ...").
  *
  * The air protocol is in firmware/shared/include/shelfkit_proto.h; the link
  * parameters live in radio.h and must match the tag firmware.
@@ -51,6 +69,37 @@
 #include "uart.h"
 #include "shelfkit_proto.h"
 
+/* ── console trace ──────────────────────────────────────────────────────
+ *
+ * How much the bridge says about itself on the serial port. This is the
+ * "where did the transfer stop" feedback: the same UART carries the
+ * operator's lines (the banner, "TAG ...") and these, so a single terminal -
+ * or tools/ap_server.py, which prints them as "ap: ..." - shows both sides
+ * of the bridge without a logic analyser.
+ *
+ *   0   only the operator's lines: the banner and "TAG <serial> rssi=<db>"
+ *   1   the bridge trace (default): every host frame parsed, every radio
+ *       frame sent and heard, every retry, every verdict handed back
+ *   2   also a heartbeat for each wait window that is running out, and the
+ *       serial parser's own recovery steps
+ *
+ * The lines are plain ASCII interleaved with the binary answers. A host tool
+ * resynchronises on the frame sync bytes (ap_server.py does), and no line
+ * can contain 0xAA or 0x55, so this is safe to leave on at level 1.
+ *
+ * Level 2 is for a link that is being brought up and is genuinely noisy: a
+ * line every 250 ms per wait window costs air-independent wall time, which
+ * delays the retry that follows it. Build it with
+ * `tools/build_firmware.ps1 -Define AP_TRACE=2`.
+ *
+ * This has to be defined before its first use, and the first use is the
+ * answer printer (host_ack) rather than the radio path: with the #define
+ * further down, `#if AP_TRACE >= 1` there silently evaluated 0 and every
+ * "ser: tx ..." line vanished - a trace that looks complete and is not. */
+#ifndef AP_TRACE
+#define AP_TRACE 1
+#endif
+
 /* ── UART RX pipe ───────────────────────────────────────────────────────
  *
  * The UART has one receive register, so a byte that arrives while we are not
@@ -67,6 +116,12 @@ static uint8_t __xdata uart_rxfifo[UART_RXFIFO_SIZE];
 static uint8_t uart_rxfifo_rd;
 static uint8_t uart_rxfifo_wr;
 
+/* Set when a byte arrives with the ring full and has to be dropped. A flag
+ * rather than a trace line: uart_rx_pump() runs inside the transmit path
+ * (uart_putc() calls it), so printing from here would recurse through the
+ * UART and can overflow the stack. The main loop reports it instead. */
+static uint8_t uart_rx_overrun;
+
 /* Move whatever the receiver has into the ring. Never blocks: it stops as
  * soon as the UART has nothing more, and stops early if the ring is full
  * (that byte then stays in U0SHREG and the next one overruns it, which costs
@@ -76,8 +131,10 @@ static void uart_rx_pump(void) __reentrant
     while (uart_rx_ready()) {
         uint8_t w = (uint8_t)((uart_rxfifo_wr + 1) & UART_RXFIFO_MASK);
 
-        if (w == uart_rxfifo_rd)
+        if (w == uart_rxfifo_rd) {
+            uart_rx_overrun = 1;
             return;
+        }
         uart_rxfifo[uart_rxfifo_wr] = uart_getc();
         uart_rxfifo_wr = w;
     }
@@ -120,26 +177,113 @@ static void uart_puthex16(uint16_t v)
     uart_puthex8((uint8_t)v);
 }
 
-/* Signed decimal, for the RSSI. RSSI is negative or zero dB. */
+/* Unsigned decimal.
+ *
+ * The RSSI is negative or zero dB, but the trace mostly prints *counts* -
+ * millisecond budgets and attempt numbers - and those run past the signed
+ * 16-bit range: the END wait alone is 60000 ms. A single signed printer built
+ * on `u = (uint16_t)(-v)` would print 60000 as -5536, which is exactly the
+ * kind of quiet wrongness a trace exists to prevent, so the counts go through
+ * this one and only the RSSI goes through the signed wrapper below. */
+static void uart_putdecu(uint16_t u)
+{
+    uint16_t div = 10000;
+    uint8_t started = 0;
+
+    while (div) {
+        uint8_t d = (uint8_t)(u / div);
+
+        if (d || started || div == 1) {
+            uart_putc((uint8_t)('0' + d));
+            started = 1;
+        }
+        u = (uint16_t)(u % div);
+        div = (uint16_t)(div / 10);
+    }
+}
+
+/* Signed decimal, for the RSSI (negative or zero dB, so never large). */
 static void uart_putdec(int16_t v)
 {
-    uint16_t u;
-
     if (v < 0) {
         uart_putc('-');
-        u = (uint16_t)(-v);
-    } else {
-        u = (uint16_t)v;
+        uart_putdecu((uint16_t)(-v));
+        return;
     }
+    uart_putdecu((uint16_t)v);
+}
 
-    if (u >= 100) {
-        uart_putc((uint8_t)('0' + (u / 100)));
-        u = (uint16_t)(u % 100);
-        uart_putc((uint8_t)('0' + (u / 10)));
-    } else if (u >= 10) {
-        uart_putc((uint8_t)('0' + (u / 10)));
+/* ── trace vocabulary ───────────────────────────────────────────────────
+ *
+ * Names rather than bare hex, so a console line reads "IMG_DATA" and
+ * "BAD_SERIAL" and the operator does not have to keep shelfkit_proto.h open
+ * next to the terminal. All of these are plain uart_puts() calls with no
+ * storage behind them, so they cost ROM (of which there is plenty) and no
+ * RAM (of which on this part there is not). */
+
+/* A 32-bit node id, in the byte order a frame carries it. */
+static void uart_putid(uint32_t v)
+{
+    uart_puthex8((uint8_t)(v >> 24));
+    uart_puthex8((uint8_t)(v >> 16));
+    uart_puthex8((uint8_t)(v >> 8));
+    uart_puthex8((uint8_t)v);
+}
+
+/* A serial number as it travels on the air: everything outside printable
+ * ASCII becomes '?', the same rule report_packet() uses for the TAG line. */
+static void uart_putprintable(const uint8_t *p, uint8_t n) __reentrant
+{
+    uint8_t i;
+
+    for (i = 0; i < n; i++) {
+        uint8_t c = p[i];
+
+        uart_putc((c >= 32 && c <= 126) ? c : '?');
     }
-    uart_putc((uint8_t)('0' + (u % 10)));
+}
+
+/* Application packet type (the second byte of a radio payload). */
+static void uart_putpkt(uint8_t type)
+{
+    switch (type) {
+    case SK_PKT_ANNOUNCE:   uart_puts("ANNOUNCE");   break;
+    case SK_PKT_IMG_BEGIN:  uart_puts("IMG_BEGIN");  break;
+    case SK_PKT_IMG_DATA:   uart_puts("IMG_DATA");   break;
+    case SK_PKT_IMG_END:    uart_puts("IMG_END");    break;
+    case SK_PKT_IMG_ACK:    uart_puts("IMG_ACK");    break;
+    case SK_PKT_IMG_STATUS: uart_puts("IMG_STATUS"); break;
+    default:                uart_puts("??");         break;
+    }
+}
+
+/* Host frame type (the third byte of a serial frame). */
+static void uart_puthost(uint8_t type)
+{
+    switch (type) {
+    case SK_U_IMG_BEGIN: uart_puts("IMG_BEGIN"); break;
+    case SK_U_IMG_DATA:  uart_puts("IMG_DATA");  break;
+    case SK_U_IMG_END:   uart_puts("IMG_END");   break;
+    case SK_U_ACK:       uart_puts("ACK");       break;
+    case SK_U_STATUS:    uart_puts("STATUS");    break;
+    default:             uart_puts("??");        break;
+    }
+}
+
+/* Transfer status code (SK_ST_*), the byte both the tag's answers and this
+ * access point's own refusals carry. */
+static void uart_putstatus(uint8_t st)
+{
+    switch (st) {
+    case SK_ST_OK:          uart_puts("OK");          break;
+    case SK_ST_BAD_SERIAL:  uart_puts("BAD_SERIAL");  break;
+    case SK_ST_FLASH:       uart_puts("FLASH");       break;
+    case SK_ST_CRC:         uart_puts("CRC");         break;
+    case SK_ST_OFFSET:      uart_puts("OFFSET");      break;
+    case SK_ST_BUSY:        uart_puts("BUSY");        break;
+    case SK_ST_UNSUPPORTED: uart_puts("UNSUPPORTED"); break;
+    default:                uart_puts("?");           break;
+    }
 }
 
 /* ── state ──────────────────────────────────────────────────────────────
@@ -311,6 +455,19 @@ static void host_begin(uint8_t type, uint8_t len) __reentrant
  * not" without keeping its own idea of what the air did. */
 static void host_ack(uint16_t off, uint8_t status) __reentrant
 {
+#if AP_TRACE >= 1
+    /* Printed *before* the frame bytes: the host resynchronises on 0xAA 0x55,
+     * so text in front of an answer is read as a line and the answer itself
+     * still lands whole. Nothing may be printed after it - that would land in
+     * the middle of the next frame's timing. */
+    uart_puts("ser: tx ACK off=");
+    uart_puthex16(off);
+    uart_puts(" st=");
+    uart_puthex8(status);
+    uart_putc(' ');
+    uart_putstatus(status);
+    uart_puts("\r\n");
+#endif
     host_begin(SK_U_ACK, 3);
     uart_out[4] = (uint8_t)(off >> 8);
     uart_out[5] = (uint8_t)off;
@@ -323,6 +480,23 @@ static void host_ack(uint16_t off, uint8_t status) __reentrant
  * reported goes out unchanged with LINK_D_TAG. */
 static void host_status(uint8_t status, uint8_t detail) __reentrant
 {
+#if AP_TRACE >= 1
+    uart_puts("ser: tx STATUS st=");
+    uart_puthex8(status);
+    uart_putc(' ');
+    uart_putstatus(status);
+    uart_puts(" detail=");
+    uart_puthex8(detail);
+    uart_puts(" (");
+    switch (detail) {
+    case LINK_D_TIMEOUT: uart_puts("the tag never answered");        break;
+    case LINK_D_RADIO:   uart_puts("the radio refused the frame");   break;
+    case LINK_D_NO_XFER: uart_puts("no transfer was open");          break;
+    case LINK_D_TAG:     uart_puts("the tag's own verdict");         break;
+    default:             uart_puts("?");                             break;
+    }
+    uart_puts(")\r\n");
+#endif
     host_begin(SK_U_STATUS, 2);
     uart_out[4] = status;
     uart_out[5] = detail;
@@ -330,14 +504,6 @@ static void host_status(uint8_t status, uint8_t detail) __reentrant
 }
 
 /* ── the radio side of the bridge ─────────────────────────────────────── */
-
-/* Set to 1 to trace the bridge on the serial console: every radio packet
- * sent, and every packet heard while waiting for an answer. The lines are
- * plain text interleaved with the binary answers; the host tool
- * resynchronises on the frame sync and prints them as "ap: ..." lines, so
- * this is safe to leave on. It answers "did the tag answer at all, and what
- * did it say" without a logic analyser. */
-#define AP_LINK_DEBUG 1
 
 /* Send one application payload to @p dst over the link, and leave the
  * receiver on the air (sk_link does that itself - radio_tx() powers the chip
@@ -350,21 +516,36 @@ static void host_status(uint8_t status, uint8_t detail) __reentrant
  * IMG_BEGIN, and the retries of anything - go out behind the vendor's long
  * WOR preamble instead. The frames in the middle of a transfer do not: the
  * tag has just answered, so it is awake and the long preamble would only
- * cost air time. */
+ * cost air time.
+ *
+ * @p attempt and @p tries are only for the trace: they turn "the tag did not
+ * answer" into "this frame went out four times and never came back". */
 static uint8_t radio_send(uint32_t dst, const uint8_t __xdata *pkt, uint8_t len,
-                          uint8_t wor) __reentrant
+                          uint8_t wor, uint8_t attempt, uint8_t tries) __reentrant
 {
     uint8_t err = wor ? sk_link_send_wor(dst, pkt, len)
                       : sk_link_send(dst, pkt, len);
 
-#if AP_LINK_DEBUG
-    uart_puts("link: sent type ");
-    uart_puthex8(len > 1 ? pkt[1] : 0);
+#if AP_TRACE >= 1
+    uart_puts("link: tx ");
+    uart_putpkt(len > 1 ? pkt[1] : 0);
     uart_puts(" len ");
     uart_puthex8(len);
+    uart_puts(" dst ");
+    uart_putid(dst);
+    uart_puts(" try ");
+    uart_putdecu(attempt);
+    uart_puts("/");
+    uart_putdecu(tries);
     if (wor)
         uart_puts(" wor");
-    uart_puts(err ? " FAILED\r\n" : "\r\n");
+    if (err) {
+        /* sk_link_send() refusing means the radio itself would not take the
+         * frame - the one failure the tag can do nothing about. */
+        uart_puts(" FAILED, radio code ");
+        uart_puthex8(err);
+    }
+    uart_puts("\r\n");
 #endif
     return err;
 }
@@ -454,12 +635,15 @@ static void report_foreign_status(const uint8_t *pkt, uint8_t n) __reentrant
 static uint8_t radio_wait_reply(uint16_t ms) __reentrant
 {
     uint8_t len, n;
+#if AP_TRACE >= 2
+    uint16_t spent = 0;             /* milliseconds of this window used so far */
+#endif
 
     while (ms--) {
         len = sk_link_poll(rx_pkt, SK_PKT_MAX);
         note_peer();
         if (!len) {
-#if AP_LINK_DEBUG
+#if AP_TRACE >= 1
             /* Two things worth a line even though neither is an answer: a
              * frame whose CRC did not survive the air (the link layer drops
              * it before we see it - this is the distinction between "the
@@ -475,6 +659,8 @@ static uint8_t radio_wait_reply(uint16_t ms) __reentrant
                  * that was dropped where it stands. */
                 uart_puts("link: duplicate msg ");
                 uart_puthex8(sk_link_seq());
+                uart_puts(" origin ");
+                uart_putid(sk_link_origin());
                 uart_puts(sk_link_origin() == sk_link_id()
                           ? " (our own, handed back by a relay)"
                           : " (already seen, dropped)");
@@ -482,19 +668,36 @@ static uint8_t radio_wait_reply(uint16_t ms) __reentrant
                 uart_puts("\r\n");
             }
 #endif
+#if AP_TRACE >= 2
+            /* A window that is running out with nothing on the air at all.
+             * The one line that tells "the tag is not answering" apart from
+             * "the tag answered and we are still waiting" during a long
+             * wait. */
+            if (++spent && (spent % 250) == 0) {
+                uart_puts("link: waiting, ");
+                uart_putdecu(spent);
+                uart_puts(" ms of ");
+                uart_putdecu(ms);
+                uart_puts(" left, nothing heard\r\n");
+            }
+#endif
             delay(1000);            /* libmf's delay(): ~1 ms per unit */
             continue;
         }
 
-#if AP_LINK_DEBUG
+#if AP_TRACE >= 1
         /* Everything heard, before any filtering - this is the line that
-         * says whether the tag answered at all, how far it had to travel and
+         * says whether the tag answered at all, which way the frame came and
          * how strong it was. Without it a rejected answer is
          * indistinguishable from silence. */
-        uart_puts("link: heard len ");
+        uart_puts("link: heard ");
+        uart_putpkt(len > 1 ? rx_pkt[1] : 0);
+        uart_puts(" len ");
         uart_puthex8(len);
-        uart_puts(" type ");
-        uart_puthex8(len > 1 ? rx_pkt[1] : 0);
+        uart_puts(" origin ");
+        uart_putid(sk_link_origin());
+        uart_puts(" seq ");
+        uart_puthex8(sk_link_seq());
         uart_puts(" rssi=");
         uart_putdec(sk_link_rssi());
         print_route();
@@ -584,6 +787,21 @@ static void link_image_begin(void) __reentrant
      * first. Until the tag answers this one, there is no transfer at all. */
     xfer_active = 0;
 
+#if AP_TRACE >= 1
+    /* The first line of a transfer: who it is for, and the two numbers the
+     * tag will be held to at the end (the image size and its CRC). A serial
+     * that does not match the tag's NFC record fails here, one line later. */
+    uart_puts("xfer: BEGIN serial ");
+    uart_putprintable(xfer_serial, xfer_slen);
+    uart_puts(" id ");
+    uart_putid(xfer_id);
+    uart_puts(" total ");
+    uart_puthex16(xfer_total);
+    uart_puts(" crc ");
+    uart_puthex16((uint16_t)(((uint16_t)ser_buf[5 + n] << 8) | ser_buf[6 + n]));
+    uart_puts("\r\n");
+#endif
+
     waited = 0;
     for (t = 0; t < LINK_BEGIN_TRIES; t++) {
         /* Broadcast (every tag hears it and the ones it is not for refuse
@@ -591,7 +809,8 @@ static void link_image_begin(void) __reentrant
          * the wake-on-radio preamble: the tag this is for may be a battery
          * leaf asleep in WOR, and this frame is the one that has to reach
          * it. */
-        if (radio_send(SK_LINK_BROADCAST, tx_pkt, len, (uint8_t)!peer_router)) {
+        if (radio_send(SK_LINK_BROADCAST, tx_pkt, len, (uint8_t)!peer_router,
+                       (uint8_t)(t + 1), LINK_BEGIN_TRIES)) {
             host_status(SK_ST_BAD_SERIAL, LINK_D_RADIO);
             return;
         }
@@ -622,19 +841,39 @@ static void link_image_begin(void) __reentrant
             if (reply_status != SK_ST_OK) {
                 /* The tag answered with an error status: do not pretend a
                  * transfer is running. */
+#if AP_TRACE >= 1
+                uart_puts("xfer: BEGIN answered with an error status - no "
+                          "transfer is running\r\n");
+#endif
                 host_ack(reply_off, reply_status);
                 return;
             }
             if (reply_off == 0) {
                 xfer_active = 1;
+#if AP_TRACE >= 1
+                uart_puts("xfer: the tag took the transfer on (offset 0000) "
+                          "- data blocks follow\r\n");
+#endif
                 host_ack(0, SK_ST_OK);
                 return;
             }
             /* An ACK that does not say "ready at zero" is not an answer to
              * this packet; send it again. */
+#if AP_TRACE >= 1
+            uart_puts("xfer: ACK for BEGIN says offset ");
+            uart_puthex16(reply_off);
+            uart_puts(", not 0000 - sending the BEGIN again\r\n");
+#endif
         } else if (reply == REPLY_STATUS && reply_status != SK_ST_BUSY) {
             /* Refused, and the tag said why: its reason goes through as it
              * is rather than as a guess of our own. */
+#if AP_TRACE >= 1
+            uart_puts("xfer: the tag refused the transfer (st ");
+            uart_puthex8(reply_status);
+            uart_putc(' ');
+            uart_putstatus(reply_status);
+            uart_puts(")\r\n");
+#endif
             host_status(reply_status, LINK_D_TAG);
             return;
         }
@@ -642,8 +881,20 @@ static void link_image_begin(void) __reentrant
         if (waited >= LINK_BEGIN_BUDGET_MS)
             break;                  /* erasing for far too long */
         /* No answer: the air or the tag lost it. Send it again. */
+#if AP_TRACE >= 1
+        uart_puts("xfer: no answer to the BEGIN after ");
+        uart_putdecu(LINK_BEGIN_WAIT_MS);
+        uart_puts(" ms - sending it again\r\n");
+#endif
     }
 
+#if AP_TRACE >= 1
+    uart_puts("xfer: the BEGIN went unanswered for ");
+    uart_putdecu(waited);
+    uart_puts(" ms over ");
+    uart_putdecu(LINK_BEGIN_TRIES);
+    uart_puts(" tries - no tag is answering this serial\r\n");
+#endif
     host_status(SK_ST_BAD_SERIAL, LINK_D_TIMEOUT);
 }
 
@@ -680,6 +931,20 @@ static void link_image_data(void) __reentrant
     /* The tag has this block once it reports every byte below off + k. */
     want = (uint16_t)(off + k);
 
+#if AP_TRACE >= 1
+    /* One line per block: the host's offset, how much of the image it
+     * carries, and the offset the tag has to report before this is done.
+     * 118 of these make a whole image, and their absence is itself the
+     * answer when a transfer stalls. */
+    uart_puts("xfer: data @");
+    uart_puthex16(off);
+    uart_puts(" k=");
+    uart_puthex8(k);
+    uart_puts(" want=");
+    uart_puthex16(want);
+    uart_puts("\r\n");
+#endif
+
     for (t = 0; t < LINK_DATA_TRIES; t++) {
         /* Addressed to the target tag's id, so a mesh relays one tag's image
          * blocks towards that tag rather than filling the house with them.
@@ -688,7 +953,8 @@ static void link_image_data(void) __reentrant
          * may mean the tag has dropped back into wake-on-radio, and only the
          * long preamble reaches it there. */
         if (radio_send(xfer_id, tx_pkt, len,
-                       (uint8_t)(!peer_router && t > 0))) {
+                       (uint8_t)(!peer_router && t > 0),
+                       (uint8_t)(t + 1), LINK_DATA_TRIES)) {
             host_status(SK_ST_BAD_SERIAL, LINK_D_RADIO);
             return;
         }
@@ -696,6 +962,15 @@ static void link_image_data(void) __reentrant
 
         if (reply == REPLY_STATUS) {
             xfer_active = 0;
+#if AP_TRACE >= 1
+            uart_puts("xfer: the tag ended the transfer at block @");
+            uart_puthex16(off);
+            uart_puts(" (st ");
+            uart_puthex8(reply_status);
+            uart_putc(' ');
+            uart_putstatus(reply_status);
+            uart_puts(")\r\n");
+#endif
             host_status(reply_status, LINK_D_TAG);
             return;
         }
@@ -707,12 +982,30 @@ static void link_image_data(void) __reentrant
                  * offset is a resume point. Report it and leave the transfer
                  * open; resending the same block would only be refused
                  * again, and the host is the party that chose the offset. */
+#if AP_TRACE >= 1
+                uart_puts("xfer: block @");
+                uart_puthex16(off);
+                uart_puts(" refused (st ");
+                uart_puthex8(reply_status);
+                uart_putc(' ');
+                uart_putstatus(reply_status);
+                uart_puts("), the tag is at ");
+                uart_puthex16(reply_off);
+                uart_puts(" - nothing was written\r\n");
+#endif
                 host_ack(reply_off, reply_status);
                 return;
             }
             if (reply_off >= want) {
                 /* Delivered - and the offset reported may be further on than
                  * this block, if the tag had already stored part of it. */
+#if AP_TRACE >= 1
+                uart_puts("xfer: block @");
+                uart_puthex16(off);
+                uart_puts(" stored, the tag is at ");
+                uart_puthex16(reply_off);
+                uart_puts("\r\n");
+#endif
                 host_ack(reply_off, SK_ST_OK);
                 return;
             }
@@ -726,6 +1019,13 @@ static void link_image_data(void) __reentrant
     /* Out of retries. The transfer stays open: the host may well want to
      * send this block again once it has looked at the link, and nothing else
      * depends on it being closed. */
+#if AP_TRACE >= 1
+    uart_puts("xfer: block @");
+    uart_puthex16(off);
+    uart_puts(" not delivered after ");
+    uart_putdecu(LINK_DATA_TRIES);
+    uart_puts(" tries - the transfer stays open\r\n");
+#endif
     host_status(SK_ST_BAD_SERIAL, LINK_D_TIMEOUT);
 }
 
@@ -748,7 +1048,7 @@ static void link_image_data(void) __reentrant
  * once every block has been acknowledged. */
 static void link_image_end(void) __reentrant
 {
-    uint8_t reply;
+    uint8_t reply, attempt;
 
     if (!xfer_active) {
         host_status(SK_ST_OFFSET, LINK_D_NO_XFER);
@@ -758,12 +1058,24 @@ static void link_image_end(void) __reentrant
     tx_pkt[0] = SK_PROTO_VERSION;
     tx_pkt[1] = SK_PKT_IMG_END;
 
+#if AP_TRACE >= 1
+    /* The long one: from here the tag writes its last page, verifies the
+     * whole image against the CRC from BEGIN and drives the panel, and only
+     * then answers. Silence for the next 20 s is normal; silence for 62 s is
+     * reported below. */
+    uart_puts("xfer: END - the tag now flushes its last page, checks the image "
+              "CRC and refreshes the panel, then answers (up to ");
+    uart_putdecu(LINK_END_RESEND_MS / 1000);
+    uart_puts(" s of silence is normal)\r\n");
+#endif
+
     /* Addressed to the tag, and behind the WOR preamble on the first
      * attempt: the tag has just finished the last block, but between that
      * answer and this frame is exactly the kind of gap in which a leaf drops
      * back to wake-on-radio, and losing this frame costs the whole ~20 s
      * refresh wait before the resend rescues it. */
-    if (radio_send(xfer_id, tx_pkt, 2, (uint8_t)!peer_router)) {
+    attempt = 1;
+    if (radio_send(xfer_id, tx_pkt, 2, (uint8_t)!peer_router, attempt, 2)) {
         host_status(SK_ST_BAD_SERIAL, LINK_D_RADIO);
         return;
     }
@@ -775,7 +1087,14 @@ static void link_image_end(void) __reentrant
          * not the tag being slow. Send it once more - and only once, because
          * a third would mean the tag is not there at all and the host should
          * be told rather than kept waiting. */
-        if (radio_send(xfer_id, tx_pkt, 2, (uint8_t)!peer_router)) {
+#if AP_TRACE >= 1
+        uart_puts("xfer: nothing heard ");
+        uart_putdecu(LINK_END_RESEND_MS / 1000);
+        uart_puts(" s after the END - too early for the refresh answer, so "
+                  "the frame was lost: sending it once more\r\n");
+#endif
+        attempt = 2;
+        if (radio_send(xfer_id, tx_pkt, 2, (uint8_t)!peer_router, attempt, 2)) {
             host_status(SK_ST_BAD_SERIAL, LINK_D_RADIO);
             return;
         }
@@ -784,6 +1103,13 @@ static void link_image_end(void) __reentrant
 
     if (reply == REPLY_STATUS) {
         xfer_active = 0;
+#if AP_TRACE >= 1
+        uart_puts("xfer: the tag refused the END (st ");
+        uart_puthex8(reply_status);
+        uart_putc(' ');
+        uart_putstatus(reply_status);
+        uart_puts(") - the transfer is closed\r\n");
+#endif
         host_status(reply_status, LINK_D_TAG);
         return;
     }
@@ -795,11 +1121,29 @@ static void link_image_end(void) __reentrant
              * CRC check failed is reported honestly instead of as a success:
              * SK_ST_CRC means the tag stored every byte and did not display
              * anything. */
+#if AP_TRACE >= 1
+            uart_puts("xfer: complete, the tag confirmed off=");
+            uart_puthex16(reply_off);
+            uart_puts(" st=");
+            uart_puthex8(reply_status);
+            uart_putc(' ');
+            uart_putstatus(reply_status);
+            uart_puts(reply_status == SK_ST_OK
+                      ? " (stored and displayed)\r\n"
+                      : " (stored, but the tag reported a failure)\r\n");
+#endif
             host_ack(reply_off, reply_status);
             return;
         }
         /* The tag is still short of the end, so the host ended the image
          * early. Report where the tag actually got to. */
+#if AP_TRACE >= 1
+        uart_puts("xfer: the host ended the image early - the tag is only at ");
+        uart_puthex16(reply_off);
+        uart_puts(" of ");
+        uart_puthex16(xfer_total);
+        uart_puts("\r\n");
+#endif
         host_ack(reply_off, SK_ST_OFFSET);
         return;
     }
@@ -809,6 +1153,12 @@ static void link_image_end(void) __reentrant
      * transfer at the tag either: close this one and say so, rather than let
      * the host wait another minute for an answer that cannot come. */
     xfer_active = 0;
+#if AP_TRACE >= 1
+    uart_puts("xfer: no answer to the END in ");
+    uart_putdecu(LINK_END_WAIT_MS / 1000);
+    uart_puts(" s - the tag never reported the refresh; the transfer is "
+              "closed\r\n");
+#endif
     host_status(SK_ST_BAD_SERIAL, LINK_D_TIMEOUT);
 }
 
@@ -818,6 +1168,17 @@ static void link_image_end(void) __reentrant
  * a host that is waiting for the answer to a frame we did. */
 static void link_frame(void) __reentrant
 {
+#if AP_TRACE >= 1
+    /* First line of the host -> tag direction: the frame is already
+     * CRC-checked here (that is what put it in ser_buf), so this is "the
+     * host's bytes arrived intact". The lines that follow are the bridge
+     * acting on it. */
+    uart_puts("ser: rx ");
+    uart_puthost(ser_buf[0]);
+    uart_puts(" len ");
+    uart_puthex8(ser_buf[1]);
+    uart_puts(" crc ok\r\n");
+#endif
     switch (ser_buf[0]) {
     case SK_U_IMG_BEGIN:
         link_image_begin();
@@ -829,6 +1190,15 @@ static void link_frame(void) __reentrant
         link_image_end();
         break;
     default:
+#if AP_TRACE >= 1
+        /* An unknown type is deliberately not answered - the host would
+         * otherwise see an answer to a frame this firmware did not
+         * understand - but it is worth a line, because it is the shape a
+         * version mismatch takes. */
+        uart_puts("ser: rx      unknown host type 0x");
+        uart_puthex8(ser_buf[0]);
+        uart_puts(" - ignored (see SK_U_* in shelfkit_proto.h)\r\n");
+#endif
         break;
     }
 }
@@ -911,6 +1281,16 @@ static uint8_t serial_poll(void) __reentrant
 
         case SER_TYPE:
             ser_buf[0] = c;
+#if AP_TRACE >= 2
+            /* The parser's own progress. At level 1 only the frames that
+             * come out of it are reported, which is what an operator wants;
+             * at level 2 the bytes going in are visible too, which is what it
+             * takes to see a host that is talking a different protocol (or
+             * the right protocol at the wrong rate). */
+            uart_puts("ser:   sync, type 0x");
+            uart_puthex8(c);
+            uart_puts("\r\n");
+#endif
             ser_state = SER_LEN;
             break;
 
@@ -919,6 +1299,13 @@ static uint8_t serial_poll(void) __reentrant
              * buffered, so resync rather than read a truncated body whose
              * CRC might pass by accident. */
             if (c > SK_UART_PAYLOAD_MAX) {
+#if AP_TRACE >= 1
+                uart_puts("ser: rx bad length 0x");
+                uart_puthex8(c);
+                uart_puts(" (max 0x");
+                uart_puthex8(SK_UART_PAYLOAD_MAX);
+                uart_puts(") - resyncing\r\n");
+#endif
                 ser_state = SER_WANT_AA;
                 break;
             }
@@ -946,6 +1333,17 @@ static uint8_t serial_poll(void) __reentrant
             ser_state = SER_WANT_AA;    /* the next frame starts from scratch */
             if (crc == (uint16_t)(((uint16_t)ser_crc_hi << 8) | c))
                 return 1;
+#if AP_TRACE >= 1
+            /* The single most useful line when the host and the access point
+             * disagree about anything at all: a frame arrived whole and the
+             * two ends computed different CRCs over it, so what was
+             * transmitted is not what was parsed. */
+            uart_puts("ser: rx CRC mismatch (frame said ");
+            uart_puthex16((uint16_t)(((uint16_t)ser_crc_hi << 8) | c));
+            uart_puts(", computed ");
+            uart_puthex16(crc);
+            uart_puts(") - dropped, resyncing on the next sync\r\n");
+#endif
             break;
         }
     }
@@ -954,6 +1352,19 @@ static uint8_t serial_poll(void) __reentrant
      * line has now been quiet for long enough that the rest cannot still be
      * in flight, drop it and go back to hunting for a sync. */
     if (!got && ser_state != SER_WANT_AA && ++ser_idle > SER_IDLE_LIMIT) {
+#if AP_TRACE >= 1
+        /* A host that stopped mid-frame: a truncated line, a tool killed
+         * halfway through a write, or a rate mismatch that turned the rest
+         * into noise. Worth a line - the next frame it sends would otherwise
+         * be the one blamed for the failure. */
+        uart_puts("ser: rx frame abandoned half-way (parser state ");
+        uart_puthex8(ser_state);
+        uart_puts(", ");
+        uart_puthex8(ser_got);
+        uart_puts(" of ");
+        uart_puthex8(ser_len);
+        uart_puts(" body bytes) - the line went quiet\r\n");
+#endif
         ser_state = SER_WANT_AA;
         ser_idle = 0;
     }
@@ -997,7 +1408,7 @@ static void report_packet(const uint8_t *payload, uint8_t len, int8_t rssi)
         uart_puts("\r\n");
         /* The route on its own line, not appended to the TAG line: the host
          * tool's check-in format is exactly "TAG <serial> rssi=<db>" and
-         * tools/tests/test_send_image.py pins that rule, including that
+         * tools/tests/test_ap_server.py pins that rule, including that
          * trailing junk is *not* a check-in. Appending here would silently
          * stop --watch from recognising the tag, so the path goes below. */
         if (sk_link_route_len()) {
@@ -1123,18 +1534,22 @@ void main()
         uart_puthex8(d[RADIO_DIAG_XTAL]);
         uart_puts(", POWSTAT ");
         uart_puthex8(d[RADIO_DIAG_POWSTAT]);
-        uart_puts("\r\n       PLLRANGINGA ");
-        uart_puthex8(d[RADIO_DIAG_RANGING]);
+        uart_puts("\r\n       VCO range ");
+        uart_puthex8((uint8_t)(d[RADIO_DIAG_RANGING] & 0x0F));
         if (d[RADIO_DIAG_RANGING] & 0x10)
             uart_puts(" RNGSTART STUCK");
         else if (d[RADIO_DIAG_RANGING] & 0x20)
-            uart_puts(" RNGERR");
+            uart_puts(" RNGERR - the VCO could not reach 868.3 MHz");
         else
             uart_puts(" ranged");
-        if (d[RADIO_DIAG_RANGING] & 0x40)
-            uart_puts(", PLL locked");
-        else
-            uart_puts(", PLL NOT LOCKED");
+        /* Only meaningful if the failure was RADIO_ERR_PLL_LOCK, because
+         * that is the only path on which radio_init() reaches the lock check
+         * with the synthesizer running. On the ranging failures above the
+         * chip is in STANDBY and these bits are 0 regardless. */
+        if (err == RADIO_ERR_PLL_LOCK)
+            uart_puts(d[RADIO_DIAG_RANGING] & 0x40
+                      ? ", PLL locked, but lock was lost"
+                      : ", PLL never locked");
         uart_puts(", VCOI ");
         uart_puthex8(d[RADIO_DIAG_VCOI]);
         uart_puts(" VCOIR ");
@@ -1148,21 +1563,32 @@ void main()
     radio_diag(d);
     uart_puts("radio ready (silicon rev ");
     uart_puthex8(radio_revision());
-    uart_puts(", PLLRANGINGA ");
-    uart_puthex8(d[RADIO_DIAG_RANGING]);
+    /* PLLRANGINGA bits 3:0 are the VCO range, and the high nibble is the lock
+     * state as read with the synthesizer running (radio_wait_pll_lock), so a
+     * healthy unit reads CA-ish here: range | PLL LOCK | no lock loss. */
+    uart_puts(", VCO range ");
+    uart_puthex8((uint8_t)(d[RADIO_DIAG_RANGING] & 0x0F));
     if (d[RADIO_DIAG_RANGING] & 0x40)
-        uart_puts(" PLL locked");
+        uart_puts(d[RADIO_DIAG_RANGING] & 0x80 ? " PLL locked" : " PLL locked, but lock was lost");
     else
         uart_puts(" PLL NOT LOCKED");
     uart_puts(", VCOI ");
     uart_puthex8(d[RADIO_DIAG_VCOI]);
     uart_puts(")\r\nlistening: 868.300 MHz, 4800 bit/s, FSK\r\n");
     uart_puts("link: router id ");
-    uart_puthex8((uint8_t)(SK_LINK_AP_ID >> 24));
-    uart_puthex8((uint8_t)(SK_LINK_AP_ID >> 16));
-    uart_puthex8((uint8_t)(SK_LINK_AP_ID >> 8));
-    uart_puthex8((uint8_t)SK_LINK_AP_ID);
+    uart_putid(SK_LINK_AP_ID);
     uart_puts(", relaying for others\r\n");
+#if AP_TRACE >= 1
+    /* Say which console this is. A log pasted into a bug report is worth a
+     * lot more when it carries its own verbosity level: "there is no line
+     * about the retry" means something different at level 0 than at 1. */
+    uart_puts("link: console trace level ");
+    uart_putdecu(AP_TRACE);
+    uart_puts(AP_TRACE >= 2
+              ? " (every wait window and every parser step)\r\n"
+              : (AP_TRACE == 1 ? " (frames, retries and verdicts)\r\n"
+                               : " (silent)\r\n"));
+#endif
     uart_flush();
 
     sk_link_init(SK_ROLE_ROUTER, SK_LINK_AP_ID);
@@ -1175,6 +1601,16 @@ void main()
          * tags are still heard while a frame is being assembled. */
         if (serial_poll())
             link_frame();
+
+        /* A byte that arrived while the RX ring was full was overwritten in
+         * the UART's single receive register, which costs the frame it
+         * belonged to. Reported here rather than inside uart_rx_pump(): that
+         * runs from the transmit path, where printing would recurse. */
+        if (uart_rx_overrun) {
+            uart_rx_overrun = 0;
+            uart_puts("ser: rx overrun - a host byte was lost (its frame will "
+                      "fail its CRC)\r\n");
+        }
 
         len = sk_link_poll(rx_pkt, sizeof rx_pkt);
         note_peer();
@@ -1189,10 +1625,7 @@ void main()
             uart_puts("relay msg ");
             uart_puthex8(sk_link_seq());
             uart_puts(" origin ");
-            uart_puthex8((uint8_t)(sk_link_origin() >> 24));
-            uart_puthex8((uint8_t)(sk_link_origin() >> 16));
-            uart_puthex8((uint8_t)(sk_link_origin() >> 8));
-            uart_puthex8((uint8_t)sk_link_origin());
+            uart_putid(sk_link_origin());
             uart_puts(" hops ");
             uart_puthex8(sk_link_hops());
             uart_puts("->");

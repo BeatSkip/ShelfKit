@@ -233,6 +233,7 @@
 #define RADIO_TMO_RANGE      6000    /* x  50 us = 300 ms for autoranging */
 #define RADIO_TMO_TX         6000    /* x  50 us = 300 ms for one packet */
 #define RADIO_TMO_ADC        400     /* x   1 us, one GPADC conversion */
+#define RADIO_TMO_PLL        2000    /* x  50 us = 100 ms for the PLL to lock */
 
 /* ── the AX-RadioLAB register table, verbatim ────────────────────────────
  * This is config.c's ax5043_set_registers(), one line per radio_write8(),
@@ -468,6 +469,81 @@ static uint8_t radio_wait_xtal(void) __reentrant
         delay(100);
     }
     return RADIO_ERR_XTAL;
+}
+
+/* ── the PLL lock check: the one place bit 6 of PLLRANGINGA means
+ * anything ──────────────────────────────────────────────────────────────
+ *
+ * PLLRANGINGA bit 6 is "PLL is locked if 1" - but only while the
+ * synthesizer is actually running. At every other point in radio_init() the
+ * chip is in STANDBY (PWRMODE 0x05) or POWERDOWN (0x00), the VCO is not
+ * powered, and bit 6 is 0 by construction. It says nothing about the PLL
+ * there: an unlocked PLL and a healthy-but-asleep PLL read the same.
+ *
+ * That is exactly why the reference never checks it during ranging.
+ * easyax5043.c's axradio_init() tests only RNGERR after ranging (line 1744)
+ * and moves straight on to the VCOI calibration, and the datasheet's own
+ * ranging flow chart (figure 8) checks RNGERR and nothing else before going
+ * to POWERDOWN. The one place the vendor reads the lock at all is
+ * axradio_calvcoi() (line 1632), which runs with PWRMODE = SYNTH_TX and the
+ * synthesizer up - and ShelfKit does not even take that branch, because
+ * chanvcoiinit is 0x99, so axradio_adjustvcoi() runs instead, which never
+ * looks at the lock.
+ *
+ * So this is called once, from inside the VCOI calibration, with the
+ * synthesizer running and the *calibrated* PLLVCOI in place - i.e. on
+ * precisely the settings the radio goes on to use. It is a real check: a PLL
+ * that does not lock here will not lock in FULLRX either, and the failure
+ * otherwise shows up much later as a receiver that silently never hears
+ * anything, which is a far worse thing to debug.
+ *
+ * It also fixes the register snapshot. The previous version of this driver
+ * sampled PLLRANGINGA once, inside the ranging poll loop, and printed that
+ * value on the boot line as "PLL locked" / "PLL NOT LOCKED" - so every unit
+ * reported "PLL NOT LOCKED", whether it was faulty or not, because the
+ * sample was taken in a power state where the bit cannot be set. Refreshing
+ * the byte here makes the reported state true.
+ *
+ * VCORA in bits 3:0 comes back unchanged - the chip only rewrites it during
+ * auto-ranging - so overwriting the whole byte keeps RADIO_RANGE() correct
+ * for the PLLRANGINGA writes in steps 6 and 7.
+ *
+ * Bit 7 is the sticky companion: "if 0, the PLL lost lock after the last read
+ * of PLLRANGINGA", and every read clears it. That clear-on-read is exactly why
+ * the reference reads the register around *every* tune-voltage measurement in
+ * axradio_calvcoi() (lines 1623 and 1625) - it is clearing the flag, not
+ * testing it.
+ *
+ * Which is why this function has to clear it too, and why the first statement
+ * is a discarded read. The VCOI sweep immediately above retunes the VCO 32
+ * times, and every one of those writes can drop lock for a moment, so the
+ * sticky bit is *certain* to be set on arrival here - on a perfectly healthy
+ * chip. Reading once first means bit 7 then reports "lost lock since we
+ * started watching", which is a real observation; without that read it reports
+ * the sweep, and the boot log says "lock was lost" on every unit that ever
+ * calibrates successfully. That is the same class of bug as the stale
+ * snapshot this function exists to fix: reporting a bit that was never
+ * measured in the state being described.
+ *
+ * Bit 6 is the bit that converges, so that is what the loop waits for. Once
+ * it is set, the loop exits and the value stored is the one that satisfied it
+ * - so bit 7 in the snapshot is "still locked and nothing dropped since the
+ * cleared read", which is what a caller wants to know. */
+static uint8_t radio_wait_pll_lock(void) __reentrant
+{
+    uint16_t t = RADIO_TMO_PLL;
+
+    /* Discarded on purpose: clears the sticky lock-loss flag the VCOI sweep
+     * left behind. See above. */
+    (void)radio_read8(AX5043_REG_PLLRANGINGA);
+
+    while (t--) {
+        radio_state[RADIO_DIAG_RANGING] = radio_read8(AX5043_REG_PLLRANGINGA);
+        if (radio_state[RADIO_DIAG_RANGING] & 0x40)
+            return RADIO_OK;
+        delay(50);
+    }
+    return RADIO_ERR_PLL_LOCK;
 }
 
 /* Any init failure ends the same way: radio off, error recorded. */
@@ -758,9 +834,19 @@ uint8_t radio_init(void) __reentrant
             radio_state[RADIO_DIAG_VCOI] = radio_adjustvcoi(x);
         } while (--j);
 
+        /* The calibrated current is the one the radio will actually use, so
+         * put it in and confirm the PLL locks on it. This is the first and
+         * only point in the sequence where the lock bits mean anything -
+         * everything before it is STANDBY or POWERDOWN - so it both catches
+         * a synthesizer that will not lock and refreshes the PLLRANGINGA
+         * snapshot the boot log prints. See radio_wait_pll_lock(). */
+        radio_write8(AX5043_REG_PLLVCOI, radio_state[RADIO_DIAG_VCOI]);
+        err = radio_wait_pll_lock();
+        if (err)
+            return radio_fail(err);
+
         /* Read the calibrated setting back before restoring the register,
          * while the synthesizer is still up. */
-        radio_write8(AX5043_REG_PLLVCOI, radio_state[RADIO_DIAG_VCOI]);
         radio_state[RADIO_DIAG_VCOIR] = radio_read8(AX5043_REG_PLLVCOIR);
         radio_write8(AX5043_REG_PLLVCOI, vcoisave);
     }
@@ -812,6 +898,7 @@ const char *radio_error_str(uint8_t err) __reentrant
     case RADIO_ERR_RANGE_ERR: return "VCO could not reach 868.3 MHz";
     case RADIO_ERR_TX_FIFO:   return "transmitter never went idle";
     case RADIO_ERR_TX_LEN:    return "payload does not fit in one packet";
+    case RADIO_ERR_PLL_LOCK:  return "PLL never locked with the synthesizer running";
     default:                  return "unknown";
     }
 }

@@ -3,7 +3,8 @@
  * @brief Read the NFC chip, show the polyform logo, then receive images
  *
  * Boots, brings up UART0 and the SPI bus, reads the NFC chip's serial
- * number and the whole NFC EEPROM and prints both over UART, then brings
+ * number off its NDEF record (and nothing else of the EEPROM - see
+ * nfc_report()) and prints it over UART, then brings
  * up the e-paper display (GDEW026Z39, 2.6"), uploads the polyform boot
  * image (both black/white and red planes), refreshes the panel, powers it
  * down, and flashes the blue LED once when the refresh has finished. The
@@ -22,10 +23,20 @@
  * mode-1 SPI slave, the panel a mode-0 one - see nfc.c) and hands the bus
  * back to the hardware SPI unit when it is done.
  *
- * UART0 is TX-only debug logging at 38400 8N1 on PB4, using the same
- * register-level output path as the flash-dump firmware (avoids the
- * broken libmf FIFO tables). RX is never enabled, so PB5 stays free for
- * the panel's reset line.
+ * UART0 is TX-only in this firmware: nothing ever reads the receiver back,
+ * and PB5 - the pin the UART would receive on - is the panel's reset line,
+ * driven as an output by epd_init_panel(). uart_begin() leaves the receiver
+ * enabled anyway (it is libmf's bring-up, shared with the access point, which
+ * does read its UART back); the pad is an output, so that is inert.
+ *
+ * The console is a debug output and never a dependency: uart_putc() bounds
+ * its wait for the transmitter and writes a dead port off, so a broken or
+ * absent serial port cannot stop the tag from starting up. What it carries is
+ * the receive loop's own story - which blocks arrived, which pages were
+ * written, which frames it refused - next to the access point's trace;
+ * TAG_TRACE sets how much of it there is. It uses the same
+ * register-level output path as the flash-dump firmware (avoids the broken
+ * libmf FIFO tables).
  */
 
 #include <ax8052f143.h>
@@ -101,14 +112,72 @@
  * until the battery is pulled. */
 #define RX_STALL_MS 30000
 
-/* ── UART TX debug logging (register-level) ──────────────────────────── */
+/* ── console trace ──────────────────────────────────────────────────────
+ *
+ * How much the tag says about itself on UART0 (PB4, 38400 8N1). The tag's
+ * console is the other half of the access point's trace: the access point can
+ * say "I sent it and nothing came back", and only this side can say whether
+ * the frame arrived, what the tag did with it and why it stayed quiet.
+ *
+ *   0   the boot report and the transfer milestones only
+ *   1   the transfer trace (default): every frame the tag acts on, every
+ *       flash page written, every refusal, and a summary at the end
+ *   2   also every answer it transmits and every frame the link layer hands
+ *       up - a line per block in both directions
+ *
+ * Level 1 costs a line per accepted block (~118 lines per image, about a
+ * second of UART in total against a transfer that takes ~35) and each line
+ * delays that block's acknowledgement by ~10 ms, which is nothing against the
+ * access point's 600 ms window. Level 2 doubles it; it is for a link that is
+ * being brought up, built with
+ * `tools/build_firmware.ps1 -Define TAG_TRACE=2`. */
+#ifndef TAG_TRACE
+#define TAG_TRACE 1
+#endif
+
+/* ── UART TX debug logging (register-level) ────────────────────────────
+ *
+ * The console is a debug output, never a dependency: nothing here may keep
+ * the tag from reading its NFC chip, announcing itself, refreshing its panel
+ * or reaching its receive loop. Two things enforce that.
+ *
+ * First, the transmit wait is bounded. "Wait for TX empty" with no limit is a
+ * hang, and a realistic one: an unclocked UART (the 20 MHz FRC oscillator is
+ * what clocks it), a pad that never took the U0TX function, or a baud
+ * register left at zero all leave U0TXEMPTY clear for ever. The tag would
+ * then stop on its first banner byte - no NFC read, no announcement, no
+ * panel, no receive loop: a label that looks dead because its serial port is.
+ *
+ * Second, a port that has timed out UART_TX_DEAD times is written off, and
+ * every later byte is dropped without waiting at all. That caps the whole
+ * cost of a broken or absent console at a few milliseconds of boot, and it
+ * also keeps a *slow* port from stretching the boot: with the port written
+ * off, 40 lines of transfer trace cannot cost 40 waits.
+ *
+ * UART_TX_SPIN is ~45x the time one byte takes at 38400 baud, so a healthy
+ * port never comes near it (it normally gets TXEMPTY on the first test). */
+#define UART_TX_SPIN   4000
+#define UART_TX_DEAD   8
+
+/* XRAM for the same reason every buffer here is: internal RAM belongs to the
+ * stack, and this is only touched by the console path. */
+static uint8_t __xdata uart_tx_timeouts;
 
 static void uart_putc(uint8_t c)
 {
-    while (!(U0STATUS & 0x04))      /* wait for U0TXEMPTY */
-        ;
-    U0SHREG = c;
-    U0CTRL |= 0x08;                 /* arm the TX-done flag, like iocore */
+    uint16_t spin;
+
+    if (uart_tx_timeouts >= UART_TX_DEAD)
+        return;                     /* console written off: do not even look */
+
+    for (spin = UART_TX_SPIN; spin; spin--) {
+        if (U0STATUS & 0x04) {      /* U0TXEMPTY: the transmitter is ready */
+            U0SHREG = c;
+            U0CTRL |= 0x08;         /* arm the TX-done flag, like iocore */
+            return;
+        }
+    }
+    uart_tx_timeouts++;             /* one byte lost; the port may be dead */
 }
 
 static void uart_puts(const char *s)
@@ -130,12 +199,83 @@ static void uart_puthex16(uint16_t v)
     uart_puthex8((uint8_t)v);
 }
 
-/* ── NFC chip: serial number + EEPROM dump ───────────────────────────── */
+/* Unsigned decimal: byte offsets, block counts and millisecond counts. The
+ * access point's copy of this is the same pair of printers, for the same
+ * reason - a signed printer built on `-v` prints anything over 32767 as a
+ * negative number, and the END wait is 60000 ms. */
+static void uart_putdecu(uint16_t u)
+{
+    uint16_t div = 10000;
+    uint8_t started = 0;
 
-/* Scratch lives in XRAM: this is an 8051, and keeping it out of IRAM
- * leaves the whole internal RAM as stack headroom. */
-static uint8_t __xdata nfc_uid[NFC_SERIAL_LEN];
-static uint8_t __xdata nfc_buf[16];
+    while (div) {
+        uint8_t d = (uint8_t)(u / div);
+
+        if (d || started || div == 1) {
+            uart_putc((uint8_t)('0' + d));
+            started = 1;
+        }
+        u = (uint16_t)(u % div);
+        div = (uint16_t)(div / 10);
+    }
+}
+
+/* Signed decimal, for the RSSI (negative or zero dB, so never large). */
+static void uart_putdec(int16_t v)
+{
+    if (v < 0) {
+        uart_putc('-');
+        uart_putdecu((uint16_t)(-v));
+        return;
+    }
+    uart_putdecu((uint16_t)v);
+}
+
+/* ── trace vocabulary ───────────────────────────────────────────────────
+ *
+ * Names rather than bare hex, so the tag's console and the access point's
+ * read the same way ("IMG_DATA", "OFFSET"). Plain uart_puts() calls: ROM
+ * only, no RAM. */
+
+/* A 32-bit node id, in the byte order a frame carries it. */
+static void uart_putid(uint32_t v)
+{
+    uart_puthex8((uint8_t)(v >> 24));
+    uart_puthex8((uint8_t)(v >> 16));
+    uart_puthex8((uint8_t)(v >> 8));
+    uart_puthex8((uint8_t)v);
+}
+
+/* Application packet type (the second byte of a radio payload). */
+static void uart_putpkt(uint8_t type)
+{
+    switch (type) {
+    case SK_PKT_ANNOUNCE:   uart_puts("ANNOUNCE");   break;
+    case SK_PKT_IMG_BEGIN:  uart_puts("IMG_BEGIN");  break;
+    case SK_PKT_IMG_DATA:   uart_puts("IMG_DATA");   break;
+    case SK_PKT_IMG_END:    uart_puts("IMG_END");    break;
+    case SK_PKT_IMG_ACK:    uart_puts("IMG_ACK");    break;
+    case SK_PKT_IMG_STATUS: uart_puts("IMG_STATUS"); break;
+    default:                uart_puts("??");         break;
+    }
+}
+
+/* Transfer status code (SK_ST_*). */
+static void uart_putstatus(uint8_t st)
+{
+    switch (st) {
+    case SK_ST_OK:          uart_puts("OK");          break;
+    case SK_ST_BAD_SERIAL:  uart_puts("BAD_SERIAL");  break;
+    case SK_ST_FLASH:       uart_puts("FLASH");       break;
+    case SK_ST_CRC:         uart_puts("CRC");         break;
+    case SK_ST_OFFSET:      uart_puts("OFFSET");      break;
+    case SK_ST_BUSY:        uart_puts("BUSY");        break;
+    case SK_ST_UNSUPPORTED: uart_puts("UNSUPPORTED"); break;
+    default:                uart_puts("?");           break;
+    }
+}
+
+/* ── NFC chip: the serial number ─────────────────────────────────────── */
 
 /* The tag's identity, as the stock system defines it: the last path segment
  * of the NDEF URI stored in the NFC chip ("1408F525"). Used to address an
@@ -156,75 +296,44 @@ static uint8_t __xdata tx_pkt[SK_PKT_MAX];
 static uint32_t __xdata tag_id;
 static uint8_t __xdata link_awake;
 
+/* Read the tag's serial number and nothing else.
+ *
+ * This used to walk the whole 924-byte EEPROM and print it as hex plus an
+ * ASCII column: 58 bit-banged transactions and some 4 KB of UART - about
+ * 150 ms of boot spent before the e-paper refresh is even reached, for bytes
+ * no part of the firmware ever reads. What the transfer actually needs is the
+ * serial, and that is the NDEF TLV window: 8 transactions, one line of
+ * output.
+ *
+ * The factory UID is still read, but only when there is no NDEF record to
+ * take the serial from - it is the fallback identity, not a boot ritual.
+ * Dumping the whole EEPROM is still possible: that is what firmware/dumptool
+ * is for, and tools/memdump.py drives it. */
 static void nfc_report(void)
 {
-    uint8_t ok, i;
-    uint16_t addr;
+    uint8_t i;
 
     uart_puts("\r\n--- NFC chip (FM11NT081DS) ---\r\n");
 
     nfc_init();                     /* bit-bang the bus, SPI unit off */
 
-    ok = nfc_read_serial(nfc_uid);
-    uart_puts("UID (7 bytes): ");
-    for (i = 0; i < NFC_SERIAL_LEN; i++) {
-        uart_puthex8(nfc_uid[i]);
-        if (i + 1 < NFC_SERIAL_LEN)
-            uart_putc(' ');
-    }
-    uart_puts(ok ? "  [check bytes ok]\r\n"
-                 : "  [check bytes BAD - read is not trustworthy]\r\n");
-
-    /* The serial number: last path segment of the NDEF URI record */
     nfc_serial_len = nfc_read_tag_serial(nfc_serial_str, sizeof nfc_serial_str);
+    uart_puts("serial number: ");
     if (nfc_serial_len) {
-        uart_puts("serial number: ");
         for (i = 0; i < nfc_serial_len; i++)
             uart_putc((uint8_t)nfc_serial_str[i]);
         uart_puts("  [from the NDEF URI]\r\n");
     } else {
         /* No usable NDEF record - fall back to the UID so the tag can still
-         * be told apart, and say so plainly. */
+         * be told apart, and say so plainly. This is the one path that reads
+         * page 0, and the only one that prints the UID. */
         nfc_serial_len = nfc_uid_string(nfc_serial_str, sizeof nfc_serial_str);
-        uart_puts("serial number: ");
         for (i = 0; i < nfc_serial_len; i++)
             uart_putc((uint8_t)nfc_serial_str[i]);
-        uart_puts("  [NO NDEF RECORD - using the UID]\r\n");
+        uart_puts("  [NO NDEF RECORD - the UID as hex]\r\n");
     }
 
-    /* Capability container: E1 10 <user bytes/8> <access> for a Type 2 tag */
-    nfc_read(NFC_CC_ADDR, nfc_buf, 4);
-    uart_puts("capability container: ");
-    for (i = 0; i < 4; i++) {
-        uart_puthex8(nfc_buf[i]);
-        uart_putc(' ');
-    }
-    uart_puts((nfc_buf[0] == 0xE1) ? "(NFC Forum Type 2 tag)\r\n"
-                                   : "(unexpected - see nfc.c)\r\n");
-
-    uart_puts("EEPROM dump, 924 bytes:\r\n");
-    for (addr = 0; addr < NFC_EEPROM_SIZE; addr += 16) {
-        uint8_t n = 16;             /* the last line is short (924 = 57*16 + 12) */
-        if (NFC_EEPROM_SIZE - addr < 16)
-            n = (uint8_t)(NFC_EEPROM_SIZE - addr);
-
-        nfc_read(addr, nfc_buf, n);
-        uart_puthex16(addr);
-        uart_puts(": ");
-        for (i = 0; i < n; i++) {
-            uart_puthex8(nfc_buf[i]);
-            uart_putc(' ');
-        }
-        for (i = n; i < 16; i++)    /* keep the ASCII column lined up */
-            uart_puts("   ");
-        uart_puts(" |");
-        for (i = 0; i < n; i++) {
-            uint8_t c = nfc_buf[i];
-            uart_putc((c >= 32 && c <= 126) ? c : '.');
-        }
-        uart_puts("|\r\n");
-    }
-    uart_puts("--- end of NFC dump ---\r\n");
+    uart_puts("--- end of NFC ---\r\n");
 
     nfc_release();                  /* SPI unit back on for the panel */
 }
@@ -353,12 +462,21 @@ static uint8_t announce_build(void) __reentrant
 static void announce_send(void) __reentrant
 {
     uint8_t len = announce_build();
+    uint8_t i;
 
     if (len) {
-        if (sk_link_send(SK_LINK_BROADCAST, tx_pkt, len) == SK_LINK_OK)
-            uart_puts("radio: announced\r\n");
-        else
+        if (sk_link_send(SK_LINK_BROADCAST, tx_pkt, len) == SK_LINK_OK) {
+            /* Which tag said hello, not just that one did: the access point's
+             * console shows the serial it received, and a mismatch between
+             * the two (the NFC read against the file name) is the first thing
+             * worth ruling out when an image will not go anywhere. */
+            uart_puts("radio: announced ");
+            for (i = 0; i < nfc_serial_len; i++)
+                uart_putc((uint8_t)nfc_serial_str[i]);
+            uart_puts("\r\n");
+        } else {
             uart_puts("radio: announce failed\r\n");
+        }
     }
 }
 
@@ -390,18 +508,22 @@ static void announce(void) __reentrant
         uart_puthex8(d[RADIO_DIAG_XTAL]);
         uart_puts(", POWSTAT ");
         uart_puthex8(d[RADIO_DIAG_POWSTAT]);
-        uart_puts("\r\n       PLLRANGINGA ");
-        uart_puthex8(d[RADIO_DIAG_RANGING]);
+        uart_puts("\r\n       VCO range ");
+        uart_puthex8((uint8_t)(d[RADIO_DIAG_RANGING] & 0x0F));
         if (d[RADIO_DIAG_RANGING] & 0x10)
             uart_puts(" RNGSTART STUCK");
         else if (d[RADIO_DIAG_RANGING] & 0x20)
-            uart_puts(" RNGERR");
+            uart_puts(" RNGERR - the VCO could not reach 868.3 MHz");
         else
             uart_puts(" ranged");
-        if (d[RADIO_DIAG_RANGING] & 0x40)
-            uart_puts(", PLL locked");
-        else
-            uart_puts(", PLL NOT LOCKED");
+        /* Only meaningful if the failure was RADIO_ERR_PLL_LOCK, because
+         * that is the only path on which radio_init() reaches the lock check
+         * with the synthesizer running. On the ranging failures above the
+         * chip is in STANDBY and these bits are 0 regardless. */
+        if (err == RADIO_ERR_PLL_LOCK)
+            uart_puts(d[RADIO_DIAG_RANGING] & 0x40
+                      ? ", PLL locked, but lock was lost"
+                      : ", PLL never locked");
         uart_puts(", VCOI ");
         uart_puthex8(d[RADIO_DIAG_VCOI]);
         uart_puts(" VCOIR ");
@@ -413,10 +535,13 @@ static void announce(void) __reentrant
     radio_diag(d);
     uart_puts("ready (silicon rev ");
     uart_puthex8(radio_revision());
-    uart_puts(", PLLRANGINGA ");
-    uart_puthex8(d[RADIO_DIAG_RANGING]);
+    /* PLLRANGINGA bits 3:0 are the VCO range, and the high nibble is the lock
+     * state as read with the synthesizer running (radio_wait_pll_lock), so a
+     * healthy unit reads range 0A, PLL locked, no lock loss here. */
+    uart_puts(", VCO range ");
+    uart_puthex8((uint8_t)(d[RADIO_DIAG_RANGING] & 0x0F));
     if (d[RADIO_DIAG_RANGING] & 0x40)
-        uart_puts(" PLL locked");
+        uart_puts(d[RADIO_DIAG_RANGING] & 0x80 ? " PLL locked" : " PLL locked, but lock was lost");
     else
         uart_puts(" PLL NOT LOCKED");
     uart_puts(", VCOI ");
@@ -436,7 +561,10 @@ static void announce(void) __reentrant
         if (i + 1 < RADIO_ANNOUNCE_REPEATS)
             ms_delay(RADIO_ANNOUNCE_GAP_MS);
     }
-    uart_puts("radio: announced\r\n");
+    uart_puts("radio: announced ");
+    for (i = 0; i < nfc_serial_len; i++)
+        uart_putc((uint8_t)nfc_serial_str[i]);
+    uart_puts(" (as the id above)\r\n");
 }
 
 /* ── receiving an image ──────────────────────────────────────────────────
@@ -481,6 +609,12 @@ static uint16_t __xdata rx_total;       /* image size the transfer announced */
 static uint16_t __xdata rx_crc;         /* CRC-16 the sender computed */
 static uint16_t __xdata rx_crc_run;     /* CRC-16 over the bytes accepted so far */
 
+/* Counters for the end-of-transfer summary, so the trace answers "did all of
+ * it arrive and get written" in one place instead of 44 page lines. */
+static uint8_t  __xdata rx_pages;       /* flash pages programmed */
+static uint8_t  __xdata rx_blocks;      /* IMG_DATA frames accepted */
+static uint8_t  __xdata rx_repeats;     /* IMG_DATA frames that were duplicates */
+
 /* 11248 bytes cover three 4 KiB sectors of the flash: two whole ones and
  * 3056 bytes of a third. */
 #define SK_IMG_SECTORS \
@@ -519,6 +653,19 @@ static void ack_send(uint16_t off, uint8_t status) __reentrant
     tx_pkt[2] = (uint8_t)(off >> 8);
     tx_pkt[3] = (uint8_t)off;
     tx_pkt[4] = status;
+#if TAG_TRACE >= 2
+    /* Every answer, in the order it goes out. At level 1 the lines around the
+     * calls already say what was acknowledged; this is for the case where a
+     * block is accepted and the answer never arrives at the access point,
+     * which looks identical to a lost block from the other end. */
+    uart_puts("img: ack off=");
+    uart_puthex16(off);
+    uart_puts(" st=");
+    uart_puthex8(status);
+    uart_putc(' ');
+    uart_putstatus(status);
+    uart_puts("\r\n");
+#endif
     tx_and_listen(5);
 }
 
@@ -579,11 +726,23 @@ static uint8_t stage_data(const uint8_t *data, uint16_t len) __reentrant
              * below it. */
             uint32_t addr = SK_IMG_FLASH_ADDR + (uint32_t)rx_next - FLASH_PAGE_SIZE;
 
-            if (!extflash_write(addr, page_buf, FLASH_PAGE_SIZE))
+            /* The failure paths name the page, which is the part that has to
+             * be right: by the time the caller reports a flash failure,
+             * rx_next has moved past it. */
+            if (!extflash_write(addr, page_buf, FLASH_PAGE_SIZE)) {
+                uart_puts("img: page ");
+                uart_puthex16(rx_next);
+                uart_puts(" WRITE FAILED\r\n");
                 return 0;
-            if (!extflash_verify(addr, page_buf, FLASH_PAGE_SIZE))
+            }
+            if (!extflash_verify(addr, page_buf, FLASH_PAGE_SIZE)) {
+                uart_puts("img: page ");
+                uart_puthex16(rx_next);
+                uart_puts(" VERIFY FAILED (read back differs)\r\n");
                 return 0;
+            }
 
+            rx_pages++;
             uart_puts("img: page ");
             uart_puthex16(rx_next);
             uart_puts(" ok\r\n");
@@ -729,12 +888,17 @@ static void img_begin(uint8_t len) __reentrant
     rx_next = 0;
     rx_status = SK_ST_OK;
     rx_state = RX_RECEIVING;
+    rx_pages = 0;
+    rx_blocks = 0;
+    rx_repeats = 0;
 
     uart_puts("img: receiving ");
     uart_puthex16(rx_total);
     uart_puts(" bytes, CRC ");
     uart_puthex16(rx_crc);
-    uart_puts("\r\n");
+    uart_puts(" (sender id ");
+    uart_putid(sk_link_origin());
+    uart_puts(")\r\n");
 
     ack_send(0, SK_ST_OK);
 }
@@ -761,18 +925,45 @@ static void img_data(uint8_t len) __reentrant
         /* Left over from the transfer that just ended: the panel refresh
          * above does not service the radio, so frames can be sitting in the
          * FIFO. Answer the end of that transfer, not a new beginning. */
+#if TAG_TRACE >= 1
+        uart_puts("img: data @");
+        uart_puthex16(off);
+        uart_puts(" k=");
+        uart_puthex8((uint8_t)k);
+        uart_puts(" after the transfer ended - re-answering off ");
+        uart_puthex16(rx_next);
+        uart_puts("\r\n");
+#endif
         ack_send(rx_next, rx_status);
         return;
     }
     if (rx_state != RX_RECEIVING) {
         /* No transfer is open. Say where the next byte of one would be -
          * byte 0 - rather than guess which transfer this belongs to. */
+#if TAG_TRACE >= 1
+        uart_puts("img: data @");
+        uart_puthex16(off);
+        uart_puts(" k=");
+        uart_puthex8((uint8_t)k);
+        uart_puts(" with no transfer open - asking for 0000\r\n");
+#endif
         ack_send(0, SK_ST_OFFSET);
         return;
     }
 
     /* Runs past the end of the image: take none of it and say where we are. */
     if ((uint32_t)off + k > rx_total) {
+#if TAG_TRACE >= 1
+        uart_puts("img: data @");
+        uart_puthex16(off);
+        uart_puts(" k=");
+        uart_puthex8((uint8_t)k);
+        uart_puts(" runs past the image (");
+        uart_puthex16(rx_total);
+        uart_puts(") - refused, still need ");
+        uart_puthex16(rx_next);
+        uart_puts("\r\n");
+#endif
         ack_send(rx_next, SK_ST_OFFSET);
         return;
     }
@@ -783,6 +974,26 @@ static void img_data(uint8_t len) __reentrant
          * Either way the answer is the offset we really need, and neither
          * may touch the flash: writing bytes where they do not belong is
          * the one thing that cannot be repaired later. */
+#if TAG_TRACE >= 1
+        /* The two cases look the same on the access point's console - both
+         * are "the block did not land" - and they are completely different
+         * problems on this side, which is why they get distinct lines: a
+         * repeat means the answer was lost on the way back, a gap means a
+         * frame was lost on the way here. */
+        uart_puts("img: data @");
+        uart_puthex16(off);
+        uart_puts(" k=");
+        uart_puthex8((uint8_t)k);
+        if (off < rx_next) {
+            rx_repeats++;
+            uart_puts(" is a repeat (already have it) - re-answering ");
+            uart_puthex16(rx_next);
+        } else {
+            uart_puts(" is ahead of me - a frame is missing, still need ");
+            uart_puthex16(rx_next);
+        }
+        uart_puts("\r\n");
+#endif
         if (off < rx_next)
             ack_send(rx_next, SK_ST_OK);
         else
@@ -802,6 +1013,21 @@ static void img_data(uint8_t len) __reentrant
         return;
     }
 
+    rx_blocks++;
+#if TAG_TRACE >= 1
+    /* One line per accepted block: the offset it carried and where that left
+     * the transfer. 118 of these are a whole image, so their absence - or
+     * where they stop - is the answer to "which block did not arrive". */
+    uart_puts("img: data @");
+    uart_puthex16(off);
+    uart_puts(" k=");
+    uart_puthex8((uint8_t)k);
+    uart_puts(" -> have ");
+    uart_puthex16(rx_next);
+    uart_puts(" of ");
+    uart_puthex16(rx_total);
+    uart_puts("\r\n");
+#endif
     ack_send(rx_next, SK_ST_OK);
 }
 
@@ -844,10 +1070,28 @@ static void img_end(void) __reentrant
 
         if (!extflash_write(addr, page_buf, left) ||
             !extflash_verify(addr, page_buf, left)) {
-            uart_puts("img: last page failed\r\n");
+            uart_puts("img: last page (");
+            uart_puthex16(base);
+            uart_puts(" + ");
+            uart_puthex16(left);
+            uart_puts(" bytes) failed\r\n");
             rx_status = SK_ST_FLASH;
+        } else {
+            rx_pages++;
         }
     }
+
+    /* One line that says whether the whole image arrived and was written,
+     * which is otherwise 44 page lines and 118 block lines to read. */
+    uart_puts("img: all data in: ");
+    uart_puthex16(rx_next);
+    uart_puts(" bytes in ");
+    uart_putdecu(rx_blocks);
+    uart_puts(" blocks (");
+    uart_putdecu(rx_repeats);
+    uart_puts(" repeats), ");
+    uart_putdecu(rx_pages);
+    uart_puts(" flash pages\r\n");
 
     if (rx_status == SK_ST_OK && rx_crc_run != rx_crc) {
         uart_puts("img: CRC mismatch: computed ");
@@ -859,7 +1103,8 @@ static void img_end(void) __reentrant
     }
 
     if (rx_status == SK_ST_OK) {
-        uart_puts("img: complete\r\n");
+        uart_puts("img: complete, driving the panel (this is the ~20 s the "
+                  "sender is waiting through)\r\n");
         show_image();
         uart_puts("img: displayed\r\n");
     }
@@ -872,9 +1117,11 @@ static void img_end(void) __reentrant
      * ten seconds of driving the panel rather than the radio. */
     uart_puts("img: answering END (off ");
     uart_puthex16(rx_total);
-    uart_puts(" status ");
+    uart_puts(" st=");
     uart_puthex8(rx_status);
-    uart_puts(")\r\n");
+    uart_putc(' ');
+    uart_putstatus(rx_status);
+    uart_puts(") - sent twice\r\n");
     /* Sent twice, deliberately. This is the one answer in the transfer that
      * goes out after ten seconds of driving the panel rather than the radio,
      * and on the bench the first copy has been lost every time while the
@@ -965,7 +1212,16 @@ void main()
      * RAM, which this firmware cannot spare (see uart.c). */
     uart_begin();
 
-    uart_puts("\r\n*** polyform demo ***\r\n");
+    uart_puts("\r\n*** ShelfKit tag ***\r\n");
+    /* Which console this is, so a pasted log carries its own verbosity: "there
+     * is no line about the block" means something different at level 0 than
+     * at level 1. */
+    uart_puts("trace level ");
+    uart_putdecu(TAG_TRACE);
+    uart_puts(TAG_TRACE >= 2
+              ? " (every frame and every answer)\r\n"
+              : (TAG_TRACE == 1 ? " (every block, page and refusal)\r\n"
+                                : " (milestones only)\r\n"));
 
     /* NFC chip first: it is a mode-1 SPI slave, so this bit-bangs the bus
      * and hands it back to the hardware SPI unit (mode 0) afterwards. */
@@ -1003,6 +1259,19 @@ void main()
 
     spi_init();
     epd_init_panel();
+
+    /* The panel is the one thing on the SPI bus this boot cannot do without
+     * - the boot image has to be uploaded and refreshed - and a bus that
+     * never completes a byte is the failure that would otherwise be
+     * indistinguishable from a tag that is simply not there. spi.c bounds
+     * that wait and writes the bus off after the first timeout; say so,
+     * once, and carry on to the receive loop: a tag with a dead display is
+     * still a tag that can be addressed, and an image that is stored and not
+     * shown is worth more than a boot that never finishes. */
+    if (spi_timed_out_flag()) {
+        uart_puts("panel: the SPI bus never completed a byte - no panel and no "
+                  "flash (clock source or pads); the radio still works\r\n");
+    }
     uart_puts("panel init ok\r\n");
 
     /* Upload the polyform logo: black/white plane, then red plane */
@@ -1025,7 +1294,7 @@ void main()
     ms_delay(300);
     PIN_SET_LOW(LEDB_PORT, LEDB_PIN);   /* blue LED: one flash */
 
-    /* ── receive loop ───────────────────────────────────────────────────
+    /* ── the receive loop ───────────────────────────────────────────────
      * From here everything the tag does is driven by the radio. Nothing in
      * this loop blocks for longer than the panel refresh in show_image(),
      * which is deliberate: the sender is stop-and-wait, so a slow tag costs
@@ -1046,11 +1315,37 @@ void main()
 #if SK_TAG_ROUTER
     sk_link_rx_mode(SK_RX_CONTINUOUS);
     radio_rx_start();
-    uart_puts("radio: listening (router)\r\n");
+    uart_puts("radio: listening (router, continuous receive)\r\n");
 #else
-    sk_link_rx_mode(SK_RX_WOR);
-    radio_rx_wor_start();
-    uart_puts("radio: listening (leaf, wake-on-radio)\r\n");
+    /* Whatever arrived while the panel was being driven is still in the
+     * radio's receive FIFO - and arming WOR *clears that FIFO*, so anything
+     * sitting there would be thrown away on the next line. Take it out first.
+     *
+     * This is not a corner case, it is the normal case for a pushed image:
+     * the tag announces itself before the panel refresh, so a sender that
+     * reacts to that announcement sends its IMG_BEGIN while this tag is still
+     * refreshing and not servicing the radio. The frame lands in the FIFO and
+     * used to die here - and a lost BEGIN is not a retry, it is the whole
+     * transfer: the access point reports "the tag never answered" and the
+     * sender sees a tag that is in range, awake, and silent, which is the
+     * most expensive kind of wrong.
+     *
+     * (An earlier comment here claimed the FIFO would carry that frame into
+     * the loop below. radio_rx_wor_start()'s FIFOSTAT clear is what made that
+     * false.) */
+    len = sk_link_poll(rx_pkt, sizeof rx_pkt);
+    if (len) {
+        quiet_ms = 0;
+        link_awake = 1;             /* stay awake for the rest of the exchange */
+        sk_link_rx_mode(SK_RX_CONTINUOUS);
+        radio_rx_start();
+        uart_puts("radio: awake (a frame was waiting from the panel refresh)\r\n");
+        handle_packet(len);
+    } else {
+        sk_link_rx_mode(SK_RX_WOR);
+        radio_rx_wor_start();
+        uart_puts("radio: listening (leaf, wake-on-radio)\r\n");
+    }
 #endif
 
     quiet_ms = 0;
@@ -1067,10 +1362,7 @@ void main()
             uart_puts("relay msg ");
             uart_puthex8(sk_link_seq());
             uart_puts(" origin ");
-            uart_puthex8((uint8_t)(sk_link_origin() >> 24));
-            uart_puthex8((uint8_t)(sk_link_origin() >> 16));
-            uart_puthex8((uint8_t)(sk_link_origin() >> 8));
-            uart_puthex8((uint8_t)sk_link_origin());
+            uart_putid(sk_link_origin());
             uart_puts(" hops ");
             uart_puthex8(sk_link_hops());
             uart_puts("->");
@@ -1091,17 +1383,47 @@ void main()
                 uart_puts("radio: awake\r\n");
             }
 #endif
+#if TAG_TRACE >= 2
+            /* Every frame the link layer accepted, before the application
+             * decides what to do with it - the tag's half of the access
+             * point's "link: heard ..." line. Level 2 only: a line per block
+             * in both directions is a lot of text, and at level 1 the "img:
+             * data ..." and "img: BEGIN ..." lines below already say which
+             * frames were acted on. */
+            uart_puts("radio: heard ");
+            uart_putpkt(len > 1 ? rx_pkt[1] : 0);
+            uart_puts(" len ");
+            uart_puthex8(len);
+            uart_puts(" origin ");
+            uart_putid(sk_link_origin());
+            uart_puts(" seq ");
+            uart_puthex8(sk_link_seq());
+            uart_puts(" rssi=");
+            uart_putdec(sk_link_rssi());
+            uart_puts("\r\n");
+#endif
             handle_packet(len);
             continue;
         }
 
-        if (sk_link_bad()) {
+        if (sk_link_dup()) {
+            /* The same (origin, seq) as something already handled: the access
+             * point repeated a frame whose answer it did not see, or a relay
+             * handed it back. Worth a line, because on this console it is the
+             * difference between "the frame never arrived" and "it arrived
+             * twice". */
+            uart_puts("radio: duplicate msg ");
+            uart_puthex8(sk_link_seq());
+            uart_puts(" origin ");
+            uart_putid(sk_link_origin());
+            uart_puts(" dropped\r\n");
+        } else if (sk_link_bad()) {
             /* Heard something that was not a frame: the CRC or the framing
              * did not survive the air. The distinction between "the radio is
              * hearing nothing" and "the radio is hearing rubbish" is the one
              * that says whether to look at the aerial or at the protocol, and
              * it is worth a line on the tag's console too. */
-            uart_puts("radio: bad frame dropped\r\n");
+            uart_puts("radio: bad frame dropped (CRC or framing)\r\n");
         }
 
         ms_delay(1);                /* 1 ms between polls of the FIFO */
@@ -1112,7 +1434,13 @@ void main()
              * keeps the tag usable - otherwise it would answer every later
              * BEGIN with SK_ST_BUSY until it was power-cycled. */
             if (quiet_ms >= RX_STALL_MS) {
-                uart_puts("img: sender went quiet, transfer abandoned\r\n");
+                uart_puts("img: the sender went quiet for ");
+                uart_putdecu(RX_STALL_MS / 1000);
+                uart_puts(" s, transfer abandoned at ");
+                uart_puthex16(rx_next);
+                uart_puts(" of ");
+                uart_puthex16(rx_total);
+                uart_puts("\r\n");
                 rx_state = RX_IDLE;
                 quiet_ms = 0;
             }

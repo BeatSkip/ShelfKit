@@ -108,9 +108,36 @@ interrupt-driven state machine:
    RadioLAB-calibrated 0x0A), wait for `RNGSTART` to clear, keep the resulting range;
 6. VCO current calibration (`axradio_adjustvcoi`): sweep `PLLVCOI` ±16 around the calibrated
    `0x99` and keep the value whose VCO tuning voltage, measured through the chip's GPADC, is
-   lowest;
+   lowest. Then write that current back and **wait for `PLLRANGINGA` bit 6** — the PLL lock
+   check, see below;
 7. `PWRMODE = POWERDOWN`, re-apply the register table, apply the receiver register set;
 8. set `PLLRANGINGA` to the ranged value and `FREQA` to channel 0.
+
+### The PLL lock check, and why step 6 is the only place it can happen
+
+`PLLRANGINGA` bit 6 is documented as "PLL is locked if 1", but it is only true while the
+synthesizer is actually running. Everywhere else in the init sequence the chip is in STANDBY
+(`PWRMODE` 0x05) or POWERDOWN (0x00) with the VCO unpowered, and bit 6 is 0 *by
+construction* — a healthy asleep PLL and a genuinely broken one read identically.
+
+That is why neither the datasheet's ranging flow chart (figure 8) nor the reference driver
+checks it during ranging: `easyax5043.c` tests only `RNGERR` there (line 1744). The one
+place the vendor reads the lock at all is `axradio_calvcoi()` (line 1632), which runs with
+`PWRMODE = SYNTH_TX`.
+
+So the driver does the same: after the VCOI sweep it writes the calibrated current into
+`PLLVCOI` — the setting the radio will actually use — and polls bit 6 for up to 100 ms
+(`RADIO_TMO_PLL`). A lock failure there is reported as `RADIO_ERR_PLL_LOCK`, because a PLL
+that does not lock in SYNTH_TX will not lock in FULLRX either, and the alternative is a
+receiver that silently never hears anything.
+
+**The boot log's `PLLRANGINGA` line is a snapshot from this read**, not from step 5. An
+earlier version sampled the register once inside the ranging poll loop and printed *that*
+value as "PLL locked" / "PLL NOT LOCKED" — so every unit reported `PLL NOT LOCKED`
+regardless of its health, because the sample was taken while the VCO was unpowered. The
+`VCOI` value in the same line is a useful cross-check: a unit that reports the *uncalibrated*
+`0x99` has a dead GPADC (every measurement returned `-1`, so nothing beat the starting
+point), whereas a value a few counts either side of it is a real measurement.
 
 Transmitting repeats the pattern the SDK uses: `PWRMODE = XTAL_ON`, then `FIFO_ON`, apply the
 transmitter register set, clear the FIFO (`FIFOSTAT = 3`), write the preamble and packet
@@ -141,7 +168,10 @@ breaks the set.
    with the raw `XTALSTATUS`, `POWSTAT` and `PLLRANGINGA` registers, which is usually enough to
    tell a clock problem from a PLL or VCO problem. If `XTALSTATUS` bit 0 never sets, the
    reference clock is not running — check the TCXO configuration above first, since that was a
-   real failure mode here.
+   real failure mode here. `PLL NOT LOCKED` on a *successful* line is likewise not a
+   measurement: on the success path the lock state is the one read with the synthesizer
+   running, and `radio_init()` cannot succeed without it, so treat that text as a
+   driver bug if you ever see it rather than a fault.
 2. **Band and antenna**: 868 MHz is the EU ISM band. A US variant may want 915 MHz, and the
    antenna matching network decides what actually radiates. The PLL can lock happily on a
    carrier the antenna does not pass.

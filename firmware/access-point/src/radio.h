@@ -134,8 +134,12 @@
 #define RADIO_ERR_XTAL          4   /* XTALSTATUS bit 0 never came up */
 #define RADIO_ERR_RANGE_TMO     5   /* VCO auto-ranging never finished */
 #define RADIO_ERR_RANGE_ERR     6   /* the VCO could not reach 868.3 MHz */
-#define RADIO_ERR_TX_FIFO       7   /* the transmitter never went idle again */
-#define RADIO_ERR_TX_LEN        8   /* payload does not fit in one packet */
+#define RADIO_ERR_PLL_LOCK      7   /* the PLL did not lock, measured with the
+                                    * synthesizer running and the calibrated
+                                    * VCO current in place - the only state in
+                                    * which PLLRANGINGA bit 6 means anything */
+#define RADIO_ERR_TX_FIFO       8   /* the transmitter never went idle again */
+#define RADIO_ERR_TX_LEN        9   /* payload does not fit in one packet */
 
 /* radio_diag() buffer: RADIO_DIAG_LEN bytes, and what each one holds.
  * Meaningful after radio_init(), successful or not; the RX fields are
@@ -145,8 +149,12 @@
 #define RADIO_DIAG_XTAL       1   /* XTALSTATUS as last read while waiting
                                    * for the reference clock (bit 0 = running) */
 #define RADIO_DIAG_POWSTAT    2   /* POWSTAT after the register set went in */
-#define RADIO_DIAG_RANGING    3   /* PLLRANGINGA after auto-ranging: VCORA in
-                                   * bits 3:0, RNGERR bit 5, PLL LOCK bit 6 */
+#define RADIO_DIAG_RANGING    3   /* PLLRANGINGA, re-read with the synthesizer
+                                   * running during the VCOI calibration: VCORA
+                                   * in bits 3:0, RNGERR bit 5, PLL LOCK bit 6,
+                                   * sticky lock loss bit 7. The lock bits are
+                                   * only meaningful from that read - see
+                                   * radio_wait_pll_lock() in radio.c */
 #define RADIO_DIAG_VCOI       4   /* VCOI written before TX/RX (bit 7 set),
                                    * 0 if the calibration produced nothing */
 #define RADIO_DIAG_VCOIR      5   /* PLLVCOIR readback after the calibration */

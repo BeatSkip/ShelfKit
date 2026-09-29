@@ -69,12 +69,54 @@ What that looks like on the console:
 TAG 1408F525 rssi=-64
    path via F240 (01 hops, 03 left)          <- the tag's frame reached us through a relay
 relay msg 00 origin 1408F525 hops 04->03     <- and this is us relaying someone else's
-link: duplicate msg 00 (our own, handed back by a relay) via F240 (01 hops, 03 left)
+link: duplicate msg 00 origin 534B4150 (our own, handed back by a relay) via F240 (01 hops, 03 left)
 ```
 
 The `TAG ... rssi=...` line keeps exactly the shape the host tool matches; the path goes on
-the line *after* it, because appending to it would silently stop `tools/send_image.py
+the line *after* it, because appending to it would silently stop `tools/ap_server.py
 --watch` from recognising the tag.
+
+## The console trace
+
+The same UART carries the bridge's own trace, which is the answer to "where did the transfer
+stop". `AP_TRACE` (top of `main.c`) sets how much of it there is:
+
+| Level | What it prints |
+|---|---|
+| 0 | only the banner and `TAG <serial> rssi=<db>` |
+| 1 (default) | plus every host frame parsed, every radio frame sent and heard, every retry, and every verdict handed back |
+| 2 | plus a heartbeat for each wait window that is running out, and the serial parser's own recovery steps |
+
+```powershell
+powershell -File tools/build_firmware.ps1 -Firmware access-point -Define AP_TRACE=2
+```
+
+A transfer reads line by line — the host's frame arrived intact, what it was for, what went on
+the air, what came back, and what the host was told:
+
+```
+ser: rx IMG_BEGIN len 0D crc ok
+xfer: BEGIN serial 1408F525 id E5C0F240 total 2BF0 crc 1234
+link: tx IMG_BEGIN len 0F dst 00000000 try 1/4 wor
+link: heard IMG_ACK len 05 origin E5C0F240 seq 01 rssi=-42
+xfer: the tag took the transfer on (offset 0000) - data blocks follow
+ser: tx ACK off=0000 st=00 OK
+ser: rx IMG_DATA len 62 crc ok
+xfer: data @0000 k=60 want=0060
+link: tx IMG_DATA len 64 dst E5C0F240 try 1/10
+link: heard IMG_ACK len 05 origin E5C0F240 seq 02 rssi=-42
+xfer: block @0000 stored, the tag is at 0060
+ser: tx ACK off=0060 st=00 OK
+...
+xfer: END - the tag now flushes its last page, checks the image CRC and refreshes the panel, then answers (up to 2 s of silence is normal)
+xfer: complete, the tag confirmed off=2BF0 st=00 OK (stored and displayed)
+```
+
+A transfer that dies leaves the same lines up to the point it died. `tools/ap_server.py`
+prints all of this as `ap: ...` lines (it resynchronises on the frame sync bytes, and no trace
+line can contain `0xAA` or `0x55`), so one command shows both ends:
+`python tools/ap_server.py COM8 --monitor`, or `--verbose` during a transfer.
+`documentation/shelfkit-image-transfer.md` has the reading guide.
 
 ## Building and flashing
 
@@ -88,8 +130,8 @@ in VS Code.
    extension deletes stale `firmware.hex`/`.bin` on every build, so flashing an unbuilt tree
    only gets you "Hex file not found".
 
-The build uses ~11 KB of the ~58 KB usable flash, ~740 bytes of the 8 KB of XRAM, and leaves
-179 bytes of the internal RAM as stack.
+The build uses ~21 KB of the ~58 KB usable flash, ~1.1 KB of the 8 KB of XRAM, and leaves
+176 bytes of the internal RAM as stack.
 
 The same build by hand, from `firmware/access-point`:
 
@@ -208,6 +250,13 @@ stay in the tree because they are the tag's, and this project folder started as 
   a register-level diagnostic from `radio_diag()` — the raw `XTALSTATUS`, `POWSTAT` and
   `PLLRANGINGA` of the failing step — because that is what distinguishes a reference-clock
   problem from a PLL or VCO one when debugging on hardware.
+- **`PLL NOT LOCKED` on the `radio ready` line was a bug, now fixed.** The VCO range in
+  `PLLRANGINGA` bits 3:0 is still reported, but the lock bits are only read with the
+  synthesizer running (`radio_wait_pll_lock()`, called from the VCOI calibration with
+  `PWRMODE = SYNTH_TX`). Sampling them earlier, in STANDBY, reported `0` on every unit
+  because the VCO is unpowered there. `radio_init()` now also fails with
+  `RADIO_ERR_PLL_LOCK` if the PLL does not lock on the calibrated VCO current, so a real
+  lock failure is no longer silent.
 - The receiver stays in FULLRX continuously (7-11 mA on the radio). Wake-on-radio is a later
   feature.
 

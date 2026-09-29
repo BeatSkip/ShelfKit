@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""send_image.py - convert an image and push it to one Vusion tag.
+"""ap_server.py - the host program that manages image transfers to tags.
 
-Reads an image named after the serial number of the tag it belongs to
-(`images/1408F525.png`), converts it to the panel's two one-bit planes and
-pushes it through the access point's serial port, which forwards it over the
-radio. The serial frame format, the packet flow and the image layout are
-defined in `firmware/shared/include/shelfkit_proto.h`; the panel framebuffer
-layout is in `firmware/shelfkit-vusion/src/epd.h`:
+It owns both halves of a push: the folder of images named after tag serials
+with the record of what each tag already has, and the serial conversation with
+the access point. An image (`images/1408F525.png`) is converted to the panel's
+two one-bit planes here, framed here, and driven over the access point's serial
+port block by block; the access point is the radio bridge on the other end and
+knows nothing about images. The serial frame format, the packet flow and the
+image layout are defined in `firmware/shared/include/shelfkit_proto.h`; the
+panel framebuffer layout is in `firmware/shelfkit-vusion/src/epd.h`:
 
     plane = black/white first, then red, 5624 bytes each, row major,
             19 bytes per row, MSB = leftmost pixel, 0 = ink, 1 = white.
@@ -28,26 +30,38 @@ and only if the image is new or has changed since the last successful send. The
 pair of (serial, file fingerprint) that was sent is remembered in
 `images/.sent.json`, so restarting the tool does not resend anything.
 
+Running it without `--watch` is **one pass of the same thing**: it waits for
+each tag to announce itself and sends that tag's image when it does, then exits
+once everything has gone out or `--wait` seconds have passed. Nothing is
+transmitted to a tag that has not checked in - a tag that is off, still booting
+or refreshing its panel cannot be reached by transmitting harder, and trying
+only spends the retry budget and reports a failure that says nothing about the
+real problem. A tag whose image is already current is skipped; `--resend`
+pushes everything again.
+
 Usage:
-    python tools/send_image.py COM8 --watch               # the normal way
-    python tools/send_image.py COM8                       # one-shot: send
-                                                          # every image once
-    python tools/send_image.py COM8 -s 1408F525           # one tag only
-    python tools/send_image.py COM8 -d pictures --fit cover --rotate 0
-    python tools/send_image.py COM8 --monitor             # just print what the
+    python tools/ap_server.py COM8 --watch               # keep running
+    python tools/ap_server.py COM8                       # one pass, on check-in
+    python tools/ap_server.py COM8 -s 1408F525           # one tag only
+    python tools/ap_server.py COM8 -d pictures --fit cover --rotate 0
+    python tools/ap_server.py COM8 --monitor             # just print what the
                                                           # access point says
-    python tools/send_image.py COM8 --ping                # is the AP hearing me?
-    python tools/send_image.py --dry-run                  # convert only, no port
-    python tools/send_image.py --selftest                 # conversion + framing
-    python tools/send_image.py --list                     # serial ports
+    python tools/ap_server.py COM8 --ping                # is the AP hearing me?
+    python tools/ap_server.py --dry-run                  # convert only, no port
+    python tools/ap_server.py --selftest                 # conversion + framing
+    python tools/ap_server.py --list                     # serial ports
 
 Options:
     -d, --dir DIR      image folder (default: images, created if missing)
     -s, --serial SNR   only this tag's image (with --watch: only this tag)
-    -w, --watch        send when the access point reports that a tag checked in
+    -w, --watch        keep running: send when the access point reports that a
+                       tag checked in (never gives up)
     -p, --port PORT    serial port (may also be the first positional argument)
     -b, --baud RATE    serial rate (default: 38400, the access point's rate)
         --resend       forget the send record and push every tag's image once
+        --wait SEC     how long one pass waits for a tag to check in before
+                       giving up on it without sending (default: 120; a leaf
+                       announces every 60s). Ignored with --watch
         --fit MODE     contain (default, letterbox on white), cover, stretch
         --rotate DEG   auto (default), 0, 90, 180, 270 - clockwise; with auto a
                        landscape source is turned 90 deg clockwise into portrait
@@ -64,7 +78,8 @@ Options:
         --retries N    extra attempts per frame (default: 5)
         --monitor      print the access point's lines for 30 s, send nothing
         --ping         prove the host -> access point link without a tag
-        --verbose      show the frames on the wire and every check-in
+        --verbose      every frame on the wire with its round-trip time, the
+                       budgets, where the retries were, and every check-in
 """
 
 import argparse
@@ -107,7 +122,7 @@ except ImportError:
     sys.exit("png2epd.py is required next to this script (tools/png2epd.py)")
 
 # ── constants mirrored from shelfkit_proto.h / epd.h ──────────────────────
-# tools/tests/test_send_image.py re-reads both headers and asserts these are
+# tools/tests/test_ap_server.py re-reads both headers and asserts these are
 # still the same numbers.
 
 SK_PROTO_VERSION = 1
@@ -171,6 +186,16 @@ DEFAULT_RED_THRESHOLD = 110
 DEFAULT_RED_DOMINANCE = 40
 DEFAULT_FIT = "contain"
 DEFAULT_ROTATE = "auto"
+
+# How long one-shot mode waits for a tag to announce itself before giving up.
+#
+# Two minutes, because a *leaf* tag (the battery default) announces itself
+# every 60 s: a shorter wait would miss a tag that is sitting there perfectly
+# healthy. It is a ceiling, not a delay - the command returns as soon as every
+# image has been sent - so it only costs time when something is genuinely
+# wrong, which is exactly when the report ("no check-in from 1408F525") is
+# worth waiting for.
+DEFAULT_WAIT = 120.0
 
 # --watch reads the access point instead of polling the folder. These two
 # shape that loop: how long one read waits for a line, and how long silence
@@ -519,27 +544,42 @@ def encode_serial(serial_no):
 
 
 def send_block(ser, reader, offset, block, timeout, retries, verbose=False):
-    """Send one SK_U_IMG_DATA and return (next offset the tag needs, retries)."""
+    """Send one SK_U_IMG_DATA and return (next offset, retries used, seconds).
+
+    The time is the whole exchange for this block, retries included, which is
+    what makes the verbose output answer "is this transfer slow because of the
+    air, the tag's flash, or the PC".
+    """
     payload = bytes([offset >> 8, offset & 0xFF]) + bytes(block)
     frame = build_frame(SK_U_IMG_DATA, payload)
     what = f"IMG_DATA @{offset}"
     attempts = retries + 1
     last = "no answer"
+    started = time.monotonic()
     for attempt in range(1, attempts + 1):
         reader.flush()
         if verbose:
-            print(f"  -> {what} ({len(block)} bytes)")
+            print(f"  -> {what} (block {len(block)} B, frame {len(frame)} B, "
+                  f"try {attempt}/{attempts})")
+        sent_at = time.monotonic()
         write_all(ser, frame)
         ack = read_ack(reader, timeout, verbose)
+        waited = time.monotonic() - sent_at
         if ack is None:
             last = f"no answer within {timeout:g}s"
+            if verbose:
+                print(f"  <- {what}: nothing came back in {waited:.2f}s")
         else:
             ack_offset, status = ack
+            if verbose:
+                print(f"  <- {what}: tag is at {ack_offset} "
+                      f"(0x{ack_offset:04X}), {status_text(status)}, "
+                      f"{waited * 1000:.0f} ms")
             if status != SK_ST_OK:
                 raise TransferError(
                     f"the tag refused {what}: {status_text(status)}")
             if ack_offset > offset:
-                return ack_offset, attempt - 1
+                return ack_offset, attempt - 1, time.monotonic() - started
             # The access point answered, but the tag has not moved past this
             # block: resend it. A duplicate block is harmless, the tag only
             # reports the next byte it still needs.
@@ -581,10 +621,22 @@ def transfer(ser, serial_no, image, timeout=DEFAULT_TIMEOUT,
     reader = FrameReader(ser)
     reader.flush()
 
+    if verbose:
+        # What is about to happen, before any of it does: the numbers below
+        # are the ones to compare a failure against ("118 blocks" and then
+        # "blocks 42" says where it stopped).
+        print(f"  transfer: tag {serial_bytes.decode('ascii')}, {total} bytes in "
+              f"{(total + SK_IMG_DATA_MAX - 1) // SK_IMG_DATA_MAX} blocks of up to "
+              f"{SK_IMG_DATA_MAX} B, image CRC 0x{image_crc:04X}")
+        print(f"  budgets:  begin {begin_timeout:g}s, block {timeout:g}s, "
+              f"end {end_timeout:g}s, {retries} retry/retries per frame")
+        print("  note:     the access point's own console lines print here as "
+              "\"ap: ...\" - that is the serial trace from the other end")
+
     begin = (bytes([len(serial_bytes)]) + serial_bytes
              + bytes([total >> 8, total & 0xFF, image_crc >> 8, image_crc & 0xFF]))
     started = time.monotonic()
-    (offset, status), retry_count = exchange(
+    (offset, status), begin_retries = exchange(
         ser, reader, build_frame(SK_U_IMG_BEGIN, begin), begin_timeout, retries,
         f"IMG_BEGIN serial {serial_bytes.decode('ascii')} total {total} "
         f"crc 0x{image_crc:04X}", verbose)
@@ -599,15 +651,21 @@ def transfer(ser, serial_no, image, timeout=DEFAULT_TIMEOUT,
 
     bar = make_bar(total, progress)
     blocks = 0
+    data_retries = 0
+    end_retries = 0
+    slowest_at, slowest_s = 0, 0.0
     try:
         if bar is not None:
             bar.update(offset)
         while offset < total:
             block = image[offset:offset + SK_IMG_DATA_MAX]
-            new_offset, used = send_block(ser, reader, offset, block,
-                                          timeout, retries, verbose)
-            retry_count += used
+            at = offset
+            new_offset, used, seconds = send_block(ser, reader, offset, block,
+                                                   timeout, retries, verbose)
+            data_retries += used
             blocks += 1
+            if seconds > slowest_s:
+                slowest_at, slowest_s = at, seconds
             if bar is not None:
                 bar.update(new_offset - offset)
             offset = new_offset
@@ -623,13 +681,17 @@ def transfer(ser, serial_no, image, timeout=DEFAULT_TIMEOUT,
         for attempt in range(1, retries + 2):
             reader.flush()
             if verbose:
-                print(f"  -> IMG_END: {hexdump(end_frame)}")
+                print(f"  -> IMG_END (try {attempt}/{retries + 1}), waiting up to "
+                      f"{end_timeout:g}s: the tag refreshes the panel first")
             write_all(ser, end_frame)
             ack = read_ack(reader, end_timeout, verbose)
             if ack is None:
                 last = f"no answer within {end_timeout:g}s"
             else:
                 ack_offset, status = ack
+                if verbose:
+                    print(f"  <- IMG_END: tag is at {ack_offset} "
+                          f"(0x{ack_offset:04X}), {status_text(status)}")
                 if status == SK_ST_CRC:
                     raise TransferError(
                         "the tag verified the image and the CRC did not match - "
@@ -641,19 +703,42 @@ def transfer(ser, serial_no, image, timeout=DEFAULT_TIMEOUT,
                     break
                 last = f"the tag only confirmed {ack_offset} of {total} bytes"
             if attempt <= retries:
+                end_retries += 1
                 print(f"  IMG_END: {last} - retry {attempt}/{retries}",
                       file=sys.stderr)
         else:
             raise TransferError(f"IMG_END: {last} after {retries + 1} attempt(s)")
+    except TransferError:
+        # Where it stopped, before the exception unwinds: a transfer that dies
+        # at block 42 of 118 is a different problem from one that dies at 117.
+        if verbose:
+            print(f"  stopped: {blocks} of "
+                  f"{(total + SK_IMG_DATA_MAX - 1) // SK_IMG_DATA_MAX} blocks sent, "
+                  f"tag confirmed offset {offset}, {data_retries} retries",
+                  file=sys.stderr)
+        raise
     finally:
         if bar is not None:
             bar.close()
 
     elapsed = time.monotonic() - started
+    if verbose:
+        # Where the retries were. The three phases fail for different reasons
+        # (no tag / a lost block / no panel answer), and the slowest block says
+        # whether the time went into the air or into the tag's flash.
+        print(f"  retries: {begin_retries} begin, {data_retries} over "
+              f"{blocks} blocks, {end_retries} end")
+        print(f"  timing:  {elapsed / max(blocks, 1) * 1000:.0f} ms per block on "
+              f"average, slowest @{slowest_at} took {slowest_s * 1000:.0f} ms")
     return {
         "bytes": total,
         "blocks": blocks,
-        "retries": retry_count,
+        "retries": begin_retries + data_retries + end_retries,
+        "begin_retries": begin_retries,
+        "data_retries": data_retries,
+        "end_retries": end_retries,
+        "slowest_block": slowest_at,
+        "slowest_seconds": slowest_s,
         "seconds": elapsed,
         "crc": image_crc,
     }
@@ -1076,24 +1161,112 @@ def send_file(args, ser, serial, path, record=None):
     return stats
 
 
-def process_pending(args, ser, record=None):
-    """One-shot mode: send every image in the folder once, changed or not.
+def dry_run_all(args, ser=None):
+    """--dry-run: convert and report every image, without opening a port.
 
-    The send record is updated for each success but never consulted, so
-    `send_image.py COM8` means "push these images now" whatever was sent
-    before. Returns (done, failed, seen).
+    The port-carrying paths are send_pending() (one pass, on check-in) and
+    watch_loop() (forever). This one has no tag to wait for and no port to
+    wait on. Returns (failed, seen).
     """
     images = find_images(args.dir, args.serial)
-    done = failed = 0
+    failed = 0
     for serial, path in images:
         try:
-            send_file(args, ser, serial, path, record)
+            send_file(args, ser, serial, path, None)
         except (TransferError, OSError, ValueError) as exc:
             print(f"{os.path.basename(path)}: {exc}", file=sys.stderr)
             failed += 1
-            continue
-        done += 1
-    return done, failed, len(images)
+    return failed, len(images)
+
+
+def report_no_images(args):
+    """The "nothing to do" message for a folder that has no image for the tag."""
+    if args.serial:
+        print(f"no image for tag {args.serial.upper()} in "
+              f"{os.path.abspath(args.dir)}")
+    else:
+        print(f"no images in {os.path.abspath(args.dir)} - name one after "
+              f"the tag's serial, e.g. {os.path.join(args.dir, '1408F525.png')}")
+
+
+def pending_images(args, record):
+    """The images that are not on their tag yet, as {SERIAL: path}.
+
+    This is what "check if there are new images" means: a file whose size and
+    modification time match what the record says that tag was last given needs
+    nothing doing. `--resend` (which forgets the record) makes everything
+    pending again, and so does a tag that has never been sent to.
+    """
+    pending = {}
+    for serial, path in find_images(args.dir, args.serial):
+        if record is not None and not args.resend:
+            try:
+                fp = fingerprint(path)
+            except OSError:
+                fp = None
+            if fp is not None and record.is_current(serial, path, fp):
+                continue
+        pending[serial] = path
+    return pending
+
+
+def send_pending(args, ser, record):
+    """One-shot mode: push what is new, when each tag checks in.
+
+    The access point is a radio bridge with no memory of who is out there, and
+    a tag that is not listening cannot be reached by transmitting harder: an
+    immediate push at a tag that is off, still booting, or refreshing its panel
+    spends the whole retry budget and then reports a failure that says nothing
+    about the actual problem. So this waits for each tag to announce itself
+    ("TAG <serial> rssi=<db>", which a tag sends every 10 s as a router or
+    every 60 s as a leaf) and sends that tag's image when it does.
+
+    Returns an exit code: 0 when everything went out, 1 when something did not.
+    """
+    images = find_images(args.dir, args.serial)
+    if not images:
+        report_no_images(args)
+        return 1
+
+    # --resend means "forget what was sent": with the record empty, everything
+    # is new again. Done here rather than by the caller so that a run cannot
+    # depend on the order the two are called in.
+    if args.resend and len(record):
+        print(f"forgetting {len(record)} send record(s): {record.path}")
+        record.clear()
+
+    pending = pending_images(args, record)
+    if not pending:
+        print(f"nothing to send: {len(images)} image(s) are already on their "
+              f"tag(s) (--resend pushes them again)")
+        return 0
+
+    print(f"{len(pending)} image(s) waiting for their tag to check in:")
+    for serial, path in sorted(pending.items()):
+        print(f"  {os.path.basename(path)} -> {serial}")
+    print(f"  waiting up to {args.wait:g}s (a leaf announces every 60s, a "
+          f"router every 10s; Ctrl-C to stop)")
+
+    deadline = time.monotonic() + args.wait
+    sent, failed = check_in_loop(args, ser, record, pending=pending,
+                                 deadline=deadline)
+
+    leftover = sorted(pending)
+    missed = [serial for serial in leftover if serial not in failed]
+    for serial in missed:
+        print(f"{serial}: no check-in within {args.wait:g}s - nothing was sent "
+              f"to it (is the tag powered, in range, and flashed?)",
+              file=sys.stderr)
+    if failed:
+        # check_in() has already printed what went wrong, per tag.
+        print(f"{len(sent)} sent, {len(failed)} failed, {len(missed)} never "
+              f"checked in", file=sys.stderr)
+        return 1
+    if missed:
+        print(f"{len(sent)} sent, {len(missed)} never checked in", file=sys.stderr)
+        return 1
+    print(f"{len(sent)} sent")
+    return 0
 
 
 def check_in(args, ser, serial, record, notes=None):
@@ -1145,34 +1318,29 @@ def check_in(args, ser, serial, record, notes=None):
     return "sent"
 
 
-def watch_loop(args, ser, record=None, max_iterations=None):
-    """Send an image when the access point reports that its tag checked in.
+def check_in_loop(args, ser, record, pending=None, deadline=None,
+                  max_iterations=None):
+    """Wait for tags to check in, and act on each one.
 
     Reads the access point's lines; every line is printed (the boot banner and
     its messages are the operator's only view of the radio side), and a
-    "TAG <serial> rssi=<db>" line is a check-in. Ctrl-C stops.
+    "TAG <serial> rssi=<db>" line is a check-in.
 
-    `max_iterations` bounds the loop and exists so the tests can run the real
-    loop over a fake port; None means "until interrupted".
+    `pending` is {SERIAL: path} - the images still to go out - and the loop
+    stops once it is empty. None means "act on every check-in whose image is
+    new", which is --watch. `deadline` bounds the whole loop and
+    `max_iterations` bounds the number of reads (the tests use it to run the
+    real loop over a fake port). Returns (sent, failed), as sets of serials.
     """
-    record = SendRecord(os.path.join(args.dir, STATE_FILE)) if record is None \
-        else record
-    record.load()
-    if args.resend and len(record):
-        print(f"forgetting {len(record)} send record(s): {record.path}")
-        record.clear()
     reader = LineReader(ser)
     notes = set()
-    print(f"watching {os.path.abspath(args.dir)}: an image is sent when its tag "
-          f"checks in (Ctrl-C to stop)")
-    print(f"  send record   {record.path} ({len(record)} tag(s))"
-          + ("" if len(record) else " - nothing sent yet"))
-    print("  a tag announces itself about every 10s; --monitor shows the access "
-          "point's own output")
-
+    sent, failed = set(), set()
     silent_since = time.monotonic()
     iterations = 0
-    while max_iterations is None or iterations < max_iterations:
+
+    while ((max_iterations is None or iterations < max_iterations)
+           and (deadline is None or time.monotonic() < deadline)
+           and (pending is None or pending)):
         iterations += 1
         line = reader.read_line(WATCH_READ_TIMEOUT)
         if line is None:
@@ -1189,10 +1357,48 @@ def watch_loop(args, ser, record=None, max_iterations=None):
         serial = parse_tag_line(line)
         if serial is None:
             continue
+        if pending is not None and serial not in pending:
+            continue                # another tag: not one of ours to send
         # The tag's line is done; anything half-read now belongs to the
         # transfer, not to the text stream.
         reader.drop_partial()
-        check_in(args, ser, serial, record, notes)
+        result = check_in(args, ser, serial, record, notes)
+        if result == "sent":
+            sent.add(serial)
+            failed.discard(serial)
+            if pending is not None:
+                pending.pop(serial, None)
+        elif result == "failed":
+            failed.add(serial)
+        elif result in ("up-to-date", "no-image") and pending is not None:
+            # Nothing to send to this one after all; do not hold the run open
+            # waiting for it to check in again.
+            pending.pop(serial, None)
+    return sent, failed
+
+
+def watch_loop(args, ser, record=None, max_iterations=None):
+    """Send an image when the access point reports that its tag checked in.
+
+    Keeps running: every check-in whose image is new or has changed gets that
+    tag's image, forever. Ctrl-C stops.
+
+    `max_iterations` bounds the loop and exists so the tests can run the real
+    loop over a fake port; None means "until interrupted".
+    """
+    record = SendRecord(os.path.join(args.dir, STATE_FILE)) if record is None \
+        else record
+    record.load()
+    if args.resend and len(record):
+        print(f"forgetting {len(record)} send record(s): {record.path}")
+        record.clear()
+    print(f"watching {os.path.abspath(args.dir)}: an image is sent when its tag "
+          f"checks in (Ctrl-C to stop)")
+    print(f"  send record   {record.path} ({len(record)} tag(s))"
+          + ("" if len(record) else " - nothing sent yet"))
+    print("  a tag announces itself about every 10s; --monitor shows the access "
+          "point's own output")
+    check_in_loop(args, ser, record, max_iterations=max_iterations)
     return 0
 
 
@@ -1434,12 +1640,19 @@ def build_parser():
                          f"(default: {DEFAULT_END_TIMEOUT:g})")
     ap.add_argument("--retries", type=int, default=DEFAULT_RETRIES,
                     help=f"extra attempts per frame (default: {DEFAULT_RETRIES})")
+    ap.add_argument("--wait", type=float, default=DEFAULT_WAIT,
+                    help=f"seconds to wait for a tag to check in before giving "
+                         f"up without sending to it (default: {DEFAULT_WAIT:g}; a "
+                         f"leaf tag announces itself every 60s). Ignored with "
+                         f"--watch, which never gives up")
     ap.add_argument("--dry-run", action="store_true",
                     help="convert and report, write the planes, do not open the port")
     ap.add_argument("--no-progress", action="store_true",
                     help="no progress bar")
     ap.add_argument("--verbose", action="store_true",
-                    help="show every frame on the wire")
+                    help="every frame on the wire with its round-trip time, the "
+                         "timeout budgets, where the retries were, and every "
+                         "check-in")
     ap.add_argument("--selftest", action="store_true",
                     help="check the conversion and the framing on synthetic input")
     ap.add_argument("--list", action="store_true",
@@ -1461,6 +1674,8 @@ def parse_args(argv=None):
         ap.error("--red-threshold must be between 0 and 256")
     if args.retries < 0:
         ap.error("--retries must not be negative")
+    if args.wait <= 0:
+        ap.error("--wait must be positive (it is the time a tag has to check in)")
     if args.timeout <= 0:
         ap.error("--timeout must be positive")
     if args.begin_timeout <= 0:
@@ -1545,26 +1760,18 @@ def main(argv=None):
             watch_loop(args, ser)
             return 0
 
-        # One-shot: every image goes out, whatever the record says. Successes
-        # are recorded, so a later --watch does not repeat them.
+        # One-shot: one pass, driven by the tags' own check-ins. Successes are
+        # recorded, so a second run does not repeat them.
+        if args.dry_run:
+            failed, seen = dry_run_all(args, ser)
+            if not seen:
+                report_no_images(args)
+                return 1
+            return 1 if failed else 0
+
         record = SendRecord(os.path.join(args.dir, STATE_FILE))
         record.load()
-        if args.resend and len(record) and not args.dry_run:
-            print(f"forgetting {len(record)} send record(s): {record.path}")
-            record.clear()
-        done, failed, seen = process_pending(args, ser, record)
-        if not seen:
-            if args.serial:
-                print(f"no image for tag {args.serial.upper()} in "
-                      f"{os.path.abspath(args.dir)}")
-            else:
-                print(f"no images in {os.path.abspath(args.dir)} - name one after "
-                      f"the tag's serial, e.g. {os.path.join(args.dir, '1408F525.png')}")
-            return 1
-        if failed:
-            print(f"{done} sent, {failed} failed", file=sys.stderr)
-            return 1
-        return 0
+        return send_pending(args, ser, record)
     except TransferError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

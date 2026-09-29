@@ -56,4 +56,11 @@ void spi_write(const uint8_t *buf, uint16_t len);
 /* Read len bytes, sending 0x00 on MOSI. */
 void spi_read(uint8_t *buf, uint16_t len);
 
+/* Non-zero once a transfer has failed to complete and the bus has been
+ * written off. Every call after that returns immediately (a transfer returns
+ * 0, a read fills zeros), so a bus that never answers costs one timeout
+ * rather than one per byte - and the panel and the flash are unusable until
+ * the next reset. Callers that care print one line; see main.c's boot. */
+uint8_t spi_timed_out_flag(void);
+
 #endif /* SPI_H */

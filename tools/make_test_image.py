@@ -11,7 +11,7 @@ is needed) that makes three things obvious at a glance once it is on a label:
 Name the file after the tag's serial number and drop it in the image folder:
 
     python tools/make_test_image.py images/1408F525.png
-    python tools/send_image.py COM8
+    python tools/ap_server.py COM8
 
 Usage:
     python tools/make_test_image.py [out.png] [--serial TEXT] [--fill]

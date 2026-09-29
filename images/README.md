@@ -10,7 +10,7 @@ images/20553F69.jpg     -> the tag whose NFC serial is 20553F69
 PNG, JPEG, BMP and GIF all work. Then plug the access point in and start the watcher:
 
 ```powershell
-python tools/send_image.py COM8 --watch
+python tools/ap_server.py COM8 --watch
 ```
 
 Power the tag. It announces itself over the radio about every 10 seconds, the access point
@@ -33,16 +33,23 @@ the next announcement, so an unattended watcher heals itself.
 Use the serial the tag itself reports - it reads it out of its NFC chip at boot and
 announces it over the radio, and the access point prints it as the `TAG ...` line above.
 That printed serial is exactly the file name to use. If you do not know it yet, power the
-tag and watch: `python tools/send_image.py COM8 --monitor` prints what the access point
+tag and watch: `python tools/ap_server.py COM8 --monitor` prints what the access point
 says for 30 seconds and sends nothing.
 
 ## Sending once instead
 
 ```powershell
-python tools/send_image.py COM8                 # every image in this folder, once
-python tools/send_image.py COM8 -s 1408F525     # just this tag's image
-python tools/send_image.py COM8 --resend        # push again even if it was sent before
+python tools/ap_server.py COM8                 # one pass, waits for each tag to check in
+python tools/ap_server.py COM8 -s 1408F525     # just this tag's image
+python tools/ap_server.py COM8 --wait 30       # give up on a silent tag after 30 seconds
+python tools/ap_server.py COM8 --resend        # push again even if it was sent before
 ```
+
+Without `--watch` the tool still waits for the tag: it sends a tag's image when that tag
+announces itself, then exits once everything has gone out. Nothing is transmitted to a tag
+that has not checked in - a tag that is off or still booting cannot be reached by transmitting
+harder, and an immediate push only reports a radio failure that blames the wrong thing. An
+image that is already on its tag is skipped entirely, so a second run has nothing to do.
 
 ## What happens to the image
 
@@ -58,7 +65,7 @@ A full-screen image takes roughly 35 seconds: 11248 bytes in 96-byte radio frame
 Preview a conversion without touching the radio:
 
 ```powershell
-python tools/send_image.py --dry-run
+python tools/ap_server.py --dry-run
 ```
 
 It writes `<name>.bw.bin` and `<name>.red.bin` next to each image and prints what it would

@@ -26,7 +26,7 @@ except ImportError:
 
 PALETTE = {"white": (255, 255, 255), "black": (0, 0, 0), "red": (255, 0, 0)}
 
-# Defaults of the non-dithered classifier. tools/send_image.py drives the very
+# Defaults of the non-dithered classifier. tools/ap_server.py drives the very
 # same function with its --threshold/--red-threshold/--red-dominance options,
 # so an image converted for the air looks exactly like a boot image.
 INK_THRESHOLD = 110

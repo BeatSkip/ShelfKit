@@ -159,12 +159,12 @@ the honest answer is observability, not a routing table:
      path via F240 (01 hops, 03 left)
   ```
   (its own frames coming back through the mesh are reported as
-  `link: duplicate msg 00 (our own, handed back by a relay) via F240 (01 hops, 03 left)`)
+  `link: duplicate msg 00 origin 534B4150 (our own, handed back by a relay) via F240 (01 hops, 03 left)`)
 
 The path deliberately goes on a second line rather than being appended to the
 `TAG ... rssi=...` line: that line's exact shape is what
-`tools/send_image.py` matches for `--watch`/check-in, and
-`tools/tests/test_send_image.py` pins it, including that trailing junk is *not*
+`tools/ap_server.py` matches for `--watch`/check-in, and
+`tools/tests/test_ap_server.py` pins it, including that trailing junk is *not*
 a check-in. Appending here would have silently stopped `--watch` from
 recognising the tag.
 
@@ -325,7 +325,7 @@ does not link the link layer, is byte-for-byte unchanged.)
 | Announcement | tag `radio: id E5C0F240 (leaf)`; access point `TAG 1408F525 rssi=-45` |
 | Image transfer, router tag | **80.8 s**, 118 blocks, 1 retry, 11248 bytes, 139 B/s, CRC verified, image displayed |
 | Image transfer, leaf tag in WOR | **80.8 s**, same block/retry/CRC result, image displayed |
-| Relay | `relay msg 00 origin 534B4150 hops 04->03` on the router; `link: duplicate msg 00 (our own, handed back by a relay) via F240 (01 hops, 03 left)` on the access point |
+| Relay | `relay msg 00 origin 534B4150 hops 04->03` on the router; `link: duplicate msg 00 origin 534B4150 (our own, handed back by a relay) via F240 (01 hops, 03 left)` on the access point |
 | WOR | tag enters WOR at 16.1 s, wakes on the access point's long preamble at 51.3 s, returns to WOR 3 s after the exchange ends |
 
 The old link moved the same image in ~40 s (281 B/s). The new one is **about
@@ -408,9 +408,9 @@ committed firmware is this section, not a broken link.
   `SK_MIN_PAYLOAD` in `shelfkit_proto.h`).
 
 **Where the tests are.** `tools/run_tests.ps1` runs all three suites:
-`tools/tests/test_send_image.py` (the host tools, 99 tests),
+`tools/tests/test_ap_server.py` (the host-side image transfer, 105 tests),
 `tools/tests/sk_link_test.c` (the link layer against a virtual radio, 142
 checks - frame layout, CRC, addressing, flooding, hop limit, full route,
 duplicates, bad frames, the record route and an end-to-end three-node walk) and
 `tools/tests/serial_frame_test.c` (the access point's serial bridge with the
-real link layer underneath it, 162 checks).
+real link layer underneath it, 187 checks).

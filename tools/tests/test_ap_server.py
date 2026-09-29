@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Tests for tools/send_image.py - the CRC, the framing, the conversion layout
+"""Tests for tools/ap_server.py - the CRC, the framing, the conversion layout
 and the stop-and-wait transfer.
 
     python -m unittest discover -s tools/tests -v
-    python tools/tests/test_send_image.py
+    python tools/tests/test_ap_server.py
 
 The layout tests are the important ones: they pin down the bit positions that
 epd.h's epd_plane_ink()/epd_plane_white() use, and they compare the air path
-(tools/send_image.py) against the boot path (tools/png2epd.py) for the same
+(tools/ap_server.py) against the boot path (tools/png2epd.py) for the same
 source image, so both produce the same picture on the panel.
 """
 
@@ -32,7 +32,7 @@ if TOOLS_DIR not in sys.path:
 from PIL import Image
 
 import png2epd
-import send_image
+import ap_server
 
 EPD_H_PATH = os.path.join(REPO_DIR, "firmware", "shelfkit-vusion", "src", "epd.h")
 PROTO_H_PATH = os.path.join(REPO_DIR, "firmware", "shared", "include",
@@ -135,19 +135,19 @@ def pack_plane(white_pixels):
     Deliberately built from pixel coordinates, starting at 0 and *setting*
     bits for white - the inverse of how the converter is written.
     """
-    plane = bytearray(send_image.SK_IMG_PLANE_BYTES)
+    plane = bytearray(ap_server.SK_IMG_PLANE_BYTES)
     for y, row in enumerate(white_pixels):
         for x, is_white in enumerate(row):
             if is_white:
-                plane[(y * send_image.SK_IMG_W + x) >> 3] |= 0x80 >> (x & 7)
+                plane[(y * ap_server.SK_IMG_W + x) >> 3] |= 0x80 >> (x & 7)
     return bytes(plane)
 
 
 def epd_h_plane(ink_pixels):
     """Port of epd.h's epd_plane_ink(), arithmetic copied verbatim."""
-    plane = bytearray([0xFF]) * send_image.SK_IMG_PLANE_BYTES
+    plane = bytearray([0xFF]) * ap_server.SK_IMG_PLANE_BYTES
     for x, y in ink_pixels:
-        plane[(y * send_image.SK_IMG_W + x) >> 3] &= ~(0x80 >> (x & 7)) & 0xFF
+        plane[(y * ap_server.SK_IMG_W + x) >> 3] &= ~(0x80 >> (x & 7)) & 0xFF
     return bytes(plane)
 
 
@@ -193,12 +193,16 @@ class FakeAP(FakePort):
     sends while a transfer is running.
     """
 
-    def __init__(self, serial=b"1408F525", total=send_image.SK_IMG_TOTAL_BYTES,
+    def __init__(self, serial=b"1408F525", total=ap_server.SK_IMG_TOTAL_BYTES,
                  drop_first=(), no_ack_once=(), no_ack=(), partial=None,
                  begin_status=0, end_status=0, begin_offset=0, end_delay=0.0,
-                 data_status=None):
+                 data_status=None, any_serial=False):
         super().__init__()
         self.serial = serial
+        # Any serial: serve whichever tag a BEGIN names. A run that pushes to
+        # two tags needs that, and the per-transfer state below is reset by
+        # every BEGIN, so one fake access point can serve them in turn.
+        self.any_serial = any_serial
         self.total = total
         self.drop_first = set(drop_first)     # answer "still need it" once
         self.no_ack_once = set(no_ack_once)   # stay silent once
@@ -216,17 +220,29 @@ class FakeAP(FakePort):
         self.image_crc = None
         self.end_seen = 0
         self.types_seen = []
-        self._parser = send_image.FrameParser()
+        self._parser = ap_server.FrameParser()
         self._delayed = []
         self._delayed_at = 0.0
         self._tried = set()
 
     # -- pyserial's surface ------------------------------------------------
-    def queue_text(self, text):
-        """Queue access point output, CR LF terminated if the caller wants."""
+    def queue_text(self, text, delay=0.0):
+        """Queue access point output, CR LF terminated if the caller wants.
+
+        `delay` holds it back for that many seconds, which is how a scripted
+        *second* check-in is made to arrive after the transfer the first one
+        started: a transfer opens its own reader and calls
+        reset_input_buffer(), so a line already sitting in the port buffer is
+        thrown away - true of the real port too, and the reason a tag repeats
+        its announcement.
+        """
         if isinstance(text, str):
             text = text.encode("latin-1")       # byte for byte, like the UART
-        self.feed(text)
+        if delay:
+            self._delayed.append(text)
+            self._delayed_at = time.monotonic() + delay
+        else:
+            self.feed(text)
 
     def write(self, data):
         for ptype, payload in self._parser.feed(bytes(data)):
@@ -240,8 +256,8 @@ class FakeAP(FakePort):
 
     # -- the access point --------------------------------------------------
     def _ack(self, offset, status, delay=0.0):
-        frame = send_image.build_frame(
-            send_image.SK_U_ACK,
+        frame = ap_server.build_frame(
+            ap_server.SK_U_ACK,
             bytes([offset >> 8, offset & 0xFF, status]))
         if delay:
             self._delayed.append(frame)
@@ -249,13 +265,13 @@ class FakeAP(FakePort):
         else:
             self._tx += frame
 
-    def _status(self, status, detail=send_image.LINK_D_TAG):
-        self._tx += send_image.build_frame(send_image.SK_U_STATUS,
+    def _status(self, status, detail=ap_server.LINK_D_TAG):
+        self._tx += ap_server.build_frame(ap_server.SK_U_STATUS,
                                            bytes([status, detail]))
 
     def handle(self, ptype, payload):
         self.types_seen.append(ptype)
-        if ptype == send_image.SK_U_IMG_BEGIN:
+        if ptype == ap_server.SK_U_IMG_BEGIN:
             self.begin = payload
             if self.begin_status:
                 self._status(self.begin_status)
@@ -263,12 +279,13 @@ class FakeAP(FakePort):
             slen = payload[0]
             total = (payload[1 + slen] << 8) | payload[2 + slen]
             self.image_crc = (payload[3 + slen] << 8) | payload[4 + slen]
-            assert payload[1:1 + slen] == self.serial, payload[1:1 + slen]
+            if not self.any_serial:
+                assert payload[1:1 + slen] == self.serial, payload[1:1 + slen]
             assert total == self.total, total
             self.image = bytearray(total)
             self.expected = self.begin_offset
-            self._ack(self.expected, send_image.SK_ST_OK)
-        elif ptype == send_image.SK_U_IMG_DATA:
+            self._ack(self.expected, ap_server.SK_ST_OK)
+        elif ptype == ap_server.SK_U_IMG_DATA:
             offset = (payload[0] << 8) | payload[1]
             data = payload[2:]
             self.offsets.append(offset)
@@ -282,33 +299,33 @@ class FakeAP(FakePort):
                 return
             if offset in self.drop_first and offset not in self._tried:
                 self._tried.add(offset)
-                self._ack(offset, send_image.SK_ST_OK)      # "still need it"
+                self._ack(offset, ap_server.SK_ST_OK)      # "still need it"
                 return
             if self.partial and offset == self.partial[0] and offset not in self._tried:
                 self._tried.add(offset)
                 count = min(self.partial[1], len(data))
                 self.image[offset:offset + count] = data[:count]
                 self.expected = offset + count
-                self._ack(self.expected, send_image.SK_ST_OK)
+                self._ack(self.expected, ap_server.SK_ST_OK)
                 return
             if offset != self.expected:
-                self._ack(self.expected, send_image.SK_ST_OFFSET)
+                self._ack(self.expected, ap_server.SK_ST_OFFSET)
                 return
             self.image[offset:offset + len(data)] = data
             self.expected = offset + len(data)
-            self._ack(self.expected, send_image.SK_ST_OK)
-        elif ptype == send_image.SK_U_IMG_END:
+            self._ack(self.expected, ap_server.SK_ST_OK)
+        elif ptype == ap_server.SK_U_IMG_END:
             self.end_seen += 1
             status = self.end_status or (
-                send_image.SK_ST_OK
-                if send_image.crc16_ccitt_false(bytes(self.image)) == self.image_crc
-                else send_image.SK_ST_CRC)
+                ap_server.SK_ST_OK
+                if ap_server.crc16_ccitt_false(bytes(self.image)) == self.image_crc
+                else ap_server.SK_ST_CRC)
             self._ack(self.total, status, self.end_delay)
 
 
 def test_image():
     """11248 deterministic bytes to push through the protocol."""
-    return bytes((i * 7 + 3) & 0xFF for i in range(send_image.SK_IMG_TOTAL_BYTES))
+    return bytes((i * 7 + 3) & 0xFF for i in range(ap_server.SK_IMG_TOTAL_BYTES))
 
 
 def run_transfer(ap, image=None, **kwargs):
@@ -316,7 +333,7 @@ def run_transfer(ap, image=None, **kwargs):
     kwargs.setdefault("timeout", 0.2)
     kwargs.setdefault("end_timeout", 1.0)
     kwargs.setdefault("progress", False)
-    return send_image.transfer(ap, ap.serial.decode("ascii"), image, **kwargs)
+    return ap_server.transfer(ap, ap.serial.decode("ascii"), image, **kwargs)
 
 
 # ── the tests ─────────────────────────────────────────────────────────────
@@ -325,7 +342,7 @@ class CrcTests(unittest.TestCase):
 
     def test_reference_vector(self):
         """CRC-16/CCITT-FALSE('123456789') is 0x29B1 (the header's check value)."""
-        self.assertEqual(send_image.crc16_ccitt_false(b"123456789"), 0x29B1)
+        self.assertEqual(ap_server.crc16_ccitt_false(b"123456789"), 0x29B1)
         # The header names binascii.crc_hqx(data, 0xFFFF) as the host-side
         # equivalent. Do not assume it: assert the check value first, then the
         # agreement over real data.
@@ -333,17 +350,17 @@ class CrcTests(unittest.TestCase):
 
     def test_matches_bitwise_reference_and_crc_hqx(self):
         rng = random.Random(20240517)
-        for size in (0, 1, 2, 3, 95, 96, 255, 256, 1000, 5624, send_image.SK_IMG_TOTAL_BYTES):
+        for size in (0, 1, 2, 3, 95, 96, 255, 256, 1000, 5624, ap_server.SK_IMG_TOTAL_BYTES):
             data = bytes(rng.randrange(256) for _ in range(size))
-            mine = send_image.crc16_ccitt_false(data)
+            mine = ap_server.crc16_ccitt_false(data)
             self.assertEqual(mine, bitwise_crc16(data), f"size {size}")
             self.assertEqual(mine, binascii.crc_hqx(data, 0xFFFF), f"size {size}")
 
     def test_same_variant_for_frames_and_for_the_image(self):
         """One implementation serves both the frame CRC and the image CRC."""
         image = test_image()
-        self.assertEqual(send_image.crc16_ccitt_false(image),
-                         send_image.bitwise_crc_reference(image))
+        self.assertEqual(ap_server.crc16_ccitt_false(image),
+                         ap_server.bitwise_crc_reference(image))
 
     def test_not_the_umts_variant(self):
         """0x8005/CRC-16/UMTS would give a different value - make sure we are
@@ -354,75 +371,75 @@ class CrcTests(unittest.TestCase):
             umts ^= byte
             for _ in range(8):
                 umts = (umts >> 1) ^ 0xA001 if umts & 1 else umts >> 1
-        self.assertNotEqual(send_image.crc16_ccitt_false(data), umts)
+        self.assertNotEqual(ap_server.crc16_ccitt_false(data), umts)
 
 
 class FrameTests(unittest.TestCase):
 
     def setUp(self):
         self.payload = bytes([0x00, 0x60]) + bytes(range(96))
-        self.frame = send_image.build_frame(send_image.SK_U_IMG_DATA, self.payload)
+        self.frame = ap_server.build_frame(ap_server.SK_U_IMG_DATA, self.payload)
 
     def test_header_layout(self):
-        self.assertEqual(self.frame[0], send_image.SK_UART_SYNC0)
-        self.assertEqual(self.frame[1], send_image.SK_UART_SYNC1)
-        self.assertEqual(self.frame[2], send_image.SK_U_IMG_DATA)
+        self.assertEqual(self.frame[0], ap_server.SK_UART_SYNC0)
+        self.assertEqual(self.frame[1], ap_server.SK_UART_SYNC1)
+        self.assertEqual(self.frame[2], ap_server.SK_U_IMG_DATA)
         self.assertEqual(self.frame[3], len(self.payload))
         self.assertEqual(len(self.frame), 4 + len(self.payload) + 2)
         crc = (self.frame[-2] << 8) | self.frame[-1]
-        self.assertEqual(crc, send_image.crc16_ccitt_false(self.frame[2:-2]))
+        self.assertEqual(crc, ap_server.crc16_ccitt_false(self.frame[2:-2]))
 
     def test_round_trip(self):
-        frames = send_image.FrameParser().feed(self.frame)
-        self.assertEqual(frames, [(send_image.SK_U_IMG_DATA, self.payload)])
+        frames = ap_server.FrameParser().feed(self.frame)
+        self.assertEqual(frames, [(ap_server.SK_U_IMG_DATA, self.payload)])
 
     def test_corrupted_crc_is_rejected(self):
         broken = bytearray(self.frame)
         broken[-1] ^= 0x01
-        self.assertEqual(send_image.FrameParser().feed(bytes(broken)), [])
+        self.assertEqual(ap_server.FrameParser().feed(bytes(broken)), [])
         broken = bytearray(self.frame)
         broken[-2] ^= 0x80
-        self.assertEqual(send_image.FrameParser().feed(bytes(broken)), [])
+        self.assertEqual(ap_server.FrameParser().feed(bytes(broken)), [])
 
     def test_corrupted_payload_is_rejected(self):
         broken = bytearray(self.frame)
         broken[10] ^= 0xFF
-        self.assertEqual(send_image.FrameParser().feed(bytes(broken)), [])
+        self.assertEqual(ap_server.FrameParser().feed(bytes(broken)), [])
 
     def test_junk_and_partial_frame_before_a_valid_frame(self):
         junk = b"\x00\x11\x22\xAA\x33"
         partial = b"\xAA\x55\x02\x08\x01\x02"        # promises 8 bytes, has 2
-        frames = send_image.FrameParser().feed(junk + partial + self.frame)
-        self.assertEqual(frames, [(send_image.SK_U_IMG_DATA, self.payload)])
+        frames = ap_server.FrameParser().feed(junk + partial + self.frame)
+        self.assertEqual(frames, [(ap_server.SK_U_IMG_DATA, self.payload)])
 
     def test_bad_length_is_rejected(self):
         # LEN above SK_UART_PAYLOAD_MAX: resynchronise instead of waiting for
         # bytes that can never be part of a legal frame.
         overlong = b"\xAA\x55\x02\xFF" + bytes(10)
-        good = send_image.build_frame(send_image.SK_U_ACK, bytes([0, 0, 0]))
-        frames = send_image.FrameParser().feed(overlong + good)
-        self.assertEqual(frames, [(send_image.SK_U_ACK, bytes([0, 0, 0]))])
+        good = ap_server.build_frame(ap_server.SK_U_ACK, bytes([0, 0, 0]))
+        frames = ap_server.FrameParser().feed(overlong + good)
+        self.assertEqual(frames, [(ap_server.SK_U_ACK, bytes([0, 0, 0]))])
 
     def test_split_across_feeds(self):
-        parser = send_image.FrameParser()
+        parser = ap_server.FrameParser()
         self.assertEqual(parser.feed(self.frame[:3]), [])
         self.assertEqual(parser.feed(self.frame[3:20]), [])
         self.assertEqual(parser.feed(self.frame[20:]),
-                         [(send_image.SK_U_IMG_DATA, self.payload)])
-        self.assertEqual(parser.feed(self.frame), [(send_image.SK_U_IMG_DATA, self.payload)])
+                         [(ap_server.SK_U_IMG_DATA, self.payload)])
+        self.assertEqual(parser.feed(self.frame), [(ap_server.SK_U_IMG_DATA, self.payload)])
 
     def test_two_frames_in_one_chunk(self):
-        end = send_image.build_frame(send_image.SK_U_IMG_END)
-        frames = send_image.FrameParser().feed(self.frame + end)
-        self.assertEqual(frames, [(send_image.SK_U_IMG_DATA, self.payload),
-                                  (send_image.SK_U_IMG_END, b"")])
+        end = ap_server.build_frame(ap_server.SK_U_IMG_END)
+        frames = ap_server.FrameParser().feed(self.frame + end)
+        self.assertEqual(frames, [(ap_server.SK_U_IMG_DATA, self.payload),
+                                  (ap_server.SK_U_IMG_END, b"")])
 
 
 class ConversionLayoutTests(unittest.TestCase):
     """The bit positions that, if wrong, scramble the picture on the panel."""
 
-    W = send_image.SK_IMG_W
-    H = send_image.SK_IMG_H
+    W = ap_server.SK_IMG_W
+    H = ap_server.SK_IMG_H
 
     def setUp(self):
         self.black = {(0, 0), (0, self.H - 1)}
@@ -436,13 +453,13 @@ class ConversionLayoutTests(unittest.TestCase):
             im.putpixel((x, y), (255, 0, 0, 255))
         im.putpixel((5, 5), (0, 0, 0, 0))       # transparent black -> white
         self.im = im
-        self.bw, self.red_plane = send_image.to_planes(im)
+        self.bw, self.red_plane = ap_server.to_planes(im)
 
     def test_plane_sizes(self):
-        self.assertEqual(len(self.bw), send_image.SK_IMG_PLANE_BYTES)
-        self.assertEqual(len(self.red_plane), send_image.SK_IMG_PLANE_BYTES)
-        self.assertEqual(send_image.SK_IMG_PLANE_BYTES, 5624)
-        self.assertEqual(send_image.SK_IMG_TOTAL_BYTES, 11248)
+        self.assertEqual(len(self.bw), ap_server.SK_IMG_PLANE_BYTES)
+        self.assertEqual(len(self.red_plane), ap_server.SK_IMG_PLANE_BYTES)
+        self.assertEqual(ap_server.SK_IMG_PLANE_BYTES, 5624)
+        self.assertEqual(ap_server.SK_IMG_TOTAL_BYTES, 11248)
 
     def test_exact_bytes_at_known_pixel_positions(self):
         # Row 0: black at x=0 (MSB of byte 0), red at x=151 (LSB of byte 18).
@@ -484,30 +501,30 @@ class ConversionLayoutTests(unittest.TestCase):
         self.assertEqual(self.red_plane, epd_h_plane(self.red))
 
     def test_ink_counts(self):
-        self.assertEqual(send_image.count_ink(self.bw), len(self.black))
-        self.assertEqual(send_image.count_ink(self.red_plane), len(self.red))
+        self.assertEqual(ap_server.count_ink(self.bw), len(self.black))
+        self.assertEqual(ap_server.count_ink(self.red_plane), len(self.red))
 
     def test_only_ink_pixels_are_cleared(self):
-        ink_bw = {send_image.plane_byte_index(x, y) for x, y in self.black}
-        for index in range(send_image.SK_IMG_PLANE_BYTES):
+        ink_bw = {ap_server.plane_byte_index(x, y) for x, y in self.black}
+        for index in range(ap_server.SK_IMG_PLANE_BYTES):
             if index not in ink_bw:
                 self.assertEqual(self.bw[index], 0xFF, f"byte {index}")
 
     def test_classification_thresholds(self):
-        self.assertEqual(send_image.classify(255, 0, 0), "red")
-        self.assertEqual(send_image.classify(120, 20, 20), "red")
-        self.assertEqual(send_image.classify(255, 255, 255), "white")
-        self.assertEqual(send_image.classify(100, 100, 100), "black")
-        self.assertEqual(send_image.classify(200, 200, 200), "white")
+        self.assertEqual(ap_server.classify(255, 0, 0), "red")
+        self.assertEqual(ap_server.classify(120, 20, 20), "red")
+        self.assertEqual(ap_server.classify(255, 255, 255), "white")
+        self.assertEqual(ap_server.classify(100, 100, 100), "black")
+        self.assertEqual(ap_server.classify(200, 200, 200), "white")
         # threshold moves the black/white line: a uniform 150 grey is all ink
         # at --threshold 200 and all white at --threshold 100.
-        self.assertEqual(send_image.to_planes(
+        self.assertEqual(ap_server.to_planes(
             self._solid((150, 150, 150)), threshold=200)[0][0], 0x00)
-        self.assertEqual(send_image.to_planes(
+        self.assertEqual(ap_server.to_planes(
             self._solid((150, 150, 150)), threshold=100)[0][0], 0xFF)
         # a dimmer red needs a lower --red-threshold
-        self.assertEqual(send_image.classify(90, 10, 10), "black")
-        self.assertEqual(send_image.classify(90, 10, 10, red_threshold=80), "red")
+        self.assertEqual(ap_server.classify(90, 10, 10), "black")
+        self.assertEqual(ap_server.classify(90, 10, 10, red_threshold=80), "red")
 
     def _solid(self, rgb):
         return Image.new("RGBA", (self.W, self.H), rgb + (255,))
@@ -518,8 +535,8 @@ class FitAndRotateTests(unittest.TestCase):
     def test_fit_modes_end_at_panel_size(self):
         source = Image.new("RGB", (400, 300), (255, 255, 255))
         for fit in ("contain", "cover", "stretch"):
-            prepared = send_image.prepare_image(source, fit=fit, rotate="auto")
-            self.assertEqual(prepared.size, (send_image.SK_IMG_W, send_image.SK_IMG_H))
+            prepared = ap_server.prepare_image(source, fit=fit, rotate="auto")
+            self.assertEqual(prepared.size, (ap_server.SK_IMG_W, ap_server.SK_IMG_H))
 
     def test_auto_rotates_landscape_only(self):
         # A landscape 296x152 source. 90 degrees clockwise puts the source's
@@ -528,56 +545,56 @@ class FitAndRotateTests(unittest.TestCase):
         landscape = Image.new("RGB", (296, 152), (255, 255, 255))
         landscape.putpixel((0, 151), (0, 0, 0))
         landscape.putpixel((0, 0), (0, 0, 0))
-        prepared = send_image.prepare_image(landscape, rotate="auto")
+        prepared = ap_server.prepare_image(landscape, rotate="auto")
         self.assertEqual(prepared.size, (152, 296))
-        bw, _red = send_image.to_planes(prepared)
+        bw, _red = ap_server.to_planes(prepared)
         self.assertEqual(bw[0], 0x7F)        # source bottom-left -> top-left
         self.assertEqual(bw[18], 0xFE)       # source top-left -> top-right
-        self.assertEqual(send_image.count_ink(bw), 2)
+        self.assertEqual(ap_server.count_ink(bw), 2)
 
         # A portrait source is left alone.
         portrait = Image.new("RGB", (152, 296), (255, 255, 255))
         portrait.putpixel((0, 0), (0, 0, 0))
-        bw, _red = send_image.to_planes(send_image.prepare_image(portrait, rotate="auto"))
+        bw, _red = ap_server.to_planes(ap_server.prepare_image(portrait, rotate="auto"))
         self.assertEqual(bw[0], 0x7F)
 
     def test_contain_letterboxes_on_white(self):
         # 608x296 black source: contain scales it to 152x74 and centres it, so
         # 111 white rows sit above and below it.
         source = Image.new("RGB", (608, 296), (0, 0, 0))
-        bw, _red = send_image.to_planes(
-            send_image.prepare_image(source, fit="contain", rotate=0))
+        bw, _red = ap_server.to_planes(
+            ap_server.prepare_image(source, fit="contain", rotate=0))
         self.assertEqual(bw[0:19], b"\xFF" * 19)                    # top band
         self.assertEqual(bw[111 * 19:112 * 19], b"\x00" * 19)       # first ink row
         self.assertEqual(bw[184 * 19:185 * 19], b"\x00" * 19)       # last ink row
         self.assertEqual(bw[185 * 19:186 * 19], b"\xFF" * 19)       # bottom band
-        self.assertEqual(send_image.count_ink(bw), 152 * 74)
+        self.assertEqual(ap_server.count_ink(bw), 152 * 74)
 
     def test_cover_crops_instead_of_letterboxing(self):
         source = Image.new("RGB", (608, 296), (255, 255, 255))
-        prepared = send_image.prepare_image(source, fit="cover", rotate=0)
+        prepared = ap_server.prepare_image(source, fit="cover", rotate=0)
         self.assertEqual(prepared.size, (152, 296))
-        bw, _red = send_image.to_planes(prepared)
-        self.assertEqual(bw, b"\xFF" * send_image.SK_IMG_PLANE_BYTES)
+        bw, _red = ap_server.to_planes(prepared)
+        self.assertEqual(bw, b"\xFF" * ap_server.SK_IMG_PLANE_BYTES)
         # ... and a black source stays black to every edge.
-        black = send_image.to_planes(send_image.prepare_image(
+        black = ap_server.to_planes(ap_server.prepare_image(
             Image.new("RGB", (608, 296), (0, 0, 0)), fit="cover", rotate=0))[0]
-        self.assertEqual(black, b"\x00" * send_image.SK_IMG_PLANE_BYTES)
+        self.assertEqual(black, b"\x00" * ap_server.SK_IMG_PLANE_BYTES)
 
     def test_stretch_ignores_the_aspect_ratio(self):
         """stretch fills the panel whatever the source shape: a square source
         becomes a 152x296 frame with no white bands."""
-        black = send_image.to_planes(send_image.prepare_image(
+        black = ap_server.to_planes(ap_server.prepare_image(
             Image.new("RGB", (76, 74), (0, 0, 0)), fit="stretch", rotate=0))[0]
-        self.assertEqual(black, b"\x00" * send_image.SK_IMG_PLANE_BYTES)
-        white = send_image.to_planes(send_image.prepare_image(
+        self.assertEqual(black, b"\x00" * ap_server.SK_IMG_PLANE_BYTES)
+        white = ap_server.to_planes(ap_server.prepare_image(
             Image.new("RGB", (76, 74), (255, 255, 255)), fit="stretch", rotate=0))[0]
-        self.assertEqual(white, b"\xFF" * send_image.SK_IMG_PLANE_BYTES)
+        self.assertEqual(white, b"\xFF" * ap_server.SK_IMG_PLANE_BYTES)
 
     def test_exact_size_source_is_not_resampled(self):
         source = Image.new("RGB", (152, 296), (255, 255, 255))
         source.putpixel((77, 88), (7, 7, 7))
-        prepared = send_image.prepare_image(source, fit="contain", rotate="auto")
+        prepared = ap_server.prepare_image(source, fit="contain", rotate="auto")
         self.assertEqual(prepared.size, (152, 296))
         self.assertEqual(prepared.getpixel((77, 88))[:3], (7, 7, 7))
 
@@ -607,11 +624,11 @@ class Png2EpdParityTests(unittest.TestCase):
         # Exactly what png2epd.py --rotate 90 does.
         boot = png2epd.rotate_image(Image.open(path).convert("RGBA"), 90)
         bw_boot, red_boot = png2epd.to_planes(boot, False)
-        (bw_air, red_air), _note = send_image.convert_file(
+        (bw_air, red_air), _note = ap_server.convert_file(
             path, fit="contain", rotate="auto")
         self.assertEqual(bw_air, bytes(bw_boot))
         self.assertEqual(red_air, bytes(red_boot))
-        (bw_air90, red_air90), _note = send_image.convert_file(
+        (bw_air90, red_air90), _note = ap_server.convert_file(
             path, fit="contain", rotate="90")
         self.assertEqual(bw_air90, bytes(bw_boot))
 
@@ -619,7 +636,7 @@ class Png2EpdParityTests(unittest.TestCase):
         path = self._write((152, 296), "portrait.png")
         boot = Image.open(path).convert("RGBA")
         bw_boot, red_boot = png2epd.to_planes(boot, False)
-        (bw_air, red_air), _note = send_image.convert_file(
+        (bw_air, red_air), _note = ap_server.convert_file(
             path, fit="contain", rotate="auto")
         self.assertEqual(bw_air, bytes(bw_boot))
         self.assertEqual(red_air, bytes(red_boot))
@@ -628,7 +645,7 @@ class Png2EpdParityTests(unittest.TestCase):
         path = self._write((296, 152), "dither.png")
         boot = png2epd.rotate_image(Image.open(path).convert("RGBA"), 90)
         bw_boot, red_boot = png2epd.to_planes(boot, True)
-        (bw_air, red_air), _note = send_image.convert_file(
+        (bw_air, red_air), _note = ap_server.convert_file(
             path, fit="contain", rotate="auto", dither=True)
         self.assertEqual(bw_air, bytes(bw_boot))
         self.assertEqual(red_air, bytes(red_boot))
@@ -660,9 +677,9 @@ class Png2EpdParityTests(unittest.TestCase):
         red_part = text.split("epd_image_red[EPD_PLANE_BYTES] = {")[1].split("};")[0]
         bw_c = bytes(int(v, 16) for v in re.findall(r"0x([0-9A-Fa-f]{2})", bw_part))
         red_c = bytes(int(v, 16) for v in re.findall(r"0x([0-9A-Fa-f]{2})", red_part))
-        (bw_air, red_air), _note = send_image.convert_file(
+        (bw_air, red_air), _note = ap_server.convert_file(
             path, fit="contain", rotate="auto")
-        self.assertEqual(len(bw_c), send_image.SK_IMG_PLANE_BYTES)
+        self.assertEqual(len(bw_c), ap_server.SK_IMG_PLANE_BYTES)
         self.assertEqual(bw_air, bw_c)
         self.assertEqual(red_air, red_c)
 
@@ -674,15 +691,15 @@ class TransferTests(unittest.TestCase):
         ap = FakeAP()
         stats = run_transfer(ap, image)
         self.assertEqual(bytes(ap.image), image)
-        self.assertEqual(stats["bytes"], send_image.SK_IMG_TOTAL_BYTES)
+        self.assertEqual(stats["bytes"], ap_server.SK_IMG_TOTAL_BYTES)
         self.assertEqual(stats["blocks"], 118)
         self.assertEqual(stats["retries"], 0)
-        self.assertEqual(stats["crc"], send_image.crc16_ccitt_false(image))
+        self.assertEqual(stats["crc"], ap_server.crc16_ccitt_false(image))
         # Offsets run 0, 96, 192 ... and all blocks but the last are full.
-        self.assertEqual(ap.offsets, list(range(0, send_image.SK_IMG_TOTAL_BYTES,
-                                                send_image.SK_IMG_DATA_MAX)))
-        self.assertEqual(ap.types_seen[0], send_image.SK_U_IMG_BEGIN)
-        self.assertEqual(ap.types_seen[-1], send_image.SK_U_IMG_END)
+        self.assertEqual(ap.offsets, list(range(0, ap_server.SK_IMG_TOTAL_BYTES,
+                                                ap_server.SK_IMG_DATA_MAX)))
+        self.assertEqual(ap.types_seen[0], ap_server.SK_U_IMG_BEGIN)
+        self.assertEqual(ap.types_seen[-1], ap_server.SK_U_IMG_END)
         self.assertEqual(ap.end_seen, 1)
 
     def test_begin_payload_carries_serial_total_and_crc(self):
@@ -693,13 +710,13 @@ class TransferTests(unittest.TestCase):
         slen = payload[0]
         self.assertEqual(payload[1:1 + slen], b"1408F525")
         self.assertEqual((payload[1 + slen] << 8) | payload[2 + slen],
-                         send_image.SK_IMG_TOTAL_BYTES)
+                         ap_server.SK_IMG_TOTAL_BYTES)
         self.assertEqual((payload[3 + slen] << 8) | payload[4 + slen],
-                         send_image.crc16_ccitt_false(image))
+                         ap_server.crc16_ccitt_false(image))
 
     def test_serial_is_upper_cased(self):
         ap = FakeAP(serial=b"1408F525")
-        send_image.transfer(ap, "1408f525", test_image(), timeout=0.2,
+        ap_server.transfer(ap, "1408f525", test_image(), timeout=0.2,
                             end_timeout=1.0, progress=False)
         self.assertEqual(bytes(ap.image), test_image())
 
@@ -724,26 +741,26 @@ class TransferTests(unittest.TestCase):
         self.assertNotIn(288, ap.offsets)       # the tail was not skipped
 
     def test_out_of_order_status_aborts(self):
-        ap = FakeAP(data_status=(96, send_image.SK_ST_OFFSET))
-        with self.assertRaises(send_image.TransferError) as ctx:
+        ap = FakeAP(data_status=(96, ap_server.SK_ST_OFFSET))
+        with self.assertRaises(ap_server.TransferError) as ctx:
             run_transfer(ap)
         self.assertIn("out of order", str(ctx.exception))
 
     def test_status_frame_aborts_with_the_status_name(self):
-        ap = FakeAP(begin_status=send_image.SK_ST_BUSY)
-        with self.assertRaises(send_image.TransferError) as ctx:
+        ap = FakeAP(begin_status=ap_server.SK_ST_BUSY)
+        with self.assertRaises(ap_server.TransferError) as ctx:
             run_transfer(ap)
         self.assertIn("already in a transfer", str(ctx.exception))
 
     def test_timeout_aborts_after_the_retries(self):
         ap = FakeAP(no_ack={0})
-        with self.assertRaises(send_image.TransferError) as ctx:
+        with self.assertRaises(ap_server.TransferError) as ctx:
             run_transfer(ap, retries=2)
         self.assertIn("3 attempt", str(ctx.exception))
 
     def test_end_crc_verdict_aborts(self):
-        ap = FakeAP(end_status=send_image.SK_ST_CRC)
-        with self.assertRaises(send_image.TransferError) as ctx:
+        ap = FakeAP(end_status=ap_server.SK_ST_CRC)
+        with self.assertRaises(ap_server.TransferError) as ctx:
             run_transfer(ap)
         self.assertIn("CRC", str(ctx.exception))
 
@@ -753,14 +770,14 @@ class TransferTests(unittest.TestCase):
         original = ap.handle
 
         def corrupt(ptype, payload):
-            if ptype == send_image.SK_U_IMG_DATA and (payload[0] << 8 | payload[1]) == 96:
+            if ptype == ap_server.SK_U_IMG_DATA and (payload[0] << 8 | payload[1]) == 96:
                 payload = bytearray(payload)
                 payload[5] ^= 0xFF
                 payload = bytes(payload)
             original(ptype, payload)
 
         ap.handle = corrupt
-        with self.assertRaises(send_image.TransferError) as ctx:
+        with self.assertRaises(ap_server.TransferError) as ctx:
             run_transfer(ap)
         self.assertIn("CRC", str(ctx.exception))
 
@@ -778,13 +795,13 @@ class TransferTests(unittest.TestCase):
         again - the 11248 data bytes are not re-transmitted."""
         ap = FakeAP(end_delay=0.3)
         with contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(send_image.TransferError):
+            with self.assertRaises(ap_server.TransferError):
                 run_transfer(ap, timeout=0.05, end_timeout=0.05, retries=1)
         self.assertEqual(len(ap.offsets), 118)      # no data block was resent
         self.assertGreaterEqual(ap.end_seen, 2)
 
     def test_wrong_image_size_is_refused(self):
-        with self.assertRaises(send_image.TransferError):
+        with self.assertRaises(ap_server.TransferError):
             run_transfer(FakeAP(), b"\x00" * 100)
 
     def test_verbose_transfer_shows_the_frames(self):
@@ -797,6 +814,44 @@ class TransferTests(unittest.TestCase):
         text = out.getvalue()
         self.assertIn("IMG_DATA @96", text)
         self.assertIn("IMG_BEGIN", text)
+
+    def test_verbose_transfer_names_the_phases_and_the_slowest_block(self):
+        """--verbose is the "where did it go wrong" view, so it has to say
+        which phase retried and how long the worst block took - the numbers
+        that separate a lost block from a slow flash write."""
+        ap = FakeAP(drop_first={96})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            stats = run_transfer(ap, verbose=True)
+        text = out.getvalue()
+        # The plan, before anything is sent
+        self.assertIn("118 blocks", text)
+        self.assertIn("budgets:", text)
+        # The per-block round trip and the ack offset the tag reported
+        self.assertIn("try 1/6", text)
+        self.assertIn("<- IMG_DATA @96", text)
+        # The phase breakdown, and which block was the slow one. (The timing
+        # itself is not asserted: over the fake port every block rounds to
+        # 0 ms, which is the point - only real air makes it interesting.)
+        self.assertIn("retries: 0 begin, 1 over 118 blocks, 0 end", text)
+        self.assertIn("slowest @", text)
+        self.assertIn("ms per block", text)
+        self.assertEqual(stats["begin_retries"], 0)
+        self.assertEqual(stats["data_retries"], 1)
+        self.assertEqual(stats["end_retries"], 0)
+        self.assertIn(stats["slowest_block"], range(0, ap_server.SK_IMG_TOTAL_BYTES))
+
+    def test_verbose_transfer_says_where_a_failed_one_stopped(self):
+        """A transfer that dies has to say how far it got, or the operator is
+        left with "it did not work" and 118 blocks of output."""
+        ap = FakeAP(no_ack={192})           # the tag goes silent at block @192
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            with self.assertRaises(ap_server.TransferError):
+                run_transfer(ap, verbose=True, retries=1)
+        text = out.getvalue()
+        self.assertIn("stopped: 2 of 118 blocks sent", text)
+        self.assertIn("tag confirmed offset 192", text)
 
 
 class CliTests(unittest.TestCase):
@@ -814,7 +869,7 @@ class CliTests(unittest.TestCase):
     def test_dry_run_converts_without_a_port(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = send_image.main(["--dry-run", "-d", self.dir])
+            rc = ap_server.main(["--dry-run", "-d", self.dir])
         self.assertEqual(rc, 0)
         text = out.getvalue()
         self.assertIn("1408F525", text)
@@ -826,28 +881,28 @@ class CliTests(unittest.TestCase):
             bw = f.read()
         with open(red_path, "rb") as f:
             red = f.read()
-        self.assertEqual(len(bw), send_image.SK_IMG_PLANE_BYTES)
-        self.assertEqual(len(red), send_image.SK_IMG_PLANE_BYTES)
-        (expected_bw, expected_red), _note = send_image.convert_file(self.path)
+        self.assertEqual(len(bw), ap_server.SK_IMG_PLANE_BYTES)
+        self.assertEqual(len(red), ap_server.SK_IMG_PLANE_BYTES)
+        (expected_bw, expected_red), _note = ap_server.convert_file(self.path)
         self.assertEqual(bw, expected_bw)
         self.assertEqual(red, expected_red)
 
     def test_no_port_is_an_error_without_dry_run(self):
         with self.assertRaises(SystemExit):
             with contextlib.redirect_stderr(io.StringIO()):
-                send_image.main(["-d", self.dir])
+                ap_server.main(["-d", self.dir])
 
     def test_missing_directory_is_created(self):
         target = os.path.join(self.dir, "new")
         with contextlib.redirect_stdout(io.StringIO()):
-            rc = send_image.main(["--dry-run", "-d", target])
+            rc = ap_server.main(["--dry-run", "-d", target])
         self.assertTrue(os.path.isdir(target))
         self.assertEqual(rc, 1)             # created, but there is nothing in it
 
     def test_selftest_passes(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = send_image.main(["--selftest"])
+            rc = ap_server.main(["--selftest"])
         text = out.getvalue()
         self.assertNotIn("FAIL", text, text)
         self.assertIn("checks passed", text)
@@ -856,13 +911,13 @@ class CliTests(unittest.TestCase):
     def test_list_does_not_need_a_port(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = send_image.main(["--list"])
+            rc = ap_server.main(["--list"])
         self.assertEqual(rc, 0)
 
     def test_dry_run_serial_filter(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = send_image.main(["--dry-run", "-d", self.dir, "-s", "1408f525",
+            rc = ap_server.main(["--dry-run", "-d", self.dir, "-s", "1408f525",
                                   "--verbose"])
         self.assertEqual(rc, 0)
         self.assertIn("1408F525", out.getvalue())
@@ -871,30 +926,30 @@ class CliTests(unittest.TestCase):
     def test_dry_run_serial_filter_with_no_match(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = send_image.main(["--dry-run", "-d", self.dir, "-s", "DEADBEEF"])
+            rc = ap_server.main(["--dry-run", "-d", self.dir, "-s", "DEADBEEF"])
         self.assertEqual(rc, 1)
         self.assertIn("no image for tag DEADBEEF", out.getvalue())
 
     def test_watch_needs_a_port(self):
         with self.assertRaises(SystemExit):
             with contextlib.redirect_stderr(io.StringIO()):
-                send_image.main(["-d", self.dir, "--watch"])
+                ap_server.main(["-d", self.dir, "--watch"])
 
     def test_watch_cannot_be_a_dry_run(self):
         with self.assertRaises(SystemExit):
             with contextlib.redirect_stderr(io.StringIO()):
-                send_image.main(["-d", self.dir, "--watch", "--dry-run", "COM1"])
+                ap_server.main(["-d", self.dir, "--watch", "--dry-run", "COM1"])
 
     def test_monitor_needs_a_port(self):
         with self.assertRaises(SystemExit):
             with contextlib.redirect_stderr(io.StringIO()):
-                send_image.main(["-d", self.dir, "--monitor"])
+                ap_server.main(["-d", self.dir, "--monitor"])
 
     def test_the_old_scan_interval_option_is_gone(self):
         """--watch is announcement-driven now; a stale --interval is an error."""
         with self.assertRaises(SystemExit):
             with contextlib.redirect_stderr(io.StringIO()):
-                send_image.main(["-d", self.dir, "--dry-run", "--interval", "2"])
+                ap_server.main(["-d", self.dir, "--dry-run", "--interval", "2"])
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -913,49 +968,48 @@ class DiscoveryTests(unittest.TestCase):
             im.save(os.path.join(self.dir, name))
 
     def test_only_serial_named_images(self):
-        found = send_image.find_images(self.dir)
+        found = ap_server.find_images(self.dir)
         self.assertEqual(found, [("1408F525", os.path.join(self.dir, "1408F525.bmp")),
                                  ("1408F525", os.path.join(self.dir, "1408F525.png")),
                                  ("ABCD1234", os.path.join(self.dir, "abcd1234.JPG"))])
 
     def test_serial_filter_is_case_insensitive(self):
-        found = send_image.find_images(self.dir, only="1408f525")
+        found = ap_server.find_images(self.dir, only="1408f525")
         self.assertEqual([os.path.basename(p) for _s, p in found],
                          ["1408F525.bmp", "1408F525.png"])
 
     def test_missing_directory_is_empty(self):
-        self.assertEqual(send_image.find_images(os.path.join(self.dir, "nope")), [])
+        self.assertEqual(ap_server.find_images(os.path.join(self.dir, "nope")), [])
 
-    def test_process_pending_sends_every_image_once(self):
-        """One-shot mode ignores the record for its decisions but updates it."""
-        args = send_image.build_parser().parse_args(["--dry-run", "-d", self.dir])
+    def test_dry_run_covers_every_image(self):
+        args = ap_server.build_parser().parse_args(["--dry-run", "-d", self.dir])
         with contextlib.redirect_stdout(io.StringIO()):
-            done, failed, seen = send_image.process_pending(args, None)
-        self.assertEqual((done, failed, seen), (3, 0, 3))
+            failed, seen = ap_server.dry_run_all(args)
+        self.assertEqual((failed, seen), (0, 3))
         # A dry run sends nothing, so nothing may be recorded.
-        self.assertFalse(os.path.exists(os.path.join(self.dir, send_image.STATE_FILE)))
+        self.assertFalse(os.path.exists(os.path.join(self.dir, ap_server.STATE_FILE)))
 
-    def test_serial_filter_limits_the_one_shot_run(self):
-        args = send_image.build_parser().parse_args(
+    def test_serial_filter_limits_the_dry_run(self):
+        args = ap_server.build_parser().parse_args(
             ["--dry-run", "-d", self.dir, "-s", "abcd1234"])
         with contextlib.redirect_stdout(io.StringIO()):
-            done, failed, seen = send_image.process_pending(args, None)
-        self.assertEqual((done, failed, seen), (1, 0, 1))
+            failed, seen = ap_server.dry_run_all(args)
+        self.assertEqual((failed, seen), (0, 1))
 
 
 class TagLineTests(unittest.TestCase):
     """The exact shape report_packet() prints: "TAG <serial> rssi=<db>"."""
 
     def test_tag_lines(self):
-        self.assertEqual(send_image.parse_tag_line("TAG 1408F525 rssi=-41"),
+        self.assertEqual(ap_server.parse_tag_line("TAG 1408F525 rssi=-41"),
                          "1408F525")
-        self.assertEqual(send_image.parse_tag_line("TAG 1408F525 rssi=-41\r"),
+        self.assertEqual(ap_server.parse_tag_line("TAG 1408F525 rssi=-41\r"),
                          "1408F525")
-        self.assertEqual(send_image.parse_tag_line("TAG abcd1234 rssi=0"),
+        self.assertEqual(ap_server.parse_tag_line("TAG abcd1234 rssi=0"),
                          "ABCD1234")
-        self.assertEqual(send_image.parse_tag_line("TAG 1408F525 rssi=12"),
+        self.assertEqual(ap_server.parse_tag_line("TAG 1408F525 rssi=12"),
                          "1408F525")
-        self.assertEqual(send_image.parse_tag_line("TAG 1408F525 rssi=-128"),
+        self.assertEqual(ap_server.parse_tag_line("TAG 1408F525 rssi=-128"),
                          "1408F525")
 
     def test_not_check_ins(self):
@@ -976,14 +1030,14 @@ class TagLineTests(unittest.TestCase):
                      "TAG " + "A" * 17 + " rssi=-1",      # longer than SK_SERIAL_MAX
                      "TAG 1408 5 rssi=-1",                # a space is not a serial
                      ""):
-            self.assertIsNone(send_image.parse_tag_line(line), line)
+            self.assertIsNone(ap_server.parse_tag_line(line), line)
 
 
 class LineReaderTests(unittest.TestCase):
 
     def test_lines_split_across_reads(self):
         port = FakePort()
-        reader = send_image.LineReader(port)
+        reader = ap_server.LineReader(port)
         port.feed(b"*** ShelfKit access point ***\r\nTAG 140")
         self.assertEqual(reader.read_line(0.05), "*** ShelfKit access point ***")
         port.feed(b"8F525 rssi=-41\r\nradio ready\r\n")
@@ -1000,21 +1054,21 @@ class LineReaderTests(unittest.TestCase):
                   b"?? checksum mismatch (12 bytes, noise?)\r\n"
                   b"TAG ABCD1234 rssi=-7\r\n"
                   b"TAG 1408F52")                 # a partial line, no newline
-        reader = send_image.LineReader(port)
+        reader = ap_server.LineReader(port)
         lines = []
         while True:
             line = reader.read_line(0.05)
             if line is None:
                 break
             lines.append(line)
-        self.assertEqual([send_image.parse_tag_line(line) for line in lines
-                          if send_image.parse_tag_line(line)],
+        self.assertEqual([ap_server.parse_tag_line(line) for line in lines
+                          if ap_server.parse_tag_line(line)],
                          ["1408F525", "ABCD1234"])
         self.assertEqual(len(lines), 6, lines)
 
     def test_drop_partial_forgets_a_half_line(self):
         port = FakePort()
-        reader = send_image.LineReader(port)
+        reader = ap_server.LineReader(port)
         port.feed(b"TAG 1408F52")
         self.assertIsNone(reader.read_line(0.05))
         reader.drop_partial()
@@ -1023,11 +1077,11 @@ class LineReaderTests(unittest.TestCase):
 
     def test_unterminated_noise_does_not_grow_without_bound(self):
         port = FakePort()
-        reader = send_image.LineReader(port)
+        reader = ap_server.LineReader(port)
         for _ in range(4):
             port.feed(b"x" * 4096)
             self.assertIsNone(reader.read_line(0.05))
-        self.assertLessEqual(len(reader._buf), send_image.WATCH_LINE_MAX)
+        self.assertLessEqual(len(reader._buf), ap_server.WATCH_LINE_MAX)
 
 
 class SendRecordTests(unittest.TestCase):
@@ -1036,17 +1090,17 @@ class SendRecordTests(unittest.TestCase):
         self.tmp = TempDir()
         self.addCleanup(self.tmp.cleanup)
         self.dir = self.tmp.name
-        self.path = os.path.join(self.dir, send_image.STATE_FILE)
+        self.path = os.path.join(self.dir, ap_server.STATE_FILE)
         self.png = os.path.join(self.dir, "1408F525.png")
         with open(self.png, "wb") as f:
             f.write(b"pretend image")
 
     def test_round_trip(self):
-        record = send_image.SendRecord(self.path)
+        record = ap_server.SendRecord(self.path)
         self.assertEqual(len(record), 0)
         record.record("1408F525", self.png, (11, 22))
         self.assertTrue(os.path.exists(self.path))
-        again = send_image.SendRecord(self.path).load()
+        again = ap_server.SendRecord(self.path).load()
         self.assertEqual(len(again), 1)
         self.assertTrue(again.is_current("1408F525", self.png, (11, 22)))
         self.assertFalse(again.is_current("1408F525", self.png, (11, 23)))
@@ -1054,7 +1108,7 @@ class SendRecordTests(unittest.TestCase):
         self.assertFalse(again.is_current("ABCD1234", self.png, (11, 22)))
 
     def test_a_renamed_file_is_not_current(self):
-        record = send_image.SendRecord(self.path)
+        record = ap_server.SendRecord(self.path)
         record.record("1408F525", self.png, (11, 22))
         other = os.path.join(self.dir, "1408F525.bmp")
         with open(other, "wb") as f:
@@ -1062,7 +1116,7 @@ class SendRecordTests(unittest.TestCase):
         self.assertFalse(record.is_current("1408F525", other, (11, 22)))
 
     def test_missing_file_is_not_an_error(self):
-        record = send_image.SendRecord(self.path).load()
+        record = ap_server.SendRecord(self.path).load()
         self.assertEqual(len(record), 0)
 
     def test_broken_file_is_ignored(self):
@@ -1070,7 +1124,7 @@ class SendRecordTests(unittest.TestCase):
             f.write("{not json at all")
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            record = send_image.SendRecord(self.path).load()
+            record = ap_server.SendRecord(self.path).load()
         self.assertEqual(len(record), 0)
         self.assertIn("ignoring the send record", err.getvalue())
 
@@ -1078,24 +1132,24 @@ class SendRecordTests(unittest.TestCase):
         with open(self.path, "w", encoding="utf-8") as f:
             f.write('{"version": 1, "sent": {"A": {"file": "A.png", "size": 1,'
                     ' "mtime_ns": 2}, "B": "nonsense", "C": {"file": "C.png"}}}')
-        record = send_image.SendRecord(self.path).load()
+        record = ap_server.SendRecord(self.path).load()
         self.assertEqual(sorted(record.entries), ["A"])
 
     def test_fingerprint_follows_size_and_mtime(self):
-        first = send_image.fingerprint(self.png)
-        self.assertEqual(first, send_image.fingerprint(self.png))
+        first = ap_server.fingerprint(self.png)
+        self.assertEqual(first, ap_server.fingerprint(self.png))
         os.utime(self.png, ns=(first[1] + 0, first[1] + 1_000_000_000))
-        second = send_image.fingerprint(self.png)
+        second = ap_server.fingerprint(self.png)
         self.assertNotEqual(first, second)
         with open(self.png, "ab") as f:
             f.write(b"more")
-        self.assertEqual(send_image.fingerprint(self.png)[0], second[0] + 4)
+        self.assertEqual(ap_server.fingerprint(self.png)[0], second[0] + 4)
 
     def test_clear(self):
-        record = send_image.SendRecord(self.path)
+        record = ap_server.SendRecord(self.path)
         record.record("1408F525", self.png, (11, 22))
         record.clear()
-        self.assertEqual(len(send_image.SendRecord(self.path).load()), 0)
+        self.assertEqual(len(ap_server.SendRecord(self.path).load()), 0)
 
 
 class CheckInTests(unittest.TestCase):
@@ -1105,8 +1159,8 @@ class CheckInTests(unittest.TestCase):
         self.tmp = TempDir()
         self.addCleanup(self.tmp.cleanup)
         self.dir = self.tmp.name
-        self.record = send_image.SendRecord(
-            os.path.join(self.dir, send_image.STATE_FILE))
+        self.record = ap_server.SendRecord(
+            os.path.join(self.dir, ap_server.STATE_FILE))
         self.notes = set()
         self.write_image("1408F525")
 
@@ -1118,7 +1172,7 @@ class CheckInTests(unittest.TestCase):
         return path
 
     def args(self, *extra):
-        return send_image.build_parser().parse_args(
+        return ap_server.build_parser().parse_args(
             ["-d", self.dir, "--no-progress", *extra])
 
     def quiet(self, func, *a, **kw):
@@ -1127,21 +1181,21 @@ class CheckInTests(unittest.TestCase):
             return func(*a, **kw)
 
     def check(self, ap, serial="1408F525", args=None):
-        return self.quiet(send_image.check_in, args or self.args(), ap, serial,
+        return self.quiet(ap_server.check_in, args or self.args(), ap, serial,
                           self.record, self.notes)
 
     def test_check_in_sends_the_image(self):
         ap = FakeAP()
         self.assertEqual(self.check(ap), "sent")
-        self.assertEqual(ap.types_seen.count(send_image.SK_U_IMG_BEGIN), 1)
+        self.assertEqual(ap.types_seen.count(ap_server.SK_U_IMG_BEGIN), 1)
         self.assertEqual(ap.end_seen, 1)
-        expected, _note = send_image.convert_file(
+        expected, _note = ap_server.convert_file(
             os.path.join(self.dir, "1408F525.png"))
         self.assertEqual(bytes(ap.image), expected[0] + expected[1])
         self.assertEqual(len(self.record), 1)
         self.assertTrue(self.record.is_current(
             "1408F525", os.path.join(self.dir, "1408F525.png"),
-            send_image.fingerprint(os.path.join(self.dir, "1408F525.png"))))
+            ap_server.fingerprint(os.path.join(self.dir, "1408F525.png"))))
 
     def test_unchanged_image_is_not_sent_again(self):
         """A tag re-announces every ~10s: that must not resend the picture."""
@@ -1153,13 +1207,13 @@ class CheckInTests(unittest.TestCase):
 
     def test_changed_file_is_sent_again(self):
         self.assertEqual(self.check(FakeAP()), "sent")
-        before = send_image.fingerprint(os.path.join(self.dir, "1408F525.png"))
+        before = ap_server.fingerprint(os.path.join(self.dir, "1408F525.png"))
         path = self.write_image("1408F525", size=(64, 64))      # different bytes
-        after = send_image.fingerprint(path)
+        after = ap_server.fingerprint(path)
         self.assertNotEqual(before, after)
         ap = FakeAP()
         self.assertEqual(self.check(ap), "sent")
-        self.assertEqual(ap.types_seen.count(send_image.SK_U_IMG_BEGIN), 1)
+        self.assertEqual(ap.types_seen.count(ap_server.SK_U_IMG_BEGIN), 1)
 
     def test_touched_file_with_new_mtime_is_sent_again(self):
         path = self.write_image("1408F525")
@@ -1169,10 +1223,10 @@ class CheckInTests(unittest.TestCase):
         self.assertEqual(self.check(FakeAP()), "sent")
 
     def test_failed_transfer_is_not_recorded_and_is_retried(self):
-        failing = FakeAP(begin_status=send_image.SK_ST_BAD_SERIAL)
+        failing = FakeAP(begin_status=ap_server.SK_ST_BAD_SERIAL)
         err = io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
-            result = send_image.check_in(self.args(), failing, "1408F525",
+            result = ap_server.check_in(self.args(), failing, "1408F525",
                                          self.record, self.notes)
         self.assertEqual(result, "failed")
         self.assertEqual(len(self.record), 0)               # nothing recorded
@@ -1182,7 +1236,7 @@ class CheckInTests(unittest.TestCase):
         good = FakeAP()
         self.assertEqual(self.check(good), "sent")
         self.assertEqual(bytes(good.image),
-                         b"".join(send_image.convert_file(
+                         b"".join(ap_server.convert_file(
                              os.path.join(self.dir, "1408F525.png"))[0]))
         self.assertEqual(len(self.record), 1)
 
@@ -1191,14 +1245,14 @@ class CheckInTests(unittest.TestCase):
         path = os.path.join(self.dir, "1408F525.png")
         ap = FakeAP()
         seen = []
-        original = send_image.transfer
+        original = ap_server.transfer
 
         def spy(ser, serial, image, **kwargs):
             seen.append(os.path.exists(self.record.path))
             return original(ser, serial, image, **kwargs)
 
-        send_image.transfer = spy
-        self.addCleanup(setattr, send_image, "transfer", original)
+        ap_server.transfer = spy
+        self.addCleanup(setattr, ap_server, "transfer", original)
         self.assertEqual(self.check(ap), "sent")
         self.assertEqual(seen, [False])                     # nothing yet
         self.assertTrue(os.path.exists(self.record.path))   # recorded after
@@ -1207,7 +1261,7 @@ class CheckInTests(unittest.TestCase):
         ap = FakeAP(serial=b"DEADBEEF")
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-            result = send_image.check_in(self.args(), ap, "DEADBEEF",
+            result = ap_server.check_in(self.args(), ap, "DEADBEEF",
                                          self.record, self.notes)
         self.assertEqual(result, "no-image")
         self.assertEqual(ap.types_seen, [])
@@ -1215,7 +1269,7 @@ class CheckInTests(unittest.TestCase):
         # The note is printed once, not on every announcement.
         out2 = io.StringIO()
         with contextlib.redirect_stdout(out2), contextlib.redirect_stderr(out2):
-            send_image.check_in(self.args(), ap, "DEADBEEF", self.record, self.notes)
+            ap_server.check_in(self.args(), ap, "DEADBEEF", self.record, self.notes)
         self.assertNotIn("no DEADBEEF", out2.getvalue())
 
     def test_serial_filter_ignores_other_tags(self):
@@ -1227,13 +1281,13 @@ class CheckInTests(unittest.TestCase):
         sender = FakeAP()
         self.assertEqual(self.check(sender, "1408F525", self.args("-s", "1408f525")),
                          "sent")
-        self.assertEqual(sender.types_seen.count(send_image.SK_U_IMG_BEGIN), 1)
+        self.assertEqual(sender.types_seen.count(ap_server.SK_U_IMG_BEGIN), 1)
 
     def test_two_files_for_one_tag_prefers_the_first_in_name_order(self):
         self.write_image("1408F525", ext=".bmp")
         err = io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
-            send_image.check_in(self.args(), FakeAP(), "1408F525", self.record,
+            ap_server.check_in(self.args(), FakeAP(), "1408F525", self.record,
                                 self.notes)
         self.assertIn("1408F525.bmp", err.getvalue())
         self.assertEqual(self.record.entries["1408F525"][0], "1408F525.bmp")
@@ -1246,22 +1300,22 @@ class WatchLoopTests(unittest.TestCase):
         self.tmp = TempDir()
         self.addCleanup(self.tmp.cleanup)
         self.dir = self.tmp.name
-        self.record = send_image.SendRecord(
-            os.path.join(self.dir, send_image.STATE_FILE))
-        self.args = send_image.build_parser().parse_args(
+        self.record = ap_server.SendRecord(
+            os.path.join(self.dir, ap_server.STATE_FILE))
+        self.args = ap_server.build_parser().parse_args(
             ["-d", self.dir, "--no-progress", "--watch"])
         im = Image.new("RGB", (152, 296), (255, 255, 255))
         im.putpixel((0, 0), (0, 0, 0))
         im.save(os.path.join(self.dir, "1408F525.png"))
         # Keep the loop's "nothing arrived" wait short for the tests.
-        self.addCleanup(setattr, send_image, "WATCH_READ_TIMEOUT",
-                        send_image.WATCH_READ_TIMEOUT)
-        send_image.WATCH_READ_TIMEOUT = 0.02
+        self.addCleanup(setattr, ap_server, "WATCH_READ_TIMEOUT",
+                        ap_server.WATCH_READ_TIMEOUT)
+        ap_server.WATCH_READ_TIMEOUT = 0.02
 
     def run_loop(self, ap, iterations=8):
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-            send_image.watch_loop(self.args, ap, self.record, max_iterations=iterations)
+            ap_server.watch_loop(self.args, ap, self.record, max_iterations=iterations)
         return out.getvalue()
 
     def test_banner_is_printed_and_the_tag_is_sent_to_once(self):
@@ -1278,7 +1332,7 @@ class WatchLoopTests(unittest.TestCase):
         self.assertIn("ap: TAG 1408F525 rssi=-41", text)
         self.assertIn("1408F525: checked in - sending 1408F525.png", text)
         # Two announcements, one transfer.
-        self.assertEqual(ap.types_seen.count(send_image.SK_U_IMG_BEGIN), 1)
+        self.assertEqual(ap.types_seen.count(ap_server.SK_U_IMG_BEGIN), 1)
         self.assertEqual(len(self.record), 1)
         # Text that was sitting in the port buffer when the transfer started is
         # flushed away by it (FrameReader.flush() calls reset_input_buffer), so
@@ -1302,38 +1356,44 @@ class WatchLoopTests(unittest.TestCase):
         ap.queue_text("TAG 1408F525 rssi=-41\r\n")
         self.run_loop(ap, iterations=4)
         self.assertEqual(len(self.record), 1)
-        reloaded = send_image.SendRecord(self.record.path).load()
+        reloaded = ap_server.SendRecord(self.record.path).load()
         second = FakeAP()
         second.queue_text("TAG 1408F525 rssi=-41\r\n")
         with contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
-            send_image.watch_loop(self.args, second, reloaded, max_iterations=4)
+            ap_server.watch_loop(self.args, second, reloaded, max_iterations=4)
         self.assertEqual(second.types_seen, [])
 
     def test_resend_forgets_the_record_and_pushes_once(self):
         self.record.record("1408F525", os.path.join(self.dir, "1408F525.png"),
                            (1, 1))
-        args = send_image.build_parser().parse_args(
+        args = ap_server.build_parser().parse_args(
             ["-d", self.dir, "--no-progress", "--watch", "--resend"])
         ap = FakeAP()
         ap.queue_text("TAG 1408F525 rssi=-41\r\nTAG 1408F525 rssi=-41\r\n")
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-            send_image.watch_loop(args, ap, self.record, max_iterations=6)
+            ap_server.watch_loop(args, ap, self.record, max_iterations=6)
         self.assertIn("forgetting 1 send record(s)", out.getvalue())
-        self.assertEqual(ap.types_seen.count(send_image.SK_U_IMG_BEGIN), 1)
+        self.assertEqual(ap.types_seen.count(ap_server.SK_U_IMG_BEGIN), 1)
 
     def test_quiet_access_point_hints_at_the_port(self):
         ap = FakeAP()
-        old = send_image.WATCH_SILENCE_HINT
-        send_image.WATCH_SILENCE_HINT = 0.0
-        self.addCleanup(setattr, send_image, "WATCH_SILENCE_HINT", old)
+        old = ap_server.WATCH_SILENCE_HINT
+        ap_server.WATCH_SILENCE_HINT = 0.0
+        self.addCleanup(setattr, ap_server, "WATCH_SILENCE_HINT", old)
         text = self.run_loop(ap, iterations=2)
         self.assertIn("no output from the access point", text)
 
 
 class OneShotTests(unittest.TestCase):
-    """`send_image.py COM8`: every image goes out, whatever the record says."""
+    """`ap_server.py COM8`: one pass, driven by the tags' check-ins.
+
+    Nothing goes on the air until a tag has announced itself - the access point
+    cannot reach a tag that is not listening, so an immediate push only spends
+    the retry budget and reports a failure that says nothing about the real
+    problem.
+    """
 
     def setUp(self):
         self.tmp = TempDir()
@@ -1343,49 +1403,119 @@ class OneShotTests(unittest.TestCase):
         im = Image.new("RGB", (152, 296), (255, 255, 255))
         im.putpixel((0, 0), (0, 0, 0))
         im.save(self.png)
-        self.record = send_image.SendRecord(
-            os.path.join(self.dir, send_image.STATE_FILE))
+        self.record = ap_server.SendRecord(
+            os.path.join(self.dir, ap_server.STATE_FILE))
+        # Keep the "no check-in" wait short for the tests.
+        self.addCleanup(setattr, ap_server, "WATCH_READ_TIMEOUT",
+                        ap_server.WATCH_READ_TIMEOUT)
+        ap_server.WATCH_READ_TIMEOUT = 0.02
 
-    def run_once(self, *extra, record=None):
-        args = send_image.build_parser().parse_args(
-            ["-d", self.dir, "--no-progress", *extra])
+    def run_once(self, *extra, record=None, check_in=True, ap=None):
+        args = ap_server.build_parser().parse_args(
+            ["-d", self.dir, "--no-progress", "--wait", "0.2", *extra])
+        ap = FakeAP() if ap is None else ap
+        if check_in:
+            ap.queue_text("TAG 1408F525 rssi=-41\r\n")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            rc = ap_server.send_pending(
+                args, ap, self.record if record is None else record)
+        return rc, ap, out.getvalue()
+
+    def test_a_check_in_is_what_starts_a_transfer(self):
+        rc, ap, text = self.run_once()
+        self.assertEqual(rc, 0)
+        self.assertIn("waiting for their tag to check in", text)
+        self.assertIn("1408F525.png -> 1408F525", text)
+        self.assertIn("1 sent", text)
+        self.assertEqual(ap.types_seen.count(ap_server.SK_U_IMG_BEGIN), 1)
+        self.assertTrue(self.record.is_current("1408F525", self.png,
+                                               ap_server.fingerprint(self.png)))
+
+    def test_nothing_is_sent_to_a_tag_that_never_checks_in(self):
+        """The whole point: no check-in, no transmission, and a report that
+        says so instead of a radio failure that blames the wrong thing."""
+        rc, ap, text = self.run_once(check_in=False)
+        self.assertEqual(rc, 1)
+        self.assertEqual(ap.types_seen, [])
+        self.assertIn("no check-in within", text)
+        self.assertIn("nothing was sent to it", text)
+        self.assertIn("0 sent, 1 never checked in", text)
+        self.assertEqual(len(self.record), 0)
+
+    def test_a_current_image_is_not_sent_again(self):
+        """'Check if there are new images': the record decides, so a second run
+        does nothing and does not even wait for a check-in."""
+        self.record.record("1408F525", self.png,
+                           ap_server.fingerprint(self.png))
+        reloaded = ap_server.SendRecord(self.record.path).load()
+        rc, ap, text = self.run_once(record=reloaded, check_in=False)
+        self.assertEqual(rc, 0)
+        self.assertIn("nothing to send", text)
+        self.assertEqual(ap.types_seen, [])
+
+    def test_resend_pushes_a_current_image_again(self):
+        self.record.record("1408F525", self.png,
+                           ap_server.fingerprint(self.png))
+        reloaded = ap_server.SendRecord(self.record.path).load()
+        rc, ap, _text = self.run_once("--resend", record=reloaded)
+        self.assertEqual(rc, 0)
+        self.assertEqual(ap.types_seen.count(ap_server.SK_U_IMG_BEGIN), 1)
+        self.assertEqual(len(reloaded), 1)       # and it is recorded again
+
+    def test_another_tags_check_in_is_ignored(self):
+        args = ap_server.build_parser().parse_args(
+            ["-d", self.dir, "--no-progress", "--wait", "0.2"])
         ap = FakeAP()
+        ap.queue_text("TAG ABCD1234 rssi=-50\r\n")
         with contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
-            done, failed, seen = send_image.process_pending(
-                args, ap, self.record if record is None else record)
-        return done, failed, seen, ap
+            rc = ap_server.send_pending(args, ap, self.record)
+        self.assertEqual(rc, 1)
+        self.assertEqual(ap.types_seen, [])      # nothing was addressed to it
 
-    def test_one_shot_sends_and_records(self):
-        done, failed, seen, ap = self.run_once()
-        self.assertEqual((done, failed, seen), (1, 0, 1))
-        self.assertEqual(ap.types_seen.count(send_image.SK_U_IMG_BEGIN), 1)
-        self.assertTrue(self.record.is_current("1408F525", self.png,
-                                               send_image.fingerprint(self.png)))
+    def test_a_failed_transfer_is_retried_on_the_next_check_in(self):
+        """A tag that checks in twice gets two attempts, and the run still ends
+        with an honest report when both fail."""
+        args = ap_server.build_parser().parse_args(
+            ["-d", self.dir, "--no-progress", "--wait", "1.0"])
+        ap = FakeAP(begin_status=ap_server.SK_ST_BUSY)
+        ap.queue_text("TAG 1408F525 rssi=-41\r\n")
+        ap.queue_text("TAG 1408F525 rssi=-41\r\n", delay=0.2)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            rc = ap_server.send_pending(args, ap, self.record)
+        self.assertEqual(rc, 1)
+        self.assertEqual(ap.types_seen.count(ap_server.SK_U_IMG_BEGIN), 2)
+        self.assertIn("1 failed", err.getvalue())
+        self.assertEqual(len(self.record), 0)    # a failure is never recorded
 
-    def test_one_shot_ignores_a_current_record(self):
-        """The record never stops an explicit one-shot push."""
-        self.record.record("1408F525", self.png, send_image.fingerprint(self.png))
-        reloaded = send_image.SendRecord(self.record.path).load()
-        done, _failed, _seen, ap = self.run_once(record=reloaded)
-        self.assertEqual(done, 1)
-        self.assertEqual(ap.types_seen.count(send_image.SK_U_IMG_BEGIN), 1)
-
-    def test_one_shot_keeps_going_after_a_failure(self):
+    def test_two_images_are_both_sent_once_their_tags_check_in(self):
         second = os.path.join(self.dir, "ABCD1234.png")
         im = Image.new("RGB", (152, 296), (255, 255, 255))
         im.save(second)
-        args = send_image.build_parser().parse_args(["-d", self.dir, "--no-progress"])
-        ap = FakeAP(begin_status=send_image.SK_ST_BUSY)
+        args = ap_server.build_parser().parse_args(
+            ["-d", self.dir, "--no-progress", "--wait", "1.0"])
+        ap = FakeAP(any_serial=True)
+        ap.queue_text("TAG 1408F525 rssi=-41\r\n")
+        ap.queue_text("TAG ABCD1234 rssi=-44\r\n", delay=0.2)
         with contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
-            done, failed, seen = send_image.process_pending(args, ap, self.record)
-        self.assertEqual((done, failed, seen), (0, 2, 2))
-        self.assertEqual(len(self.record), 0)
+            rc = ap_server.send_pending(args, ap, self.record)
+        self.assertEqual(rc, 0)
+        self.assertEqual(ap.types_seen.count(ap_server.SK_U_IMG_BEGIN), 2)
+        self.assertEqual(len(self.record), 2)
 
     def test_dry_run_records_nothing(self):
-        done, failed, seen, ap = self.run_once("--dry-run")
-        self.assertEqual((done, failed, seen), (1, 0, 1))
+        args = ap_server.build_parser().parse_args(
+            ["-d", self.dir, "--dry-run", "--no-progress"])
+        ap = FakeAP()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            failed, seen = ap_server.dry_run_all(args, ap)
+        self.assertEqual((failed, seen), (0, 1))
+        self.assertIn("dry run - the serial port was not opened", out.getvalue())
         self.assertEqual(len(self.record), 0)
         self.assertFalse(os.path.exists(self.record.path))
         self.assertEqual(ap.types_seen, [])
@@ -1397,14 +1527,14 @@ class DiagnosticsTests(unittest.TestCase):
     def test_ping_reports_a_working_link(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = send_image.ping(FakeAP(), timeout=0.2)
+            rc = ap_server.ping(FakeAP(), timeout=0.2)
         self.assertEqual(rc, 0)
         self.assertIn("working", out.getvalue())
 
     def test_ping_reports_a_link_that_answers_nothing(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
-            rc = send_image.ping(FakePort(), timeout=0.05, retries=0)
+            rc = ap_server.ping(FakePort(), timeout=0.05, retries=0)
         self.assertEqual(rc, 1)
         self.assertIn("did not answer", out.getvalue())
 
@@ -1417,7 +1547,7 @@ class DiagnosticsTests(unittest.TestCase):
                   b"TAG 1408F525 rssi=-42\r\n")
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            rc = send_image.monitor(port, seconds=0.2)
+            rc = ap_server.monitor(port, seconds=0.2)
         text = out.getvalue()
         self.assertEqual(rc, 0)
         self.assertIn("ap: *** ShelfKit access point ***", text)
@@ -1428,7 +1558,7 @@ class DiagnosticsTests(unittest.TestCase):
         port.feed(b"*** ShelfKit access point ***\r\n")
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            send_image.monitor(port, seconds=0.1)
+            ap_server.monitor(port, seconds=0.1)
         self.assertIn("no TAG line", out.getvalue())
 
 
@@ -1453,8 +1583,8 @@ class BootImageParityTests(unittest.TestCase):
             self.skipTest(f"the committed boot image was generated differently: {header}")
         bw_c = self._array(text, "bw")
         red_c = self._array(text, "red")
-        self.assertEqual(len(bw_c), send_image.SK_IMG_PLANE_BYTES)
-        (bw_air, red_air), _note = send_image.convert_file(
+        self.assertEqual(len(bw_c), ap_server.SK_IMG_PLANE_BYTES)
+        (bw_air, red_air), _note = ap_server.convert_file(
             self.PNG, fit="contain", rotate="auto")
         self.assertEqual(bw_air, bw_c)
         self.assertEqual(red_air, red_c)
@@ -1472,37 +1602,37 @@ class HeaderInterfaceTests(unittest.TestCase):
 
     def test_proto_header_constants(self):
         defines = self._defines(PROTO_H_PATH)
-        self.assertEqual(int(defines["SK_IMG_DATA_MAX"], 0), send_image.SK_IMG_DATA_MAX)
+        self.assertEqual(int(defines["SK_IMG_DATA_MAX"], 0), ap_server.SK_IMG_DATA_MAX)
         self.assertEqual(int(defines["SK_IMG_PLANE_BYTES"], 0),
-                         send_image.SK_IMG_PLANE_BYTES)
+                         ap_server.SK_IMG_PLANE_BYTES)
         self.assertEqual(int(defines["SK_IMG_PLANES"], 0), 2)
-        self.assertEqual(int(defines["SK_IMG_W"], 0), send_image.SK_IMG_W)
-        self.assertEqual(int(defines["SK_IMG_H"], 0), send_image.SK_IMG_H)
-        self.assertEqual(int(defines["SK_SERIAL_MAX"], 0), send_image.SK_SERIAL_MAX)
-        self.assertEqual(int(defines["SK_UART_SYNC0"], 0), send_image.SK_UART_SYNC0)
-        self.assertEqual(int(defines["SK_UART_SYNC1"], 0), send_image.SK_UART_SYNC1)
-        self.assertEqual(int(defines["SK_U_IMG_BEGIN"], 0), send_image.SK_U_IMG_BEGIN)
-        self.assertEqual(int(defines["SK_U_IMG_DATA"], 0), send_image.SK_U_IMG_DATA)
-        self.assertEqual(int(defines["SK_U_IMG_END"], 0), send_image.SK_U_IMG_END)
-        self.assertEqual(int(defines["SK_U_ACK"], 0), send_image.SK_U_ACK)
-        self.assertEqual(int(defines["SK_U_STATUS"], 0), send_image.SK_U_STATUS)
-        self.assertEqual(int(defines["SK_ST_OK"], 0), send_image.SK_ST_OK)
-        self.assertEqual(int(defines["SK_ST_BAD_SERIAL"], 0), send_image.SK_ST_BAD_SERIAL)
-        self.assertEqual(int(defines["SK_ST_FLASH"], 0), send_image.SK_ST_FLASH)
-        self.assertEqual(int(defines["SK_ST_CRC"], 0), send_image.SK_ST_CRC)
-        self.assertEqual(int(defines["SK_ST_OFFSET"], 0), send_image.SK_ST_OFFSET)
-        self.assertEqual(int(defines["SK_ST_BUSY"], 0), send_image.SK_ST_BUSY)
+        self.assertEqual(int(defines["SK_IMG_W"], 0), ap_server.SK_IMG_W)
+        self.assertEqual(int(defines["SK_IMG_H"], 0), ap_server.SK_IMG_H)
+        self.assertEqual(int(defines["SK_SERIAL_MAX"], 0), ap_server.SK_SERIAL_MAX)
+        self.assertEqual(int(defines["SK_UART_SYNC0"], 0), ap_server.SK_UART_SYNC0)
+        self.assertEqual(int(defines["SK_UART_SYNC1"], 0), ap_server.SK_UART_SYNC1)
+        self.assertEqual(int(defines["SK_U_IMG_BEGIN"], 0), ap_server.SK_U_IMG_BEGIN)
+        self.assertEqual(int(defines["SK_U_IMG_DATA"], 0), ap_server.SK_U_IMG_DATA)
+        self.assertEqual(int(defines["SK_U_IMG_END"], 0), ap_server.SK_U_IMG_END)
+        self.assertEqual(int(defines["SK_U_ACK"], 0), ap_server.SK_U_ACK)
+        self.assertEqual(int(defines["SK_U_STATUS"], 0), ap_server.SK_U_STATUS)
+        self.assertEqual(int(defines["SK_ST_OK"], 0), ap_server.SK_ST_OK)
+        self.assertEqual(int(defines["SK_ST_BAD_SERIAL"], 0), ap_server.SK_ST_BAD_SERIAL)
+        self.assertEqual(int(defines["SK_ST_FLASH"], 0), ap_server.SK_ST_FLASH)
+        self.assertEqual(int(defines["SK_ST_CRC"], 0), ap_server.SK_ST_CRC)
+        self.assertEqual(int(defines["SK_ST_OFFSET"], 0), ap_server.SK_ST_OFFSET)
+        self.assertEqual(int(defines["SK_ST_BUSY"], 0), ap_server.SK_ST_BUSY)
         self.assertEqual(int(defines["SK_ST_UNSUPPORTED"], 0),
-                         send_image.SK_ST_UNSUPPORTED)
-        self.assertEqual(send_image.SK_IMG_PLANE_BYTES * 2,
-                         send_image.SK_IMG_TOTAL_BYTES)
+                         ap_server.SK_ST_UNSUPPORTED)
+        self.assertEqual(ap_server.SK_IMG_PLANE_BYTES * 2,
+                         ap_server.SK_IMG_TOTAL_BYTES)
 
     def test_epd_header_geometry(self):
         defines = self._defines(EPD_H_PATH)
-        self.assertEqual(int(defines["EPD_W"], 0), send_image.SK_IMG_W)
-        self.assertEqual(int(defines["EPD_H"], 0), send_image.SK_IMG_H)
-        self.assertEqual((send_image.SK_IMG_W * send_image.SK_IMG_H + 7) // 8,
-                         send_image.SK_IMG_PLANE_BYTES)
+        self.assertEqual(int(defines["EPD_W"], 0), ap_server.SK_IMG_W)
+        self.assertEqual(int(defines["EPD_H"], 0), ap_server.SK_IMG_H)
+        self.assertEqual((ap_server.SK_IMG_W * ap_server.SK_IMG_H + 7) // 8,
+                         ap_server.SK_IMG_PLANE_BYTES)
 
 
 if __name__ == "__main__":

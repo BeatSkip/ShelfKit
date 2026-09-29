@@ -3,18 +3,18 @@ __pycache__/
 *.pyc
 
 
-# Plane dumps written by tools/send_image.py --dry-run
+# Plane dumps written by tools/ap_server.py --dry-run
 images/*.bw.bin
 images/*.red.bin
 
-# What each tag has already been sent (tools/send_image.py --watch)
+# What each tag has already been sent (tools/ap_server.py --watch)
 images/.sent.json
 images/.sent.json.tmp
 
 # Scratch build directories. /build-probe/ holds probe builds and the object
 # files the host tests link against; /.tmp-test/ is where the Python suite puts
 # its temporary directories when the system temp root is not usable (see
-# tools/tests/test_send_image.py, TempDir).
+# tools/tests/test_ap_server.py, TempDir).
 /build-probe/
 /.scratch/
 /.tmp/

@@ -8,7 +8,7 @@
 #
 # Three suites:
 #   * the Python tools (the host-side image transfer and its serial protocol),
-#     tools/tests/test_send_image.py;
+#     tools/tests/test_ap_server.py;
 #   * sk_link_test.c, the link layer itself (frame layout, CRC, addressing,
 #     managed flooding, the record route), which compiles the real sk_link.c
 #     against a virtual radio and drives it from both sides;
@@ -25,7 +25,7 @@
 # The scratch directory for the Python suite is pinned inside the repository:
 # tempfile's default is a directory created with mode 0700, which on Windows is
 # an owner-only ACL that some sandboxes refuse to write into. The tests work
-# around that themselves (tools/tests/test_send_image.py, TempDir), and this
+# around that themselves (tools/tests/test_ap_server.py, TempDir), and this
 # only makes the choice explicit.
 
 $ErrorActionPreference = 'Continue'

@@ -521,15 +521,62 @@ static int tx_skip_past(const char *s)
     return 0;
 }
 
+/* Is @p s anywhere in what the access point has printed?
+ *
+ * The capture is console text interleaved with binary host frames, and a
+ * trace line is pure printable ASCII that no frame can produce (the sync
+ * bytes are 0xAA 0x55), so a substring search is meaningful. This is how the
+ * console-trace tests below pin what an operator sees. */
+static int tx_contains(const char *s)
+{
+    size_t n = strlen(s);
+    size_t i;
+
+    if (tx_capture_len < n)
+        return 0;
+    for (i = 0; i + n <= tx_capture_len; i++) {
+        if (memcmp(tx_capture + i, s, n) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* Print the console half of the capture, one line per run of printable text.
+ *
+ * The same filter the host tool applies (ap_server.py's
+ * _show_access_point_text): a run of four or more printable characters is a
+ * trace line, and a binary host frame cannot survive it. So this is exactly
+ * what an operator sees as "ap: ..." lines, which is what makes it worth
+ * printing on a test run. */
+static void tx_dump_console(void)
+{
+    char line[256];
+    size_t n = 0, i;
+
+    for (i = 0; i <= tx_capture_len; i++) {
+        uint8_t c = (i < tx_capture_len) ? tx_capture[i] : 0;
+
+        if (c >= 32 && c < 127 && n < sizeof line - 1) {
+            line[n++] = (char)c;
+            continue;
+        }
+        if (n >= 4) {
+            line[n] = '\0';
+            printf("   | %s\n", line);
+        }
+        n = 0;
+    }
+}
+
 /* Offset of the next 0xAA 0x55 at or after @p from, or (size_t)-1.
  *
- * With AP_LINK_DEBUG on, the console trace ("link: sent type 10 len 10") is
- * interleaved with the binary host frames on the same UART - deliberately, so
- * an operator can read what happened. The real host tool copes by
- * resynchronising on the frame sync (send_image.py's reader does exactly
- * that), so the test does too: text before the sync bytes is diagnostic
- * output, not a frame. Without this the test only passed while the trace was
- * off, which is not a property worth keeping. */
+ * With the console trace on (AP_TRACE, default 1), the trace text ("link: tx
+ * IMG_DATA len 64 ...") is interleaved with the binary host frames on the
+ * same UART - deliberately, so an operator can read what happened. The real
+ * host tool copes by resynchronising on the frame sync (ap_server.py's
+ * reader does exactly that), so the test does too: text before the sync bytes
+ * is diagnostic output, not a frame. Without this the test only passed while
+ * the trace was off, which is not a property worth keeping. */
 static size_t find_frame(size_t from)
 {
     size_t i;
@@ -841,12 +888,16 @@ static void test_unknown_type_is_silent(void)
 
     /* A CRC-valid frame of a type the access point does not know: the header
      * says resynchronise and say nothing. The parser hands it up - it has no
-     * business knowing the command set - and the bridge drops it. */
+     * business knowing the command set - and the bridge drops it without an
+     * answer. (It does print a line about it: an unknown type is the shape a
+     * version mismatch takes, and there is no other way to see one.) */
     p[0] = 1; p[1] = 2; p[2] = 3;
     build_frame(f, 0x77, p, 3);
     feed(f, 3 + 6);
     (void)run_pending();
     CHECK(radio_tx_calls == 0, "an unknown type went out on the air");
+    CHECK(tx_contains("unknown host type 0x77"),
+          "the unknown type was not reported on the console");
     expect_no_frame();
 
     p[0] = 0; p[1] = 0;
@@ -1429,6 +1480,138 @@ static void test_idle_answers_are_reported(void)
           "printed \"%.*s\"", (int)tx_capture_len, tx_capture);
 }
 
+/* ── the console trace ────────────────────────────────────────────────── */
+
+/* The trace's decimal printers, pinned at their limits.
+ *
+ * This is not busy-work: the counts in the trace run past the signed 16-bit
+ * range (a retry budget is 12000 ms, the END wait 60000), and two real bugs
+ * lived here. The first printer stopped at 999 and rendered 1500 as "?00 ms",
+ * so a retry line looked like a broken budget rather than a broken line. The
+ * obvious repair - one signed printer for everything - renders 60000 as
+ * -5536. Both are the kind of quiet wrongness a trace exists to prevent, and
+ * both are one call away from coming back. */
+static void test_decimal_printers(void)
+{
+    static const char want[] = "0 7 999 1000 1500 60000 -42";
+
+    printf("-- the console's decimal printers\n");
+    reset_world();
+
+    uart_putdecu(0);
+    uart_putc(' ');
+    uart_putdecu(7);
+    uart_putc(' ');
+    uart_putdecu(999);
+    uart_putc(' ');
+    uart_putdecu(1000);
+    uart_putc(' ');
+    uart_putdecu(1500);
+    uart_putc(' ');
+    uart_putdecu(60000);
+    uart_putc(' ');
+    uart_putdec(-42);
+
+    CHECK(tx_capture_len == strlen(want) &&
+          memcmp(tx_capture, want, tx_capture_len) == 0,
+          "printed \"%.*s\", wanted \"%s\"", (int)tx_capture_len, tx_capture, want);
+}
+
+/* The trace is the operator's whole view of the bridge - there is no logic
+ * analyser on the bench - so a transfer that works end to end has to be
+ * readable line by line. What this pins is not the wording but the presence
+ * of the facts someone debugging needs, in the order they happen:
+ *
+ *   the host's frame arrived intact   "ser: rx ... crc ok"
+ *   what it was for                   "xfer: BEGIN serial ... total ... crc ..."
+ *   what went on the air              "link: tx IMG_BEGIN ... try 1/4 wor"
+ *   what came back                    "link: heard IMG_ACK ... rssi=-42"
+ *   what the bridge made of it        "xfer: block @0000 stored, ..."
+ *   what the host was told            "ser: tx ACK off=2BF0 st=00 OK"
+ *
+ * A transfer that dies leaves the same lines up to the point it died, which
+ * is the whole point: the last line before the silence names the side that
+ * stopped answering. */
+static void test_console_trace_of_a_transfer(void)
+{
+    printf("-- the console trace of a whole transfer\n");
+    reset_world();
+
+    /* BEGIN, acknowledged 300 ms later. */
+    tag_reply_ack(300, 0, SK_ST_OK);
+    host_begin_cmd(SK_IMG_TOTAL_BYTES, 0x1234);
+    CHECK(run_pending() == 1, "the BEGIN frame was not parsed");
+
+    /* One full data block at offset 0, acknowledged as stored. */
+    tag_reply_ack(300, SK_IMG_DATA_MAX, SK_ST_OK);
+    host_data_cmd(0, 0x40, SK_IMG_DATA_MAX);
+    CHECK(run_pending() == 1, "the DATA frame was not parsed");
+
+    /* END, answered with the whole image once the tag's refresh is done. */
+    tag_reply_ack(1500, SK_IMG_TOTAL_BYTES, SK_ST_OK);
+    host_end_cmd();
+    CHECK(run_pending() == 1, "the END frame was not parsed");
+
+    tx_dump_console();
+
+    CHECK(tx_contains("ser: rx IMG_BEGIN len 0D crc ok"),
+          "the host's BEGIN is not in the trace");
+    CHECK(tx_contains("xfer: BEGIN serial 1408F525 id "),
+          "the transfer's target is not in the trace");
+    CHECK(tx_contains(" total 2BF0 crc 1234"),
+          "the image size and CRC are not in the trace");
+    CHECK(tx_contains("link: tx IMG_BEGIN len 0F dst 00000000 try 1/4 wor"),
+          "the BEGIN transmission is not in the trace");
+    CHECK(tx_contains("link: heard IMG_ACK len 05 origin "),
+          "the tag's answer is not in the trace");
+    CHECK(tx_contains("xfer: the tag took the transfer on"),
+          "the accepted BEGIN is not in the trace");
+    CHECK(tx_contains("ser: tx ACK off=0000 st=00 OK"),
+          "the BEGIN's answer to the host is not in the trace");
+
+    CHECK(tx_contains("ser: rx IMG_DATA len 62 crc ok"),
+          "the host's DATA frame is not in the trace");
+    CHECK(tx_contains("xfer: data @0000 k=60 want=0060"),
+          "the data block's offsets are not in the trace");
+    CHECK(tx_contains("link: tx IMG_DATA len 64 dst "),
+          "the DATA transmission is not in the trace");
+    CHECK(tx_contains("xfer: block @0000 stored, the tag is at 0060"),
+          "the stored block is not in the trace");
+
+    CHECK(tx_contains("xfer: END - the tag now flushes"),
+          "the END is not introduced in the trace");
+    CHECK(tx_contains("xfer: complete, the tag confirmed off=2BF0 st=00 OK"),
+          "the completed transfer is not in the trace");
+    CHECK(tx_contains("ser: tx ACK off=2BF0 st=00 OK"),
+          "the final answer to the host is not in the trace");
+}
+
+/* A transfer that dies has to say where and why, with the same vocabulary as
+ * the one that works. This is the case the trace exists for: no tag in
+ * range, at level 1, reports every transmission and then the verdict. */
+static void test_console_trace_of_a_failed_transfer(void)
+{
+    printf("-- the console trace of a BEGIN that nobody answers\n");
+    reset_world();
+    host_begin_cmd(SK_IMG_TOTAL_BYTES, 0x1234);
+    CHECK(run_pending() == 1, "the BEGIN frame was not parsed");
+
+    tx_dump_console();
+
+    CHECK(tx_contains("link: tx IMG_BEGIN len 0F dst 00000000 try 1/4 wor"),
+          "the first attempt is not in the trace");
+    CHECK(tx_contains("link: tx IMG_BEGIN len 0F dst 00000000 try 4/4 wor"),
+          "the last attempt is not in the trace");
+    CHECK(tx_contains("xfer: no answer to the BEGIN after 1500 ms"),
+          "the per-attempt timeout is not in the trace");
+    /* 4 tries x 1500 ms: the 12 s budget is the BUSY case's ceiling, not what
+     * four unanswered broadcasts cost. */
+    CHECK(tx_contains("xfer: the BEGIN went unanswered for 6000 ms over 4 tries"),
+          "the final verdict is not in the trace");
+    CHECK(tx_contains("ser: tx STATUS st=01 BAD_SERIAL detail=00"),
+          "the answer handed to the host is not in the trace");
+}
+
 int main(void)
 {
     printf("ShelfKit access point: serial frame parser and bridge tests\n");
@@ -1470,6 +1653,9 @@ int main(void)
     test_radio_failure();
     test_announcements_still_print();
     test_idle_answers_are_reported();
+    test_decimal_printers();
+    test_console_trace_of_a_transfer();
+    test_console_trace_of_a_failed_transfer();
 
     printf("\n%d checks, %s\n", checks,
            failures ? "FAILURES" : "all passed");

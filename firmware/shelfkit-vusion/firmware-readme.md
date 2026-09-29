@@ -12,8 +12,8 @@ instead, using the **SDCC-MDF** extension for VS Code.
 
 ## Current status
 
-- The project **builds cleanly with SDCC**; roughly 29 KB of the ~58 KB usable flash is used,
-  with 142 bytes of stack left.
+- The project **builds cleanly with SDCC**; roughly 34.6 KB of the ~58 KB usable flash is used,
+  with 141 bytes of stack left.
 - On boot the tag, in this order:
   1. reads the **NFC chip** and pulls the serial number out of its NDEF URI record (a real tag
      answers `https://nfc.ses-imagotag.com/1408F525`, so the serial is `1408F525`), falling
@@ -29,7 +29,7 @@ instead, using the **SDCC-MDF** extension for VS Code.
   While nothing is being transferred it repeats its announcement every 10 s, so an access point
   that comes up late still finds the tag. The end-to-end design is in
   [`documentation/shelfkit-image-transfer.md`](../../documentation/shelfkit-image-transfer.md).
-- The NFC read (including the check bytes) and the radio link are **implemented but not yet
+- The NFC read and the radio link are **implemented but not yet
   verified on hardware** - the boot log says exactly what happened either way. The flash write
   path and the receive state machine are in the same position: they compile and link, and the
   sequences are the ones the datasheets specify, but no image has been transferred to a real
@@ -166,6 +166,20 @@ configuration the vendor's own LCD code uses. Provides `spi_init()`, `spi_transf
 (EPD, NFC, flash). The SPI clock source is a `#define` at the top of the header; the default
 (0xD8) is the LibMF LCD driver's setting, and 0x06 (SYSCLK) also works.
 
+**The completion wait is bounded, and a bus that never answers is written off.** The vendor's
+sequence polls `SPSTATUS` with no limit; here the poll gives up after `SPI_TMO` tries, sets a
+flag, and every later transfer returns immediately (`spi_timed_out_flag()`). The reason is the
+boot image: 11248 bytes go out over this bus on every power-up, so a bus that never completes a
+byte — SPI unit off, a clock source that never runs, a pad that never took SCK/MOSI — would
+otherwise stop the tag on the first byte. With the timeout, a label with a dead display still
+comes up, announces itself and accepts an image (stored, not shown), and says so once:
+`panel: the SPI bus never completed a byte`. A healthy bus never comes close to the timeout.
+
+`epd_wait_busy()` in `epd.c` is the one remaining unbounded poll, and it is unreachable in this
+firmware: `main.c` drives the panel through its own `epd_write_cmd()`/`epd_write_data()` and
+bounds both of its BUSY waits with `wait_busy_change()`/`wait_busy_return()`. Only
+`epd_init()`/`epd_refresh()`/`epd_sleep()` — which nothing calls — reach it.
+
 ### NFC — `src/nfc.h`
 
 Driver for the tag's NFC chip, a **Fudan FM11NT081DS**: an NFC Forum Type 2 tag with a
@@ -208,8 +222,13 @@ gcc -Wall -Wextra -o nfc_ndef_test tools/tests/nfc_ndef_test.c `
 ./nfc_ndef_test
 ```
 
-`main.c` uses all of it in `nfc_report()`: UID (with its check bytes), the serial number, the
-capability container, then a hexdump of the whole EEPROM — all before the panel is brought up.
+`main.c` uses it in `nfc_report()` for **the serial number and nothing else**: the NDEF TLV
+window (8 bit-banged transactions), and the 7-byte UID only when there is no NDEF record to
+fall back from. It used to also read the capability container and hexdump the whole 924-byte
+EEPROM — 58 transactions and some 4 KB of UART, about 150 ms of boot blocked before the panel
+refresh was even reached, for bytes no part of the firmware ever read. Reading the whole EEPROM
+is still a thing that can be done: that is what `firmware/dumptool` is for, driven by
+`tools/memdump.py`.
 
 **Why it is bit-banged.** The FM11NT081DS slave only speaks SPI **mode 1** (CPOL=0, CPHA=1,
 the factory default) or mode 3, while the IL0373 e-paper controller needs mode 0 — and mode 0
@@ -219,7 +238,8 @@ sidesteps the undocumented SPMODE mode bits: it switches the SPI unit off, drive
 GPIO, reads MISO from `PINC`, then hands the bus back. While it does so it also clears the
 PALTC bits of PC1/PC2 (so the peripheral output and the PORT register cannot fight over the
 pad) and restores them afterwards. The bit rate lands around 100-250 kHz, far below the
-chip's 5 MHz limit — the full 924-byte dump takes well under a second.
+chip's 5 MHz limit — the serial-number read is eight transactions and takes a couple of
+milliseconds.
 
 Reading the chip at any other time works the same way; the NFC chip's chip select (PB1) is
 held high whenever the hardware SPI unit is in use, so the flash and the panel are unaffected.
@@ -227,23 +247,29 @@ held high whenever the hardware SPI unit is in use, so the flash and the panel a
 A boot log looks like this:
 
 ```
+*** ShelfKit tag ***
+trace level 1 (every block, page and refusal)
+
 --- NFC chip (FM11NT081DS) ---
-serial number (7-byte UID): 04 5A 3C 7D 21 E8 B6  [check bytes ok]
-capability container: E1 10 6F 00 (NFC Forum Type 2 tag)
-EEPROM dump, 924 bytes:
-0000: 04 5A 3C EA 7D 21 E8 B6 02 00 00 00 E1 10 6F 00  |.Z<.}!........|
-...
---- end of NFC dump ---
+serial number: 1408F525  [from the NDEF URI]
+--- end of NFC ---
 ```
 
-(The UID sits either side of its first check byte, so the dump reads
-`SN0 SN1 SN2 BCC0 SN3 SN4 SN5 SN6 BCC1` — here `BCC0 = 0x88 ^ 04 ^ 5A ^ 3C = EA` and
-`BCC1 = 7D ^ 21 ^ E8 ^ B6 = 02`.)
+When the chip has no readable NDEF record the tag falls back to the UID, and says so — the UID
+as 14 hex characters, with the reason:
 
-`[check bytes ok]` means the two ISO/IEC 14443-3 check bytes that live next to the UID
-(`BCC0 = 0x88 ^ UID0 ^ UID1 ^ UID2`, `BCC1 = UID3 ^ UID4 ^ UID5 ^ UID6`) matched, so the
-bytes really came off the chip. If the UID reads back as all `00` or all `FF` and the check
-bytes say *BAD*, nothing reached the chip — in rough order of likelihood:
+```
+serial number: 045A3CEA7D21E8B6  [NO NDEF RECORD - the UID as hex]
+```
+
+That line is the one to read when something is wrong with the chip. A UID of all `00` or all
+`FF` means nothing came off the contact interface (the chip is unpowered, was not awake yet, or
+the pads never became GPIO); see the list below. **The check bytes the driver also verifies are
+no longer printed**: with the EEPROM dump gone, the NDEF record is the proof that the chip
+answered, and a UID that is all `00`/`FF` is the proof that it did not. The driver still returns
+the check-byte verdict and `tools/memdump.py` prints it for a full dump.
+
+If the NDEF read fails, in rough order of likelihood:
 
 1. **The chip may have no supply.** PA2/PA5 switch unidentified transistor loads (`pwr.h`);
    if the NFC chip is behind one of them, try `PWR_USE_U5 1` and/or flip the polarity defines.
@@ -311,15 +337,46 @@ every 10 s and relays. The boot log says which this build is, and prints the tag
 
 ```
 radio: id E5C0F240 (leaf)
-radio: announced
+radio: announced 1408F525 (as the id above)
 ...
 radio: listening (leaf, wake-on-radio)
 ```
 
 That id is `FNV-1a/32` of the serial number and is what the access point addresses frames to,
 so a mismatch between it and what the access point computes looks exactly like dead hardware.
+The announcement line carries the serial for the same reason: the access point's console shows
+the serial it received, and a mismatch between the two is the first thing to rule out.
 
 ### UART — `src/uart.h`
+
+UART0 is TX-only on this board and carries the tag's **console**: everything the tag does,
+from the NFC read at boot to the last page of an image transfer. `TAG_TRACE` (top of `main.c`)
+sets how much of it there is:
+
+| Level | What it prints |
+|---|---|
+| 0 | the boot report and the transfer milestones |
+| 1 (default) | plus a line per block accepted, per flash page written, and per refusal — and a summary at the end of a transfer |
+| 2 | plus every answer transmitted and every frame the link layer hands up |
+
+```
+powershell -File tools/build_firmware.ps1 -Firmware shelfkit-vusion -Define TAG_TRACE=2
+```
+
+Level 1 costs about 118 block lines and 44 page lines per image (roughly a second of UART
+against a transfer that takes ~35), and each line delays that block's acknowledgement by about
+10 ms — nothing against the access point's 600 ms window. The tag's console and the access
+point's are written to be read together: the access point says what it sent and whether
+anything came back, and the tag says whether the frame arrived and what it did with it.
+
+**The console is not a dependency.** `uart_putc()` bounds its wait for `U0TXEMPTY`
+(`UART_TX_SPIN`, ~45x the time a byte takes at 38400 baud) and, after `UART_TX_DEAD` timeouts,
+writes the port off: every later byte is dropped without waiting. Nothing in the boot path is
+allowed to be gated on serial output — the NFC read, the announcement, the panel refresh and
+the receive loop all happen whether or not anything is listening. Without the bound, a tag
+whose UART is unclocked, whose pad never took the U0TX function, or whose baud register is
+left at zero would stop on its first banner byte: a label that looks dead because its serial
+port is. The bound also caps what the trace can cost — 40 lines cannot become 40 waits.
 
 `uart_begin()` is libmf's `uart_timer0_baud()` + `uart0_init()` **inlined** (38400 8N1, TX on
 PB4, timer 0 generating the rate). Two reasons, both about RAM:
@@ -335,8 +392,9 @@ This part has 128 bytes of directly addressable internal RAM, and SDCC spends it
 *and* on one permanent parameter block per non-reentrant function. Hence two house rules in
 this project: buffers go in XRAM, and API functions with parameters are declared
 `__reentrant` (SDCC then passes parameters on the stack). Together they are what makes the
-e-paper, the NFC driver, the radio and the image transfer fit in one image with 142 bytes of
-stack left.
+e-paper, the NFC driver, the radio and the image transfer fit in one image with 137 bytes of
+stack left. (The two console/bus flags added by the bounded waits are in XRAM for the same
+reason: internal RAM belongs to the stack.)
 
 The image transfer is what makes the rule bite: adding the receive handlers to `main.c` once
 failed to link with `?ASlink-Error-Could not get 21 consecutive bytes in internal RAM for area
@@ -416,8 +474,13 @@ orientation. If the logo shows up sideways on the tag, regenerate with a differe
 
 Two hardware notes that will matter on first bring-up:
 
-- **UART0 is off in the demo.** Its RX pin (PB5) doubles as the panel reset line; with the
-  UART enabled, the pin belongs to the UART and the reset pulse never reaches the panel.
+- **PB5 is shared: panel reset and UART RX.** `main.c` drives the reset as an ordinary
+  output (`DIRB` bit 5) and `uart_begin()` leaves the receiver enabled, because that is
+  libmf's bring-up and the access point does read its UART back. An output pad cannot be
+  driven by the receiver, so the reset pulse reaches the panel; the firmware never reads the
+  UART, so nothing else happens either. (An earlier note here claimed the UART had to stay
+  off for the reset to work. It does not: the tag refreshes its panel with the UART on, which
+  is what the boot log shows.)
 - **BUSY polarity.** Every driver found for this panel on this tag polls BUSY *low* while
   busy — the tag board inverts the line, although the bare Good Display module is
   active-high. `epd.c` defaults to active-low. If `epd_init()` hangs or updates render
@@ -426,6 +489,17 @@ Two hardware notes that will matter on first bring-up:
 
 ## Known issues and quirks
 
+- **The FRC oscillator calibration wait is the one unbounded wait left in the boot path.**
+  `main()` follows the AXSEM bootloader: 128 passes of "set `OSCCALIB`, `enter_standby()`
+  until bit 6 says the calibration finished". `enter_standby()` is `PCON |= IDLE`, so if that
+  bit never sets — the 20 MHz FRC is slaved to the 32 kHz LPX crystal (`LPXOSCGM`,
+  `CLKSRC_LPXOSC`), and a crystal that does not start means no calibration interrupt — the CPU
+  sleeps for ever with no output at all, the one failure mode that looks like a completely
+  dead board. It is left as the vendor wrote it because the sequence is the chip's clock
+  bring-up and changing it needs hardware: the bounded version would busy-poll `OSCCALIB`
+  instead of sleeping (a `guard` counter outside `enter_standby()` cannot help — the CPU is
+  asleep inside it) and carry on uncalibrated, which costs baud accuracy. Worth doing if a
+  board is ever found wedged there.
 - **SDCC-MDF vs PowerShell** (extension ≤ 0.29.11): the extension emits single-quoted tool
   paths without the `&` call operator, so with a PowerShell terminal every build fails with
   `Unexpected token '-mmcs' …`. This repo works around it with `"sdcc.shellPath": "cmd.exe"`
@@ -444,9 +518,10 @@ Two hardware notes that will matter on first bring-up:
   breakpoints and for recovering a tag whose bootloader is gone.
 - Hardware verification of the e-paper driver (init + first frame), settling the BUSY
   polarity question.
-- Hardware verification of the NFC read: the serial number should come back with
-  `[check bytes ok]`, the serial line should read the NDEF URI's last segment, and the
-  capability container should read `E1 10 6F 00`.
+- Hardware verification of the NFC read: the serial number should come back from the NDEF URI
+  (`serial number: 1408F525  [from the NDEF URI]`), and the dump-free boot should reach the
+  panel in ~1 ms of I/O instead of the ~150 ms the old 924-byte EEPROM walk cost. A chip with
+  no NDEF record falls back to the UID and says so.
 - **Hardware verification of the radio link** with an access point running
   `firmware/access-point`: the tag announces, the AP prints `TAG <serial> rssi=<db>`. The
   bring-up checklist (crystal, band, AFC range) is in `documentation/shelfkit-radio-link.md`.
